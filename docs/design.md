@@ -386,6 +386,6 @@ Not yet:
 
 Two compiler bugs were found on the way and fixed in pico-lang PRs:
 - #103: a subclass's fields after `instanceof` narrowing panicked the compiler. Decoded messages are narrowed this way.
-- #105: a field named `target` was taken for the build constant in async methods. The operations write `this.target` until it's merged.
+- #104 (PR #105, merged): a field named `target` was taken for the build constant in async methods. The operations wrote `this.target` until the fix; now plain `target`, which needs a pico newer than 0.4.2 (as #102's fix does).
 
 The Drone Configurator (`../drone-configurator`) uses this package for its backend: the simulator, UDP, TCP and serial (with padcom/serialport).

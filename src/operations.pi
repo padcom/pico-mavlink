@@ -155,8 +155,6 @@ function paramOf(m: ParamValue, encoding: ParamEncoding): Param {
 /// Downloads the whole parameter list: PARAM_REQUEST_LIST, then PARAM_REQUEST_READ by index for
 /// whatever didn't arrive, a few rounds. A list that stays incomplete says so (`complete`,
 /// `missing`) rather than pretending.
-// In the async `run` methods, `target` is written `this.target`: a bare `target` there is taken
-// for the build constant until pico-lang #104 is fixed.
 export class ParamList {
   readonly conn: MavLinkConnection
   readonly target: Target
@@ -180,8 +178,8 @@ export class ParamList {
   public async run(): Promise<ParamListResult> throws Error {
     const listener = conn.on((r: Received) => this.arrived(r))
     const request = new ParamRequestList()
-    request.targetSystem = this.target.system as u8
-    request.targetComponent = this.target.component as u8
+    request.targetSystem = target.system as u8
+    request.targetComponent = target.component as u8
     lastArrival = Date.now() as int
     await conn.send(request)
     await quiet()
@@ -190,8 +188,8 @@ export class ParamList {
       checkAborted(signal, "the parameter list")
       for (const i of missing()) {
         const read = new ParamRequestRead()
-        read.targetSystem = this.target.system as u8
-        read.targetComponent = this.target.component as u8
+        read.targetSystem = target.system as u8
+        read.targetComponent = target.component as u8
         read.paramIndex = i as i16
         await conn.send(read)
       }
@@ -269,10 +267,10 @@ export class ParamRead {
   public async run(id: string): Promise<Param> throws Error {
     for (let attempt = 0; attempt <= retries; attempt++) {
       checkAborted(signal, `reading ${id}`)
-      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs, signal)
+      const reply = conn.waitFor((r: Received) => isValueOf(r, target, id), timeoutMs, signal)
       const read = new ParamRequestRead()
-      read.targetSystem = this.target.system as u8
-      read.targetComponent = this.target.component as u8
+      read.targetSystem = target.system as u8
+      read.targetComponent = target.component as u8
       read.paramId = id
       read.paramIndex = -1
       await conn.send(read)
@@ -285,7 +283,7 @@ export class ParamRead {
       }
     }
     checkAborted(signal, `reading ${id}`)
-    throw new MavLinkError("TIMEOUT", `no PARAM_VALUE for ${id} from ${this.target.system}/${this.target.component} after ${retries + 1} tries`)
+    throw new MavLinkError("TIMEOUT", `no PARAM_VALUE for ${id} from ${target.system}/${target.component} after ${retries + 1} tries`)
   }
 }
 
@@ -329,14 +327,14 @@ export class ParamWrite {
   /// no reply comes.
   public async run(id: string, value: TypedParamValue): Promise<ParamSetResult> throws Error {
     const request = new ParamSet()
-    request.targetSystem = this.target.system as u8
-    request.targetComponent = this.target.component as u8
+    request.targetSystem = target.system as u8
+    request.targetComponent = target.component as u8
     request.paramId = id
     request.paramValue = encodeParam(value, encoding)
     request.paramType = paramTypeOf(value) as u8
     for (let attempt = 0; attempt <= retries; attempt++) {
       checkAborted(signal, `writing ${id}`)
-      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs, signal)
+      const reply = conn.waitFor((r: Received) => isValueOf(r, target, id), timeoutMs, signal)
       await conn.send(request)
       const r = await reply
       if (r != null) {
@@ -381,10 +379,10 @@ export class AutopilotVersionRead {
   public async run(): Promise<AutopilotVersion?> throws Error {
     for (let attempt = 0; attempt <= retries; attempt++) {
       checkAborted(signal, "AUTOPILOT_VERSION")
-      const reply = conn.waitFor((r: Received) => isVersionFrom(r, this.target), timeoutMs, signal)
+      const reply = conn.waitFor((r: Received) => isVersionFrom(r, target), timeoutMs, signal)
       const c = new CommandLong()
-      c.targetSystem = this.target.system as u8
-      c.targetComponent = this.target.component as u8
+      c.targetSystem = target.system as u8
+      c.targetComponent = target.component as u8
       c.confirmation = attempt as u8
       if (attempt <= retries / 2) {
         c.command = MavCmd.REQUEST_MESSAGE as u16
@@ -435,10 +433,10 @@ export class CommandCall {
     const name = MavCmd.nameOf(command) ?? `${command}`
     for (let attempt = 0; attempt <= retries; attempt++) {
       checkAborted(signal, name)
-      const reply = conn.waitFor((r: Received) => isAckOf(r, this.target, command), timeoutMs, signal)
+      const reply = conn.waitFor((r: Received) => isAckOf(r, target, command), timeoutMs, signal)
       const c = new CommandLong()
-      c.targetSystem = this.target.system as u8
-      c.targetComponent = this.target.component as u8
+      c.targetSystem = target.system as u8
+      c.targetComponent = target.component as u8
       c.command = command as u16
       c.confirmation = attempt as u8
       const p = (i: int) => (if (i < params.length) params[i] else 0.0) as f32
