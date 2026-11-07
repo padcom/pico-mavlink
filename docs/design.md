@@ -332,7 +332,7 @@ the magic numbers. The output is Pico instead of TypeScript.
 | SHA-256 | `std/crypto` `digest` | enough |
 | UDP and TCP | `std/net` `bind`, `connect` | enough for SITL (MV2) |
 | Timers, deadlines | `std/timers` `delay(ms, signal)` | enough for retries |
-| Cancellable reads (serial, closing a connection) | missing: pico-lang #100 | needed for a clean disconnect over serial; UDP/TCP have their own close |
+| Cancellable reads (serial, closing a connection) | `Reader.close()` on pico-lang main since #100 (unreleased) | padcom/serialport's close() uses it |
 | 64-bit integers | native `i64`/`u64` | no bigint needed |
 
 ## 9. Decisions for the owner
@@ -362,3 +362,29 @@ buffer with a bounded ring buffer.
 The oracle agrees. `oracle/counts.mjs` runs the published `node-mavlink@2.3.0` and
 `mavlink-mappings@1.0.22-20260311` (dev-time, `npm install` in `oracle/`) over the same capture,
 and prints `3398 3398/0/14`, as the Pico spike does.
+
+## 11. Status (2026-11-07)
+
+Built, with tests:
+- **MV1:**
+  - the byte layer and the dialects (296 messages, checked against mavlink-mappings);
+  - framing: CRC, splitter (bounded, tlog-safe), MAVLink 1 and 2, signing;
+  - 296 interop cases against node-mavlink, and its captures.
+- **MV2, without SITL:**
+  - the connection (`packets`, `send`, `sendSigned`, `messages`, `run`/`on`/`waitFor`);
+  - byte streams (UDP, TCP, file, memory);
+  - typed parameters (bytewise and C-cast);
+  - operations: `HeartbeatSender`, `VehicleDiscovery`, `ParamList`, `ParamRead`, `ParamWrite`, `AutopilotVersionRead`;
+  - a signing policy (replay, unsigned handling);
+  - `SimulatedAutopilot`.
+
+Not yet:
+- ArduPilot SITL runs (they need its binaries);
+- `PARAM_EXT_*` (MV3);
+- operations' cancellation through an `AbortSignal`.
+
+Two compiler bugs were found on the way and fixed in pico-lang PRs:
+- #103: a subclass's fields after `instanceof` narrowing panicked the compiler. Decoded messages are narrowed this way.
+- #105: a field named `target` was taken for the build constant in async methods. The operations write `this.target` until it's merged.
+
+The Drone Configurator (`../drone-configurator`) uses this package for its backend: the simulator, UDP, TCP and serial (with padcom/serialport).
