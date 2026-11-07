@@ -1,0 +1,10 @@
+{
+  "name": "pico-mavlink-generator",
+  "private": true,
+  "description": "Dev-time only: generates the Pico dialect modules from the MAVLink XML",
+  "type": "module",
+  "scripts": { "generate": "node generate.mjs" },
+  "devDependencies": {
+    "mavlink-mappings-gen": "0.0.9"
+  }
+}

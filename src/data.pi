@@ -1,0 +1,101 @@
+// The base types every generated dialect builds on (mavlink-mappings' lib/mavlink.ts in Pico).
+
+/// A field of a message, as laid out on the wire: `mavlink-mappings`' `MavLinkPacketField`.
+export class MavLinkPacketField {
+  /// The original name, from the XML (`custom_mode`).
+  public readonly source: string
+  /// The name in Pico (`customMode`).
+  public readonly name: string
+  /// Where it starts in the payload.
+  public readonly offset: int
+  /// Whether it's an extension field (MAVLink 2 only, after the base fields).
+  public readonly extension: bool
+  /// The size of the field, or of one element for an array field.
+  public readonly size: int
+  /// The wire type (`uint32_t`, `char[]`, …).
+  public readonly type: string
+  public readonly units: string
+  /// The number of elements for an array field, 0 otherwise.
+  public readonly length: int
+
+  constructor(source: string, name: string, offset: int, extension: bool, size: int, type: string, units: string,
+    length: int = 0) {
+    this.source = source
+    this.name = name
+    this.offset = offset
+    this.extension = extension
+    this.size = size
+    this.type = type
+    this.units = units
+    this.length = length
+  }
+}
+
+/// What a message class is, without an instance: what a registry maps an id to.
+export class MessageInfo {
+  public readonly id: int
+  public readonly name: string
+  /// The payload's length with every field, extensions included.
+  public readonly payloadLength: int
+  /// The payload's length without extensions: all a MAVLink 1 frame carries.
+  public readonly basePayloadLength: int
+  /// CRC-extra.
+  public readonly magic: int
+  public readonly fields: MavLinkPacketField[]
+  readonly decoder: (payload: Uint8Array) => MavLinkData
+
+  constructor(id: int, name: string, payloadLength: int, basePayloadLength: int, magic: int,
+    fields: MavLinkPacketField[], decoder: (payload: Uint8Array) => MavLinkData) {
+    this.id = id
+    this.name = name
+    this.payloadLength = payloadLength
+    this.basePayloadLength = basePayloadLength
+    this.magic = magic
+    this.fields = fields
+    this.decoder = decoder
+  }
+
+  /// A message from `payload` (shorter payloads read as zeros past their end).
+  public decode(payload: Uint8Array): MavLinkData {
+    const d = this.decoder
+    d(payload)
+  }
+}
+
+/// A message: every generated message class extends it.
+export abstract class MavLinkData {
+  /// The message's class, as a registry has it.
+  public abstract info(): MessageInfo
+
+  /// Writes all `info().payloadLength` bytes of the payload at `at` (zeros included: truncating
+  /// is the protocol's job).
+  public abstract encode(into: Uint8Array, at: int): void
+}
+
+/// Message classes by id: one dialect's, or several merged (later ones win).
+export class Registry {
+  readonly byId: Map<int, MessageInfo> = new Map<int, MessageInfo>()
+
+  constructor(dialects: Map<int, MessageInfo>[] = []) {
+    for (const d of dialects) {
+      add(d)
+    }
+  }
+
+  /// Adds (or replaces) a dialect's messages.
+  public add(dialect: Map<int, MessageInfo>): void {
+    for (const [id, info] of dialect) {
+      byId.set(id, info)
+    }
+  }
+
+  public get(id: int): MessageInfo? {
+    byId.get(id)
+  }
+
+  /// CRC-extra of message `id`, or null for a message this registry doesn't know.
+  public magic(id: int): int? {
+    const info = byId.get(id)
+    if (info == null) null else info!.magic
+  }
+}

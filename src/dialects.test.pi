@@ -1,0 +1,68 @@
+import { describe, it, expect } from "std/test"
+import { Heartbeat, MavType, MavAutopilot } from "./dialects/minimal"
+import { MSG_ID_MAGIC_NUMBER } from "./dialects/magic-numbers"
+
+function heartbeatRoundTrips(): void {
+  const h = new Heartbeat()
+  h.type = MavType.QUADROTOR as u8
+  h.autopilot = MavAutopilot.ARDUPILOTMEGA as u8
+  h.customMode = 4_000_000_000
+  h.mavlinkVersion = 3
+  const payload = new Uint8Array(Heartbeat.PAYLOAD_LENGTH)
+  h.encode(payload, 0)
+  const back = Heartbeat.decode(payload)
+  expect(back.type as int).toBe(MavType.QUADROTOR)
+  expect(back.autopilot as int).toBe(MavAutopilot.ARDUPILOTMEGA)
+  expect(back.customMode as int).toBe(4_000_000_000)
+  expect(back.mavlinkVersion as int).toBe(3)
+  expect(back.info().name).toBe("HEARTBEAT")
+}
+
+function enumNames(): void {
+  expect(MavType.nameOf(2) ?? "?").toBe("QUADROTOR")
+  expect(MavType.nameOf(99999) == null).toBe(true)
+}
+
+function magic(): void {
+  expect(MSG_ID_MAGIC_NUMBER.get(0) ?? -1).toBe(50)
+}
+
+describe("generated dialects", () => {
+  it("round-trips a HEARTBEAT", heartbeatRoundTrips)
+  it("names enum values, and knows when it can't", enumNames)
+  it("has the CRC-extra table", magic)
+})
+
+import { REGISTRY as MINIMAL } from "./dialects/minimal"
+import { REGISTRY as STANDARD } from "./dialects/standard"
+import { REGISTRY as COMMON, ParamValue, SysStatus } from "./dialects/common"
+import { REGISTRY as ARDUPILOTMEGA } from "./dialects/ardupilotmega"
+import { Registry } from "./data"
+
+function registries(): void {
+  const r = new Registry([MINIMAL, STANDARD, COMMON, ARDUPILOTMEGA])
+  expect(r.get(0)!.name).toBe("HEARTBEAT")
+  expect(r.get(22)!.name).toBe("PARAM_VALUE")
+  expect(r.magic(1) ?? -1).toBe(SysStatus.MAGIC_NUMBER)
+  // SYS_STATUS: 31 base bytes, 12 more in extensions.
+  expect(`${SysStatus.INFO.basePayloadLength}/${SysStatus.INFO.payloadLength}`).toBe("31/43")
+  expect(r.get(424242) == null).toBe(true)
+}
+
+function paramValueText(): void {
+  const p = new ParamValue()
+  p.paramId = "ARMING_CHECK"
+  p.paramValue = 1.0 as f32
+  p.paramCount = 900
+  const payload = new Uint8Array(ParamValue.PAYLOAD_LENGTH)
+  p.encode(payload, 0)
+  const back = ParamValue.decode(payload)
+  expect(back.paramId).toBe("ARMING_CHECK")
+  expect(back.paramValue as f64).toBe(1.0)
+  expect(back.paramCount as int).toBe(900)
+}
+
+describe("generated dialects: common and ardupilotmega", () => {
+  it("merge into a registry", registries)
+  it("round-trip PARAM_VALUE with its char[16] id", paramValueText)
+})

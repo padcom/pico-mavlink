@@ -194,6 +194,15 @@ debugging. Behavior that must match node-mavlink:
 - serialization truncates trailing zero bytes (v2 only), and the CRC covers the truncated packet
   plus CRC-extra.
 
+### 4.1 As built (MV1)
+
+- **Enums are classes of `int` constants** (`MavType.QUADROTOR`), each with `nameOf(value): string?`. Pico enums are sum types without numeric values, and wire data must keep values a dialect doesn't define (newer firmware, bitmasks). So message fields keep their wire types (`type: u8`), and a doc comment names the enum.
+- **Names follow `mavlink-mappings` exactly.** Classes, fields (camelCase), enum constants (common prefix cut), and its hand-fixed message names (`StatusText`, `TimeSync`, …). Keywords are valid member names in Pico, so `type` stays `type`; only `operator` would be renamed.
+- **Text:** `char[N]` decodes up to the first NUL as UTF-8, and invalid bytes become U+FFFD, as Node's `Buffer.toString` does. Encoding cuts at N bytes and NUL-pads.
+- **The generator** (`generator/generate.mjs`) uses `mavlink-mappings-gen@0.0.9`'s `XmlDataSource` for names, field order and CRC-extra, so its output agrees with `mavlink-mappings` by construction. `oracle/check-mappings.mjs` checks all 296 messages of minimal, standard, common and ardupilotmega anyway: ID, name, CRC-extra, lengths, and every field's offset, size, type and units.
+- **The XML isn't vendored.** `mavlink/mavlink` is LGPL-3.0, and its generated output is MIT by that project's exception. The generator reads it from a `mavlink-mappings` checkout, pinned by SHA-256.
+- **`scripts/check.sh` is the commit gate.** It regenerates and fails on any diff, runs the oracle, runs fmt and lint on the hand-written code, and runs the tests. The generated dialects keep `mavlink-mappings`' names (`GOPRO_RESOLUTION_480p`), which Pico's naming lint flags, so they're linted by the oracle instead.
+
 ## 5. Operations
 
 PROJECT_DESCRIPTION asks for "classes implementing individual operations". Each is a small class

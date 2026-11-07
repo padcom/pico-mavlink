@@ -3,7 +3,7 @@
   "private": true,
   "description": "Dev-time only: what node-mavlink makes of the fixtures, for Pico MAVLink to match",
   "type": "module",
-  "scripts": { "counts": "node counts.mjs" },
+  "scripts": { "counts": "node counts.mjs", "check-mappings": "node check-mappings.mjs" },
   "dependencies": {
     "mavlink-mappings": "1.0.22-20260311",
     "node-mavlink": "2.3.0"

@@ -1,0 +1,130 @@
+// Little-endian reads and writes at an offset, as MAVLink lays out payloads. Reads past the end
+// give 0: MAVLink 2 senders drop the payload's trailing zero bytes (and v1 senders may not know
+// about extension fields), so a short payload means zeros, not an error.
+
+const SCRATCH = new ArrayBuffer(8)
+const SCRATCH_BYTES = new Uint8Array(SCRATCH, 0)
+const SCRATCH_F32 = new Float32Array(SCRATCH, 0)
+const SCRATCH_F64 = new Float64Array(SCRATCH, 0)
+
+/// The byte at `at`, or 0 past the end.
+export function byteAt(b: Uint8Array, at: int): int {
+  if (at < b.length) b[at] as int else 0
+}
+
+/// An unsigned little-endian integer of `n` bytes (at most 7) at `at`.
+export function readUint(b: Uint8Array, at: int, n: int): int {
+  let v = 0
+  for (let i = n - 1; i >= 0; i--) {
+    v = (v << 8) | byteAt(b, at + i)
+  }
+  v
+}
+
+export function readU8(b: Uint8Array, at: int): u8 {
+  byteAt(b, at) as u8
+}
+
+/// `v` (`bits` wide, unsigned) as two's complement: Pico's `as` checks ranges, it doesn't reinterpret.
+function signed(v: int, bits: int): int {
+  if (v >= (1 << (bits - 1))) v - (1 << bits) else v
+}
+
+export function readI8(b: Uint8Array, at: int): i8 {
+  signed(byteAt(b, at), 8) as i8
+}
+
+export function readU16(b: Uint8Array, at: int): u16 {
+  readUint(b, at, 2) as u16
+}
+
+export function readI16(b: Uint8Array, at: int): i16 {
+  signed(readUint(b, at, 2), 16) as i16
+}
+
+export function readU32(b: Uint8Array, at: int): u32 {
+  readUint(b, at, 4) as u32
+}
+
+export function readI32(b: Uint8Array, at: int): i32 {
+  signed(readUint(b, at, 4), 32) as i32
+}
+
+export function readU64(b: Uint8Array, at: int): u64 {
+  ((readUint(b, at + 4, 4) as u64) << 32) | (readUint(b, at, 4) as u64)
+}
+
+export function readI64(b: Uint8Array, at: int): i64 {
+  // The high half signed carries the sign; the low half is added unsigned.
+  (signed(readUint(b, at + 4, 4), 32) << 32) | readUint(b, at, 4)
+}
+
+export function readF32(b: Uint8Array, at: int): f32 {
+  for (let i = 0; i < 4; i++) {
+    SCRATCH_BYTES.set(i, byteAt(b, at + i))
+  }
+  SCRATCH_F32.get(0)
+}
+
+export function readF64(b: Uint8Array, at: int): f64 {
+  for (let i = 0; i < 8; i++) {
+    SCRATCH_BYTES.set(i, byteAt(b, at + i))
+  }
+  SCRATCH_F64.get(0)
+}
+
+/// Text up to the first NUL (or `n` bytes), as `char[n]` fields hold it.
+export function readChars(b: Uint8Array, at: int, n: int): string {
+  let end = 0
+  while (end < n && byteAt(b, at + end) != 0) {
+    end += 1
+  }
+  const bytes = new Uint8Array(end)
+  for (let i = 0; i < end; i++) {
+    bytes.set(i, b[at + i])
+  }
+  try {
+    new TextDecoder().decode(bytes)
+  } catch (e: TypeError) {
+    // Only a fatal decoder throws; this one replaces invalid bytes with U+FFFD, as node-mavlink's
+    // Buffer.toString("utf8") does.
+    ""
+  }
+}
+
+/// Writes the low `n` bytes of `v`, little-endian.
+export function writeUint(b: Uint8Array, at: int, n: int, v: int): void {
+  let x = v
+  for (let i = 0; i < n; i++) {
+    b.set(at + i, x & 0xFF)
+    x = x >> 8
+  }
+}
+
+export function writeU64(b: Uint8Array, at: int, v: u64): void {
+  writeUint(b, at, 4, (v & 0xFFFFFFFF) as int)
+  writeUint(b, at + 4, 4, (v >> 32) as int)
+}
+
+export function writeF32(b: Uint8Array, at: int, v: f32): void {
+  SCRATCH_F32.set(0, v)
+  for (let i = 0; i < 4; i++) {
+    b.set(at + i, SCRATCH_BYTES[i])
+  }
+}
+
+export function writeF64(b: Uint8Array, at: int, v: f64): void {
+  SCRATCH_F64.set(0, v)
+  for (let i = 0; i < 8; i++) {
+    b.set(at + i, SCRATCH_BYTES[i])
+  }
+}
+
+/// `s` as UTF-8 in `n` bytes, cut at `n` and NUL-padded (the rest of the field stays 0).
+export function writeChars(b: Uint8Array, at: int, n: int, s: string): void {
+  const bytes = new TextEncoder().encode(s)
+  const len = if (bytes.length < n) bytes.length else n
+  for (let i = 0; i < len; i++) {
+    b.set(at + i, bytes[i])
+  }
+}
