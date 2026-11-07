@@ -1,0 +1,173 @@
+// node-mavlink's MavLinkPacketSplitter: whole frames out of a byte stream, checked against their
+// CRC-extra. A frame of a known message with a bad CRC drops one byte (its start byte was a false
+// match); a frame of an unknown message is skipped whole.
+import { MSG_ID_MAGIC_NUMBER } from "./dialects/magic-numbers"
+import { readUint } from "./bytes"
+import { x25crc } from "./crc"
+import { CHECKSUM_LENGTH, MavLinkProtocolV1, MavLinkProtocolV2, SIGNATURE_LENGTH } from "./protocol"
+
+/// A frame the splitter found, with its tlog timestamp (ms since 1970) if it came from a tlog.
+export struct RawPacket {
+  buffer: Uint8Array
+  timestamp: int?
+}
+
+export struct SplitterOptions {
+  /// CRC-extra by message id: the messages this stream may carry (default: every generated dialect).
+  magicNumbers?: Map<int, int>
+  /// The most bytes kept while waiting for the rest of a frame (default 64 KiB). Past it, the
+  /// oldest bytes are dropped (and counted as invalid).
+  maxBuffer?: int
+  /// Called with each frame whose CRC is wrong (for diagnostics).
+  onCrcError?: (frame: Uint8Array) => void
+}
+
+export class MavLinkPacketSplitter {
+  readonly magicNumbers: Map<int, int>
+  readonly maxBuffer: int
+  readonly onCrcError: ((frame: Uint8Array) => void)?
+  /// tlog: each frame is preceded by an 8-byte big-endian timestamp in µs.
+  readonly tlog: bool
+  buffer: Uint8Array = new Uint8Array(4096)
+  /// The bytes waiting are buffer[start, end).
+  start: int = 0
+  end: int = 0
+  valid: int = 0
+  invalid: int = 0
+  unknown: int = 0
+
+  constructor(options: SplitterOptions = {}, tlog: bool = false) {
+    this.magicNumbers = options.magicNumbers ?? MSG_ID_MAGIC_NUMBER
+    this.maxBuffer = options.maxBuffer ?? 65536
+    this.onCrcError = options.onCrcError
+    this.tlog = tlog
+  }
+
+  /// Frames whose CRC matched.
+  public get validPackets(): int {
+    valid
+  }
+
+  /// Frames of known messages whose CRC didn't match, and bytes dropped from an overfull buffer.
+  public get invalidPackets(): int {
+    invalid
+  }
+
+  /// Frames of messages missing from `magicNumbers`.
+  public get unknownPackets(): int {
+    unknown
+  }
+
+  /// Bytes waiting for the rest of a frame.
+  public get buffered(): int {
+    end - start
+  }
+
+  public resetCounters(): void {
+    valid = 0
+    invalid = 0
+    unknown = 0
+  }
+
+  /// The frames `chunk` completes.
+  public push(chunk: Uint8Array): RawPacket[] {
+    append(chunk)
+    const out: RawPacket[] = []
+    while (end > start) {
+      const at = findStart()
+      if (at < 0) {
+        // Keep up to 7 bytes in a tlog: they may be the next frame's timestamp.
+        start = if (tlog && end - start > 7) end - 7 else if (tlog) start else end
+        break
+      }
+      const timestamp = if (tlog) readTimestamp(at) else null
+      start = at
+      const v2 = buffer[start] == MavLinkProtocolV2.START_BYTE
+      const offset = if (v2) MavLinkProtocolV2.PAYLOAD_OFFSET else MavLinkProtocolV1.PAYLOAD_OFFSET
+      if (end - start < offset + CHECKSUM_LENGTH) {
+        break
+      }
+      const signed = v2 && (buffer[start + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0
+      const length = offset + buffer[start + 1] + CHECKSUM_LENGTH + (if (signed) SIGNATURE_LENGTH else 0)
+      if (end - start < length) {
+        break
+      }
+      const msgid = if (v2) readUint(buffer, start + 7, 3) else buffer[start + 5]
+      const magic = magicNumbers.get(msgid)
+      if (magic == null) {
+        unknown += 1
+        start += length
+        continue
+      }
+      const crcAt = start + offset + buffer[start + 1]
+      if (readUint(buffer, crcAt, 2) == x25crc(buffer, start + 1, crcAt, magic!)) {
+        valid += 1
+        out.push({ buffer: buffer.slice(start, start + length), timestamp })
+        start += length
+      } else {
+        invalid += 1
+        const report = onCrcError
+        if (report != null) {
+          report!(buffer.slice(start, start + length))
+        }
+        start += 1
+      }
+    }
+    bound()
+    out
+  }
+
+  /// The first start byte at or after `start` (in a tlog, with 8 bytes before it), or -1.
+  findStart(): int {
+    for (let i = if (tlog) start + 8 else start; i < end; i++) {
+      const b = buffer[i]
+      if (b == MavLinkProtocolV1.START_BYTE || b == MavLinkProtocolV2.START_BYTE) {
+        return i
+      }
+    }
+    -1
+  }
+
+  readTimestamp(at: int): int {
+    let us = 0
+    for (let i = at - 8; i < at; i++) {
+      us = (us << 8) | buffer[i]
+    }
+    us / 1000
+  }
+
+  append(chunk: Uint8Array): void {
+    const waiting = end - start
+    if (waiting + chunk.length > buffer.length || end + chunk.length > buffer.length) {
+      // Move what's waiting to the front, growing the buffer if it must.
+      let size = buffer.length
+      while (waiting + chunk.length > size) {
+        size *= 2
+      }
+      const next = new Uint8Array(size)
+      next.setAll(buffer.slice(start, end), 0)
+      buffer = next
+      start = 0
+      end = waiting
+    }
+    buffer.setAll(chunk, end)
+    end += chunk.length
+  }
+
+  /// What's left waiting is bounded: the oldest bytes go (noise that looks like the start of a
+  /// long frame must not grow the buffer forever). Frames are taken out first, so a large chunk
+  /// loses nothing.
+  bound(): void {
+    if (end - start > maxBuffer) {
+      invalid += 1
+      start = end - maxBuffer
+    }
+  }
+}
+
+/// node-mavlink's MavLinkTLogPacketSplitter: frames from a tlog, each with its timestamp.
+export class MavLinkTLogPacketSplitter extends MavLinkPacketSplitter {
+  constructor(options: SplitterOptions = {}) {
+    super(options, true)
+  }
+}

@@ -1,0 +1,140 @@
+import { describe, it, expect } from "std/test"
+import { readBytes } from "std/fs"
+import { x25crc } from "./crc"
+import { MavLinkPacketSplitter } from "./splitter"
+import { MavLinkError, MavLinkPacketParser, MavLinkProtocol, MavLinkPacketSignature, MavLinkProtocolV1, MavLinkProtocolV2 } from "./protocol"
+import { Heartbeat, MavType } from "./dialects/minimal"
+import { ParamValue, SetupSigning, SysStatus } from "./dialects/common"
+
+const CAPTURE = "../../node-mavlink/examples/mavlink-v2-3412-packets.bin"
+
+function crc(): void {
+  const p = new TextEncoder().encode("123456789")
+  expect(x25crc(p, 0, p.length)).toBe(0x6F91)
+}
+
+async function counts(chunk: int): Promise<string> throws Error {
+  const bytes = await readBytes(CAPTURE)
+  const s = new MavLinkPacketSplitter()
+  let n = 0
+  for (let i = 0; i < bytes.length; i += chunk) {
+    n += s.push(bytes.slice(i, if (i + chunk < bytes.length) i + chunk else bytes.length)).length
+  }
+  `${n} ${s.validPackets}/${s.invalidPackets}/${s.unknownPackets}`
+}
+
+async function splitsTheCapture(): Promise<void> throws Error {
+  // node-mavlink 2.3.0 gives the same (oracle/counts.mjs).
+  expect(await counts(1 << 30)).toBe("3398 3398/0/14")
+  expect(await counts(1)).toBe("3398 3398/0/14")
+  expect(await counts(13)).toBe("3398 3398/0/14")
+}
+
+function heartbeat(): Heartbeat {
+  const h = new Heartbeat()
+  h.type = MavType.GCS as u8
+  h.mavlinkVersion = 3
+  h
+}
+
+function roundTripsBothVersions(): void {
+  const parser = new MavLinkPacketParser()
+  const protocols: MavLinkProtocol[] = [new MavLinkProtocolV1(42, 7), new MavLinkProtocolV2(42, 7)]
+  for (const proto of protocols) {
+    const frame = proto.serialize(heartbeat(), 300)
+    const s = new MavLinkPacketSplitter()
+    const got = s.push(frame)
+    expect(got.length).toBe(1)
+    const p = parser.parse(got[0].buffer)
+    expect(`${p.protocol.name()} ${p.header.sysid}/${p.header.compid} seq ${p.header.seq} msg ${p.header.msgid}`)
+      .toBe(`${proto.name()} 42/7 seq 44 msg 0`)
+    const m = p.protocol.data(p.payload, Heartbeat.INFO)
+    if (m instanceof Heartbeat) {
+      expect(m.type as int).toBe(MavType.GCS)
+      expect(m.mavlinkVersion as int).toBe(3)
+    } else {
+      expect("decoded").toBe("a Heartbeat")
+    }
+  }
+}
+
+function v2TruncatesV1Doesnt(): void {
+  const s = new SysStatus()
+  s.load = 500
+  const v1 = new MavLinkProtocolV1().serialize(s, 0)
+  const v2 = new MavLinkProtocolV2().serialize(s, 0)
+  // v1: the 31 base bytes (no extensions); v2: up to the last non-zero byte.
+  expect(v1[1]).toBe(31)
+  expect(v2[1] < 31).toBe(true)
+  const back = SysStatus.decode(new MavLinkProtocolV2().payload(v2))
+  expect(back.load as int).toBe(500)
+  // All zeros: v2 keeps the first byte.
+  expect(new MavLinkProtocolV2().serialize(new ParamValue(), 0)[1]).toBe(1)
+}
+
+function v1RefusesLargeIds(): void {
+  let code = "sent"
+  try {
+    new MavLinkProtocolV1().serialize(new SetupSigning(), 0)
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  expect(code).toBe("UNSUPPORTED_BY_V1")
+  // MAVLink 2 sends it.
+  expect(new MavLinkProtocolV2().serialize(new SetupSigning(), 0)[7]).toBe(0)
+}
+
+function signs(): void {
+  const key = MavLinkPacketSignature.key("qwerty")
+  const proto = new MavLinkProtocolV2(1, 1, MavLinkProtocolV2.IFLAG_SIGNED)
+  const signed = proto.sign(proto.serialize(heartbeat(), 0), 5, key, 1_700_000_000_000)
+  const s = new MavLinkPacketSplitter()
+  const got = s.push(signed)
+  expect(got.length).toBe(1)
+  const p = new MavLinkPacketParser().parse(got[0].buffer)
+  const sig = p.signature!
+  expect(sig.linkId).toBe(5)
+  expect(sig.timestamp).toBe((1_700_000_000_000 - MavLinkProtocolV2.SIGNATURE_START_TIME) * 100)
+  expect(sig.matches(key)).toBe(true)
+  expect(sig.matches(MavLinkPacketSignature.key("wrong"))).toBe(false)
+}
+
+function resynchronizes(): void {
+  // sysid 1: the default 254 is 0xFE, a MAVLink 1 start byte, which a resync would rightly try too.
+  const good = new MavLinkProtocolV2(1, 1).serialize(heartbeat(), 1)
+  const bad = good.slice(0, good.length)
+  bad.set(bad.length - 1, bad[bad.length - 1] ^ 0xFF)
+  // Junk without a start byte, then a frame whose CRC is wrong (drops one byte and resyncs).
+  const junk = new Uint8Array(5)
+  junk.set(2, 0x42)
+  const stream = new Uint8Array(junk.length + bad.length + good.length)
+  stream.setAll(junk, 0)
+  stream.setAll(bad, junk.length)
+  stream.setAll(good, junk.length + bad.length)
+  const s = new MavLinkPacketSplitter()
+  const got = s.push(stream)
+  expect(got.length).toBe(1)
+  expect(s.validPackets).toBe(1)
+  expect(s.invalidPackets).toBe(1)
+}
+
+function bounded(): void {
+  const s = new MavLinkPacketSplitter({ maxBuffer: 1024 })
+  // A start byte announcing a long frame, then noise: the buffer stays bounded.
+  const noise = new Uint8Array(100_000)
+  noise.set(0, 0xFD)
+  noise.set(1, 255)
+  s.push(noise)
+  expect(s.buffered <= 1024).toBe(true)
+}
+
+describe("framing", () => {
+  it("computes CRC-16/MCRF4XX", crc)
+  it("splits node-mavlink's capture as node-mavlink does, in any chunking", splitsTheCapture)
+  it("serializes and parses MAVLink 1 and 2", roundTripsBothVersions)
+  it("truncates v2 payloads, not v1, which carries only base fields", v2TruncatesV1Doesnt)
+  it("refuses ids above 255 in MAVLink 1", v1RefusesLargeIds)
+  it("signs and verifies MAVLink 2 frames", signs)
+  it("resynchronizes after junk and a bad CRC", resynchronizes)
+  it("keeps its buffer bounded", bounded)
+})

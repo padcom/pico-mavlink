@@ -14,6 +14,11 @@ git diff --exit-code --stat -- src/dialects
 echo "==> generated dialects match mavlink-mappings"
 node oracle/check-mappings.mjs
 
+echo "==> interop fixtures from node-mavlink are up to date"
+node oracle/interop.mjs > /dev/null
+pico fmt src/interop.test.pi > /dev/null
+git diff --exit-code --stat -- src/interop.test.pi
+
 echo "==> pico fmt and lint (hand-written code; the dialects keep mavlink-mappings' names)"
 pico fmt --check src/*.pi spike
 pico lint src/*.pi spike

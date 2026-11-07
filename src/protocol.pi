@@ -1,0 +1,372 @@
+// MAVLink 1 and 2 frames: headers, payloads, checksums, serialization and signing (node-mavlink's
+// MavLinkProtocolV1, MavLinkProtocolV2, MavLinkPacketSignature and MavLinkPacket).
+import { digest } from "std/crypto"
+import { MavLinkData, MessageInfo } from "./data"
+import { readUint, writeUint } from "./bytes"
+import { x25crc } from "./crc"
+
+export const CHECKSUM_LENGTH: int = 2
+export const SIGNATURE_LENGTH: int = 13
+
+/// What went wrong with a frame or a message.
+export class MavLinkError extends Error {
+  /// `INVALID_START_BYTE`, `UNSUPPORTED_BY_V1`, `TOO_SHORT`.
+  public readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.code = code
+  }
+}
+
+/// A frame's header.
+export class MavLinkPacketHeader {
+  /// From a tlog: when the packet was recorded, in ms since 1970 (UTC).
+  public timestamp: int? = null
+  /// The start byte: 0xFE (v1) or 0xFD (v2).
+  public magic: int = 0
+  public payloadLength: int = 0
+  public incompatibilityFlags: int = 0
+  public compatibilityFlags: int = 0
+  public seq: int = 0
+  public sysid: int = 0
+  public compid: int = 0
+  public msgid: int = 0
+}
+
+/// A version of the protocol: how frames of it are laid out.
+export abstract class MavLinkProtocol {
+  /// The defaults node-mavlink sends with: a ground station's system id and component id.
+  public static readonly SYS_ID: int = 254
+  public static readonly COMP_ID: int = 1
+
+  public sysid: int = MavLinkProtocol.SYS_ID
+  public compid: int = MavLinkProtocol.COMP_ID
+
+  /// `MAV_V1` or `MAV_V2`.
+  public abstract name(): string
+
+  /// The start byte.
+  public abstract startByte(): int
+
+  /// Where the payload starts in a frame.
+  public abstract payloadOffset(): int
+
+  /// `message` as a frame with sequence number `seq`.
+  public abstract serialize(message: MavLinkData, seq: int): Uint8Array throws MavLinkError
+
+  /// The header of `frame`.
+  public abstract header(frame: Uint8Array, timestamp: int? = null): MavLinkPacketHeader throws MavLinkError
+
+  /// The checksum `frame` carries.
+  public crc(frame: Uint8Array): int {
+    readUint(frame, payloadOffset() + frame[1], 2)
+  }
+
+  /// The payload bytes of `frame` (as sent: a MAVLink 2 payload may be truncated; decoding reads
+  /// zeros past its end).
+  public payload(frame: Uint8Array): Uint8Array {
+    frame.slice(payloadOffset(), payloadOffset() + frame[1])
+  }
+
+  /// The signature of `frame`, if it's a signed MAVLink 2 frame.
+  public virtual signature(frame: Uint8Array, header: MavLinkPacketHeader): MavLinkPacketSignature? {
+    null
+  }
+
+  /// The message in `payload`, as `info` describes it.
+  public data(payload: Uint8Array, info: MessageInfo): MavLinkData {
+    info.decode(payload)
+  }
+
+  /// Writes the CRC (over everything after the start byte, then CRC-extra) into the frame's last
+  /// `CHECKSUM_LENGTH` bytes.
+  protected finish(frame: Uint8Array, magic: int): Uint8Array {
+    const at = frame.length - CHECKSUM_LENGTH
+    writeUint(frame, at, 2, x25crc(frame, 1, at, magic))
+    frame
+  }
+}
+
+/// MAVLink 1: start byte 0xFE, a 6-byte header, one-byte message ids, no extensions, no signing.
+export class MavLinkProtocolV1 extends MavLinkProtocol {
+  public static readonly NAME: string = "MAV_V1"
+  public static readonly START_BYTE: int = 0xFE
+  public static readonly PAYLOAD_OFFSET: int = 6
+
+  constructor(sysid: int = MavLinkProtocol.SYS_ID, compid: int = MavLinkProtocol.COMP_ID) {
+    super()
+    this.sysid = sysid
+    this.compid = compid
+  }
+
+  public override name(): string {
+    MavLinkProtocolV1.NAME
+  }
+
+  public override startByte(): int {
+    MavLinkProtocolV1.START_BYTE
+  }
+
+  public override payloadOffset(): int {
+    MavLinkProtocolV1.PAYLOAD_OFFSET
+  }
+
+  /// A v1 frame carries the base payload: extension fields are MAVLink 2 only (the MAVLink spec;
+  /// node-mavlink 2.3.0 sends them in v1 frames too). Ids above 255 don't fit.
+  public override serialize(message: MavLinkData, seq: int): Uint8Array throws MavLinkError {
+    const info = message.info()
+    if (info.id > 255) {
+      throw new MavLinkError("UNSUPPORTED_BY_V1", `${info.name} (id ${info.id}) can't be sent as MAVLink 1: its id needs MAVLink 2`)
+    }
+    const full = new Uint8Array(info.payloadLength)
+    message.encode(full, 0)
+    const n = info.basePayloadLength
+    const frame = new Uint8Array(MavLinkProtocolV1.PAYLOAD_OFFSET + n + CHECKSUM_LENGTH)
+    frame.set(0, MavLinkProtocolV1.START_BYTE)
+    frame.set(1, n)
+    frame.set(2, seq & 0xFF)
+    frame.set(3, sysid)
+    frame.set(4, compid)
+    frame.set(5, info.id)
+    for (let i = 0; i < n; i++) {
+      frame.set(MavLinkProtocolV1.PAYLOAD_OFFSET + i, full[i])
+    }
+    finish(frame, info.magic)
+  }
+
+  public override header(frame: Uint8Array, timestamp: int? = null): MavLinkPacketHeader throws MavLinkError {
+    if (frame.length < MavLinkProtocolV1.PAYLOAD_OFFSET || frame[0] != MavLinkProtocolV1.START_BYTE) {
+      throw new MavLinkError("INVALID_START_BYTE", "not a MAVLink 1 frame")
+    }
+    const h = new MavLinkPacketHeader()
+    h.timestamp = timestamp
+    h.magic = frame[0]
+    h.payloadLength = frame[1]
+    h.seq = frame[2]
+    h.sysid = frame[3]
+    h.compid = frame[4]
+    h.msgid = frame[5]
+    h
+  }
+}
+
+/// MAVLink 2: start byte 0xFD, a 10-byte header, three-byte message ids, extensions, payloads
+/// without their trailing zeros, and optional signing.
+export class MavLinkProtocolV2 extends MavLinkProtocol {
+  public static readonly NAME: string = "MAV_V2"
+  public static readonly START_BYTE: int = 0xFD
+  public static readonly PAYLOAD_OFFSET: int = 10
+  /// The incompatibility flag of a signed frame.
+  public static readonly IFLAG_SIGNED: int = 0x01
+  /// Signature timestamps count 10 µs units from 2015-01-01 (UTC); this is that day in ms since 1970.
+  public static readonly SIGNATURE_START_TIME: int = 1_420_070_400_000
+
+  public incompatibilityFlags: int = 0
+  public compatibilityFlags: int = 0
+
+  constructor(sysid: int = MavLinkProtocol.SYS_ID, compid: int = MavLinkProtocol.COMP_ID,
+    incompatibilityFlags: int = 0, compatibilityFlags: int = 0) {
+    super()
+    this.sysid = sysid
+    this.compid = compid
+    this.incompatibilityFlags = incompatibilityFlags
+    this.compatibilityFlags = compatibilityFlags
+  }
+
+  public override name(): string {
+    MavLinkProtocolV2.NAME
+  }
+
+  public override startByte(): int {
+    MavLinkProtocolV2.START_BYTE
+  }
+
+  public override payloadOffset(): int {
+    MavLinkProtocolV2.PAYLOAD_OFFSET
+  }
+
+  public override serialize(message: MavLinkData, seq: int): Uint8Array throws MavLinkError {
+    const info = message.info()
+    const full = new Uint8Array(info.payloadLength)
+    message.encode(full, 0)
+    // Trailing zero bytes aren't sent (the first byte always is, per the MAVLink spec).
+    let n = full.length
+    while (n > 1 && full[n - 1] == 0) {
+      n -= 1
+    }
+    const frame = new Uint8Array(MavLinkProtocolV2.PAYLOAD_OFFSET + n + CHECKSUM_LENGTH)
+    frame.set(0, MavLinkProtocolV2.START_BYTE)
+    frame.set(1, n)
+    frame.set(2, incompatibilityFlags)
+    frame.set(3, compatibilityFlags)
+    frame.set(4, seq & 0xFF)
+    frame.set(5, sysid)
+    frame.set(6, compid)
+    writeUint(frame, 7, 3, info.id)
+    for (let i = 0; i < n; i++) {
+      frame.set(MavLinkProtocolV2.PAYLOAD_OFFSET + i, full[i])
+    }
+    finish(frame, info.magic)
+  }
+
+  /// `frame` (serialized with the IFLAG_SIGNED flag set) with a signature for `linkId` under
+  /// `key`, at `timestamp` (ms since 1970).
+  public sign(frame: Uint8Array, linkId: int, key: Uint8Array, timestamp: int): Uint8Array {
+    const signed = new Uint8Array(frame.length + SIGNATURE_LENGTH)
+    signed.setAll(frame, 0)
+    const s = new MavLinkPacketSignature(signed)
+    s.setLinkId(linkId)
+    s.setTimestamp((timestamp - MavLinkProtocolV2.SIGNATURE_START_TIME) * 100)
+    s.setSignature(s.calculate(key))
+    signed
+  }
+
+  public override header(frame: Uint8Array, timestamp: int? = null): MavLinkPacketHeader throws MavLinkError {
+    if (frame.length < MavLinkProtocolV2.PAYLOAD_OFFSET || frame[0] != MavLinkProtocolV2.START_BYTE) {
+      throw new MavLinkError("INVALID_START_BYTE", "not a MAVLink 2 frame")
+    }
+    const h = new MavLinkPacketHeader()
+    h.timestamp = timestamp
+    h.magic = frame[0]
+    h.payloadLength = frame[1]
+    h.incompatibilityFlags = frame[2]
+    h.compatibilityFlags = frame[3]
+    h.seq = frame[4]
+    h.sysid = frame[5]
+    h.compid = frame[6]
+    h.msgid = readUint(frame, 7, 3)
+    h
+  }
+
+  public override signature(frame: Uint8Array, header: MavLinkPacketHeader): MavLinkPacketSignature? {
+    if ((header.incompatibilityFlags & MavLinkProtocolV2.IFLAG_SIGNED) != 0) new MavLinkPacketSignature(frame) else null
+  }
+}
+
+/// The signature at the end of a signed MAVLink 2 frame: link id (1 byte), timestamp (6 bytes,
+/// 10 µs units since 2015) and the first 6 bytes of SHA-256(key + frame up to the signature's
+/// last 6 bytes).
+export class MavLinkPacketSignature {
+  readonly frame: Uint8Array
+
+  /// A key from a passphrase, as Mission Planner makes them: its SHA-256.
+  public static key(passphrase: string): Uint8Array {
+    digest("SHA-256", passphrase)
+  }
+
+  constructor(frame: Uint8Array) {
+    this.frame = frame
+  }
+
+  get at(): int {
+    frame.length - SIGNATURE_LENGTH
+  }
+
+  public get linkId(): int {
+    frame[at]
+  }
+
+  public setLinkId(value: int): void {
+    frame.set(at, value)
+  }
+
+  public get timestamp(): int {
+    readUint(frame, at + 1, 6)
+  }
+
+  public setTimestamp(value: int): void {
+    writeUint(frame, at + 1, 6, value)
+  }
+
+  /// The 6 signature bytes, as lowercase hex (node-mavlink's form).
+  public get signature(): string {
+    hex(frame.slice(at + 7, at + 13))
+  }
+
+  public setSignature(value: Uint8Array): void {
+    for (let i = 0; i < 6; i++) {
+      frame.set(at + 7 + i, value[i])
+    }
+  }
+
+  /// The signature this frame should carry under `key`.
+  public calculate(key: Uint8Array): Uint8Array {
+    const data = new Uint8Array(key.length + frame.length - 6)
+    data.setAll(key, 0)
+    data.setAll(frame.slice(0, frame.length - 6), key.length)
+    digest("SHA-256", data).slice(0, 6)
+  }
+
+  /// Whether the frame's signature is the one `key` makes.
+  public matches(key: Uint8Array): bool {
+    hex(calculate(key)) == signature
+  }
+
+  public toString(): string {
+    `linkid: ${linkId}, timestamp ${timestamp}, signature ${signature}`
+  }
+}
+
+function hex(b: Uint8Array): string {
+  const digits = "0123456789abcdef"
+  let s = ""
+  for (let i = 0; i < b.length; i++) {
+    s += `${digits[b[i] >> 4]}${digits[b[i] & 0xF]}`
+  }
+  s
+}
+
+/// A parsed frame.
+export class MavLinkPacket {
+  public readonly buffer: Uint8Array
+  public readonly header: MavLinkPacketHeader
+  public readonly payload: Uint8Array
+  public readonly crc: int
+  public readonly protocol: MavLinkProtocol
+  public readonly signature: MavLinkPacketSignature?
+
+  constructor(buffer: Uint8Array, header: MavLinkPacketHeader, payload: Uint8Array, crc: int,
+    protocol: MavLinkProtocol, signature: MavLinkPacketSignature?) {
+    this.buffer = buffer
+    this.header = header
+    this.payload = payload
+    this.crc = crc
+    this.protocol = protocol
+    this.signature = signature
+  }
+
+  /// The packet in one line, as node-mavlink's `debug()` writes it.
+  public debug(): string {
+    const crcBytes = new Uint8Array(2)
+    crcBytes.set(0, crc >> 8)
+    crcBytes.set(1, crc)
+    const crcHex = "0x" + hex(crcBytes)
+    const sig = if (signature == null) "" else `, ${signature!.toString()}`
+    `Packet (proto: ${protocol.name()}, sysid: ${header.sysid}, compid: ${header.compid}, msgid: ${header.msgid}, seq: ${header.seq}, plen: ${header.payloadLength}, crc: ${crcHex}${sig})`
+  }
+}
+
+/// The protocol whose frames start with `startByte`, or null.
+export function protocolOf(startByte: int): MavLinkProtocol? {
+  if (startByte == MavLinkProtocolV1.START_BYTE) {
+    return new MavLinkProtocolV1()
+  }
+  if (startByte == MavLinkProtocolV2.START_BYTE) {
+    return new MavLinkProtocolV2()
+  }
+  null
+}
+
+/// node-mavlink's MavLinkPacketParser: a whole frame (as the splitter gives them) as a packet.
+export class MavLinkPacketParser {
+  public parse(frame: Uint8Array, timestamp: int? = null): MavLinkPacket throws MavLinkError {
+    const protocol = protocolOf(if (frame.length > 0) frame[0] else -1)
+    if (protocol == null) {
+      throw new MavLinkError("INVALID_START_BYTE", "a frame starts with 0xFE or 0xFD")
+    }
+    const p = protocol!
+    const header = p.header(frame, timestamp)
+    new MavLinkPacket(frame, header, p.payload(frame), p.crc(frame), p, p.signature(frame, header))
+  }
+}

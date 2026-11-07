@@ -203,6 +203,28 @@ debugging. Behavior that must match node-mavlink:
 - **The XML isn't vendored.** `mavlink/mavlink` is LGPL-3.0, and its generated output is MIT by that project's exception. The generator reads it from a `mavlink-mappings` checkout, pinned by SHA-256.
 - **`scripts/check.sh` is the commit gate.** It regenerates and fails on any diff, runs the oracle, runs fmt and lint on the hand-written code, and runs the tests. The generated dialects keep `mavlink-mappings`' names (`GOPRO_RESOLUTION_480p`), which Pico's naming lint flags, so they're linted by the oracle instead.
 
+### 4.2 Interoperability, as built
+
+`oracle/interop.mjs` generates `src/interop.test.pi`. For each of the 296 messages, it sets
+seeded random values for every field (64-bit integers, floats, arrays and text included) and
+records node-mavlink 2.3.0's frames.
+- Pico MAVLink must serialize the message to the same bytes: v2, signed v2 (link 7, a fixed
+  timestamp, a passphrase key), and v1 where the ID fits.
+- For the 57 messages with extensions, the v1 frame is node-mavlink's without the extensions, with
+  that length and its CRC (§3.4).
+- Decoding node-mavlink's v2 frame must give back every value.
+
+All 296 pass.
+
+Two messages share a class name in different dialects (`SimState`: common's `SIM_STATE` and
+ardupilotmega's `SIMSTATE`), as in `mavlink-mappings`. Code that imports both aliases one of them.
+
+### 4.3 MAVLink 2 payload truncation
+
+The MAVLink spec keeps a payload's first byte even when every byte is zero. node-mavlink 2.3.0
+sends an empty payload then. Pico MAVLink follows the spec. Both parsers accept either, and the
+seeded values never produce an all-zero payload, so the interop cases don't hit it.
+
 ## 5. Operations
 
 PROJECT_DESCRIPTION asks for "classes implementing individual operations". Each is a small class
