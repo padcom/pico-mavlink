@@ -1,0 +1,80 @@
+// Whatever arrives on a link, receiving never panics: node-mavlink's capture with bytes flipped,
+// and random noise, through the splitter, the parser and the registry's decoders (seeded, so a
+// failure reproduces).
+import { describe, it, expect } from "std/test"
+import { readBytes } from "std/fs"
+import { MavLinkPacketParser } from "./protocol"
+import { MavLinkPacketSplitter } from "./splitter"
+import { defaultRegistry } from "./connection"
+
+/// A small deterministic generator (an LCG), so the same bytes are tried every run.
+class Random {
+  state: int
+
+  constructor(seed: int) {
+    this.state = seed
+  }
+
+  public next(n: int): int {
+    state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+    state % n
+  }
+}
+
+/// Splits, parses and decodes `bytes` in chunks; the number of messages decoded.
+function receive(bytes: Uint8Array, rng: Random): int {
+  const splitter = new MavLinkPacketSplitter()
+  const parser = new MavLinkPacketParser()
+  const registry = defaultRegistry()
+  let decoded = 0
+  let at = 0
+  while (at < bytes.length) {
+    const n = 1 + rng.next(700)
+    const end = if (at + n < bytes.length) at + n else bytes.length
+    for (const raw of splitter.push(bytes.slice(at, end))) {
+      try {
+        const p = parser.parse(raw.buffer, raw.timestamp)
+        const info = registry.get(p.header.msgid)
+        if (info != null) {
+          p.protocol.data(p.payload, info!)
+          decoded += 1
+        }
+      } catch (e: Error) {
+        // A parse error is an answer; a panic would end the test.
+      }
+    }
+    at = end
+  }
+  decoded
+}
+
+async function corruptedCapture(): Promise<void> throws Error {
+  const original = await readBytes("../../node-mavlink/examples/mavlink-v2-3412-packets.bin")
+  for (let round = 0; round < 5; round++) {
+    const rng = new Random(round + 1)
+    const bytes = original.slice(0, original.length)
+    // About one byte in fifty changed: lengths, flags, ids, payloads, CRCs.
+    for (let i = 0; i < bytes.length / 50; i++) {
+      bytes.set(rng.next(bytes.length), rng.next(256))
+    }
+    const decoded = receive(bytes, rng)
+    // Most frames still check out; the corrupted ones are dropped, never decoded wrongly.
+    expect(decoded > 1000 && decoded < 3398).toBe(true)
+  }
+}
+
+function noise(): void {
+  const rng = new Random(42)
+  const bytes = new Uint8Array(200_000)
+  for (let i = 0; i < bytes.length; i++) {
+    // Start bytes are common in this noise, so the splitter keeps trying frames.
+    bytes.set(i, if (rng.next(8) == 0) 0xFD else rng.next(256))
+  }
+  receive(bytes, rng)
+  expect(true).toBe(true)
+}
+
+describe("receiving damaged input", () => {
+  it("never panics on node-mavlink's capture with bytes flipped", corruptedCapture)
+  it("never panics on random noise full of start bytes", noise)
+})
