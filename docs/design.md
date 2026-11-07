@@ -173,7 +173,7 @@ debugging. Behavior that must match node-mavlink:
 
 - payloads shorter than the message are zero-filled (MAVLink 2 truncation, extensions);
 - `char[N]` decodes up to the first NUL, as text;
-- `uint8_t_mavlink_version` is written by the protocol (3 for v2), not by the user;
+- `uint8_t_mavlink_version`: `mavlink-mappings` documents it as "added by protocol", but node-mavlink's serializer writes the field's value as given. Pico MAVLink matches node-mavlink's bytes, and `HeartbeatSender` sets 3;
 - serialization truncates trailing zero bytes (v2 only), and the CRC covers the truncated packet
   plus CRC-extra.
 
