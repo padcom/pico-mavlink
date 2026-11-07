@@ -38,6 +38,7 @@ export {
 } from "./src/params"
 export {
   AutopilotVersionRead,
+  CommandCall,
   HeartbeatSender,
   Param,
   ParamList,

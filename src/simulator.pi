@@ -103,6 +103,14 @@ export class SimulatedAutopilot {
     if (m instanceof CommandLong) {
       const wants = (m.command as int == MavCmd.REQUEST_MESSAGE && m._param1 as int == AutopilotVersion.MSG_ID)
         || m.command as int == MavCmd.REQUEST_AUTOPILOT_CAPABILITIES
+      if (m.command as int == MavCmd.SET_MESSAGE_INTERVAL) {
+        // Accepted (its telemetry runs at its own pace anyway).
+        const ack = new CommandAck()
+        ack.command = m.command
+        ack.result = MavResult.ACCEPTED as u8
+        conn.send(ack)
+        return
+      }
       if (wants && answersVersion) {
         const ack = new CommandAck()
         ack.command = m.command

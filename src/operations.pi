@@ -6,7 +6,7 @@ import { MavLinkConnection, Received } from "./connection"
 import { MavLinkError } from "./protocol"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam, sameParam } from "./params"
 import { Heartbeat, MavAutopilot, MavState, MavType } from "./dialects/minimal"
-import { CommandLong, MavCmd, ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
+import { CommandAck, CommandLong, MavCmd, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
 import { AutopilotVersion } from "./dialects/standard"
 
 /// Which system and component an operation talks to (component 0: any component of the system).
@@ -410,4 +410,71 @@ export class AutopilotVersionRead {
 function isVersionFrom(r: Received, target: Target): bool {
   const m = r.message
   (m instanceof AutopilotVersion) && from(r, target)
+}
+
+/// Sends a COMMAND_LONG and waits for its COMMAND_ACK, asking again (with the confirmation number
+/// raised, as the protocol says) when no ack comes. IN_PROGRESS acks are waited past.
+export class CommandCall {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly timeoutMs: int
+  readonly retries: int
+  readonly signal: AbortSignal?
+
+  constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.timeoutMs = options.timeoutMs ?? 1000
+    this.retries = options.retries ?? 3
+    this.signal = options.signal
+  }
+
+  /// MAV_RESULT of `command` with up to seven parameters; a `TIMEOUT` MavLinkError when nothing
+  /// acks it.
+  public async run(command: int, params: f64[] = []): Promise<int> throws Error {
+    const name = MavCmd.nameOf(command) ?? `${command}`
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      checkAborted(signal, name)
+      const reply = conn.waitFor((r: Received) => isAckOf(r, this.target, command), timeoutMs, signal)
+      const c = new CommandLong()
+      c.targetSystem = this.target.system as u8
+      c.targetComponent = this.target.component as u8
+      c.command = command as u16
+      c.confirmation = attempt as u8
+      const p = (i: int) => (if (i < params.length) params[i] else 0.0) as f32
+      c._param1 = p(0)
+      c._param2 = p(1)
+      c._param3 = p(2)
+      c._param4 = p(3)
+      c._param5 = p(4)
+      c._param6 = p(5)
+      c._param7 = p(6)
+      await conn.send(c)
+      const r = await reply
+      if (r != null) {
+        const m = r!.message
+        if (m instanceof CommandAck) {
+          if (m.result as int != MavResult.IN_PROGRESS) {
+            return m.result as int
+          }
+        }
+      }
+    }
+    checkAborted(signal, name)
+    throw new MavLinkError("TIMEOUT", `no COMMAND_ACK for ${name} after ${retries + 1} tries`)
+  }
+
+  /// Asks for `messageId` every `intervalUs` microseconds (MAV_CMD_SET_MESSAGE_INTERVAL; -1 stops
+  /// it, 0 is the autopilot's default); MAV_RESULT.
+  public async setMessageInterval(messageId: int, intervalUs: int): Promise<int> throws Error {
+    await run(MavCmd.SET_MESSAGE_INTERVAL, [messageId as f64, intervalUs as f64])
+  }
+}
+
+function isAckOf(r: Received, target: Target, command: int): bool {
+  const m = r.message
+  if (m instanceof CommandAck) {
+    return from(r, target) && m.command as int == command
+  }
+  false
 }
