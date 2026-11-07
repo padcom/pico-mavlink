@@ -260,7 +260,7 @@ the magic numbers. The output is Pico instead of TypeScript.
 
 | # | Decision | Recommendation |
 |---|---|---|
-| D1 | License of `pico-mavlink` | MIT, like Pico Desktop, which the owner can grant for their own code. LGPL-3.0, as the originals, is the alternative |
+| D1 | License of `pico-mavlink` | **Decided (2026-11-07): MIT.** |
 | D2 | Names | keep node-mavlink's (`MavLinkPacketSplitter`, `MavLinkPacketParser`, `MavLinkProtocolV2`, `MavLinkData`, `MavLinkPacketSignature`, `REGISTRY`, `MSG_ID_MAGIC_NUMBER`, field names in camelCase as in `mavlink-mappings`). New names: `packets()`, `MavLinkConnection`, `Registry`, `MessageInfo`, `ParamValue`, `ParamEncoding` and the operation classes in §5 |
 | D3 | The byte-stream interface | each package declares its own and an application adapts them (no shared dependency); the alternative is a tiny shared `padcom/bytestream` |
 | D4 | The generator | TypeScript, adapted from `mavlink-mappings-gen`, emitting Pico, dev-time only; the alternative is a generator in Pico (needs an XML parser in Pico first) |
