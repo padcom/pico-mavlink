@@ -62,7 +62,19 @@ function encodings(): void {
   expect(encodingOf(0 as u64) == null).toBe(true)
 }
 
+function oddWireValues(): void {
+  // Whatever a link delivers, decoding doesn't panic.
+  const nan = (0.0 / 0.0) as f32
+  const inf = (1.0 / 0.0) as f32
+  expect(showParam(decodeParam(nan, MavParamType.INT32, ParamEncoding.CCast))).toBe("0")
+  expect(showParam(decodeParam(inf, MavParamType.INT8, ParamEncoding.CCast))).toBe("127")
+  expect(showParam(decodeParam(-inf, MavParamType.UINT16, ParamEncoding.CCast))).toBe("0")
+  expect(showParam(decodeParam(1.0e30 as f32, MavParamType.INT32, ParamEncoding.CCast))).toBe("2147483647")
+  expect(showParam(decodeParam(1.0e30 as f32, MavParamType.INT64, ParamEncoding.CCast))).toBe("9000000000000000")
+}
+
 describe("typed parameter values", () => {
+  it("decode NaN, infinities and out-of-range wire values without panicking (clamped)", oddWireValues)
   it("round-trip integers of every width in both encodings", intsBothWays)
   it("carry all 32 bits bytewise, NaN patterns included", bytewiseCarriesAll32Bits)
   it("refuse values that don't fit or that C-cast can't carry exactly", refusesWhatDoesntFit)

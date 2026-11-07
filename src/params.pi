@@ -94,7 +94,25 @@ export function decodeParam(wire: f32, type: int, encoding: ParamEncoding): Type
     return TypedParamValue.Int(v, type)
   }
   // C-cast (and 64-bit types, which PARAM_VALUE can only carry as a float's value).
-  TypedParamValue.Int((wire as f64) as int, type)
+  TypedParamValue.Int(castInt(wire as f64, type), type)
+}
+
+/// `f` as an integer of `type`, never panicking on what a link delivers: NaN is 0, and values
+/// outside the type's range (which a correct autopilot never sends) are clamped to it.
+function castInt(f: f64, type: int): int {
+  if (f != f) {
+    return 0
+  }
+  const bits = intBits(type)
+  const lo = if (bits == 0 || bits == 64) -9.0e15 else if (isSigned(type)) -((1 << (bits - 1)) as f64) else 0.0
+  const hi = if (bits == 0 || bits == 64) 9.0e15 else if (isSigned(type)) ((1 << (bits - 1)) - 1) as f64 else ((1 << bits) - 1) as f64
+  if (f <= lo) {
+    return lo as int
+  }
+  if (f >= hi) {
+    return hi as int
+  }
+  f as int
 }
 
 /// The float field for `value` (its type goes in `param_type`).
