@@ -1,0 +1,35 @@
+import { describe, it, expect } from "std/test"
+import { readBytes } from "std/fs"
+import { Splitter, x25crc } from "./splitter"
+
+const FIXTURE = "/home/padcom/projects/padcom/node-mavlink/examples/mavlink-v2-3412-packets.bin"
+
+async function counts(chunk: int): Promise<string> throws Error {
+  const bytes = await readBytes(FIXTURE)
+  const s = new Splitter()
+  let packets = 0
+  for (let i = 0; i < bytes.length; i += chunk) {
+    packets += s.push(bytes.slice(i, if (i + chunk < bytes.length) i + chunk else bytes.length)).length
+  }
+  `${packets} ${s.valid}/${s.invalid}/${s.unknown}`
+}
+
+async function splitsTheCapture(): Promise<void> throws Error {
+  const whole = await counts(1 << 30)
+  // 3412 frames: 3398 known and valid, 14 with ids outside the magic table (skipped, as node-mavlink does).
+  expect(whole).toBe("3398 3398/0/14")
+  // The same packets however the bytes arrive.
+  expect(await counts(1)).toBe(whole)
+  expect(await counts(7)).toBe(whole)
+}
+
+function crcOfAHeartbeat(): void {
+  // The CRC-16/MCRF4XX check value.
+  const p = new TextEncoder().encode("123456789")
+  expect(x25crc(p, 0, p.length)).toBe(0x6F91)
+}
+
+describe("splitter spike", () => {
+  it("finds the capture's 3412 packets, in any chunking", splitsTheCapture)
+  it("computes CRC-16/MCRF4XX", crcOfAHeartbeat)
+})

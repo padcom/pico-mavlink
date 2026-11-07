@@ -266,3 +266,16 @@ the magic numbers. The output is Pico instead of TypeScript.
 | D4 | The generator | TypeScript, adapted from `mavlink-mappings-gen`, emitting Pico, dev-time only; the alternative is a generator in Pico (needs an XML parser in Pico first) |
 | D5 | Repository | `padcom/pico-mavlink`, public, like `pico-desktop` (creating it needs the owner's go-ahead in this environment) |
 | D6 | MAVLink 1 | parse v1 (old radios still send it) and send v2 only |
+
+## 10. Spike result (2026-11-07)
+
+`spike/` ports node-mavlink's splitter rules to Pico: STX search, v1/v2 lengths, the signature
+flag, CRC-16/MCRF4XX with CRC-extra from `mavlink-mappings`' magic-number table, and dropping one
+byte on a CRC failure or a whole packet when the message is unknown.
+- On `node-mavlink/examples/mavlink-v2-3412-packets.bin` it finds all 3412 frames: 3398 valid, and
+  14 whose IDs aren't in the table, skipped as node-mavlink skips them. There are no CRC failures.
+- The result is the same for chunks of 1 byte, 7 bytes, or the whole file.
+- The CRC matches the CRC-16/MCRF4XX check value (`0x6F91` for `"123456789"`).
+
+So framing needs nothing Pico lacks. The real splitter (MV1) replaces the spike's copy-per-chunk
+buffer with a bounded ring buffer, and the node-mavlink oracle script confirms the 3398/0/14 counts.

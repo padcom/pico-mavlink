@@ -1,0 +1,87 @@
+// MV0 spike: node-mavlink's MavLinkPacketSplitter rules in Pico (STX search, length, CRC-extra,
+// resynchronization). Not the library: just a check that the design fits Pico.
+import { MAGIC } from "./magic"
+
+const STX_V1 = 0xFE
+const STX_V2 = 0xFD
+const SIGNATURE_LENGTH = 13
+
+/// MAVLink's CRC-16/MCRF4XX over bytes[from, to), then the CRC-extra byte if any (node-mavlink's x25crc).
+export function x25crc(b: Uint8Array, from: int, to: int, magic: int? = null): int {
+  let crc = 0xFFFF
+  const step = (byte: int) => {
+    let tmp = byte ^ (crc & 0xFF)
+    tmp = (tmp ^ (tmp << 4)) & 0xFF
+    crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+  }
+  for (let i = from; i < to; i++) {
+    step(b[i] as int)
+  }
+  if (magic != null) {
+    step(magic!)
+  }
+  crc
+}
+
+export class Splitter {
+  buffer: Uint8Array = new Uint8Array(0)
+  public valid: int = 0
+  public invalid: int = 0
+  public unknown: int = 0
+
+  start(): int {
+    for (let i = 0; i < buffer.length; i++) {
+      const b = buffer[i] as int
+      if (b == STX_V1 || b == STX_V2) {
+        return i
+      }
+    }
+    -1
+  }
+
+  /// The packets completed by `chunk`, as their bytes.
+  public push(chunk: Uint8Array): Uint8Array[] {
+    const joined = new Uint8Array(buffer.length + chunk.length)
+    joined.setAll(buffer, 0)
+    joined.setAll(chunk, buffer.length)
+    buffer = joined
+    const out: Uint8Array[] = []
+    while (buffer.length > 0) {
+      const at = start()
+      if (at < 0) {
+        buffer = new Uint8Array(0)
+        break
+      }
+      buffer = buffer.slice(at)
+      const v2 = (buffer[0] as int) == STX_V2
+      const header = if (v2) 10 else 6
+      if (buffer.length < header + 2) {
+        break
+      }
+      const signed = v2 && ((buffer[2] as int) & 1) != 0
+      const length = header + (buffer[1] as int) + 2 + (if (signed) SIGNATURE_LENGTH else 0)
+      if (buffer.length < length) {
+        break
+      }
+      const msgid = if (v2) (buffer[7] as int) | ((buffer[8] as int) << 8) | ((buffer[9] as int) << 16) else buffer[5] as int
+      const magic = MAGIC.get(msgid)
+      if (magic == null) {
+        unknown += 1
+        buffer = buffer.slice(length)
+        continue
+      }
+      const trim = 2 + (if (signed) SIGNATURE_LENGTH else 0)
+      const at2 = length - trim
+      const crc = (buffer[at2] as int) | ((buffer[at2 + 1] as int) << 8)
+      if (crc == x25crc(buffer, 1, at2, magic!)) {
+        valid += 1
+        out.push(buffer.slice(0, length))
+        buffer = buffer.slice(length)
+      } else {
+        invalid += 1
+        buffer = buffer.slice(1)
+      }
+    }
+    out
+  }
+}
