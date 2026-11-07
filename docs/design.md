@@ -162,6 +162,19 @@ export class Heartbeat extends MavLinkData {
 Each dialect module exports `REGISTRY: Map<int, MessageInfo>` and `MSG_ID_MAGIC_NUMBER`, as in
 `mavlink-mappings`.
 
+### 3.4 MAVLink 1 and 2 in one package
+
+The package is universal: it reads and writes both versions, as node-mavlink does.
+`MavLinkConnection` takes a `protocol` (`MavLinkProtocolV1` or `MavLinkProtocolV2`, default V2) for
+sending, and parses whatever arrives. A v1 frame is limited in what it can carry, so sending one is
+checked rather than silently cut:
+- message IDs above 255 don't fit v1's one-byte ID: `send` fails with `UNSUPPORTED_BY_V1`;
+- v1 has no extension fields: they aren't sent, and the payload is the base length;
+- v1 has no signing: `sendSigned` is V2 only, as in node-mavlink;
+- v1 frames aren't truncated; v2 frames drop trailing zero bytes.
+
+The fixtures (§7) cover both directions for both versions.
+
 ## 4. Why generated codecs, not reflection
 
 `protocol.data()` in node-mavlink walks `FIELDS` and sets properties by name. Pico has `std/reflect`,
@@ -264,8 +277,8 @@ the magic numbers. The output is Pico instead of TypeScript.
 | D2 | Names | keep node-mavlink's (`MavLinkPacketSplitter`, `MavLinkPacketParser`, `MavLinkProtocolV2`, `MavLinkData`, `MavLinkPacketSignature`, `REGISTRY`, `MSG_ID_MAGIC_NUMBER`, field names in camelCase as in `mavlink-mappings`). New names: `packets()`, `MavLinkConnection`, `Registry`, `MessageInfo`, `ParamValue`, `ParamEncoding` and the operation classes in §5 |
 | D3 | The byte-stream interface | each package declares its own and an application adapts them (no shared dependency); the alternative is a tiny shared `padcom/bytestream` |
 | D4 | The generator | TypeScript, adapted from `mavlink-mappings-gen`, emitting Pico, dev-time only; the alternative is a generator in Pico (needs an XML parser in Pico first) |
-| D5 | Repository | `padcom/pico-mavlink`, public, like `pico-desktop` (creating it needs the owner's go-ahead in this environment) |
-| D6 | MAVLink 1 | parse v1 (old radios still send it) and send v2 only |
+| D5 | Repository and package name | **Decided (2026-11-07):** repository `padcom/pico-mavlink` (public), package `padcom/pico-mavlink`: the folder's name, with the `scope/` Pico requires |
+| D6 | MAVLink 1 | **Decided (2026-11-07):** one universal package that reads and writes both v1 and v2, as node-mavlink does |
 
 ## 10. Spike result (2026-11-07)
 
