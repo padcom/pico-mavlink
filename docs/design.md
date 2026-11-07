@@ -219,7 +219,26 @@ All 296 pass.
 Two messages share a class name in different dialects (`SimState`: common's `SIM_STATE` and
 ardupilotmega's `SIMSTATE`), as in `mavlink-mappings`. Code that imports both aliases one of them.
 
-### 4.3 MAVLink 2 payload truncation
+### 4.3 Captures, and a node-mavlink bug Pico doesn't copy
+
+`oracle/counts.mjs` runs node-mavlink's splitter over its own example captures, with the magic
+numbers of the four generated dialects so that both sides know the same messages. Pico's
+splitter gives the same counts:
+
+| Capture | Frames | valid/invalid/unknown |
+|---|---|---|
+| `mavlink-v2-3412-packets.bin` | 3398 | 3398/0/14 |
+| `GH-5.bin` | 137 | 137/0/1 |
+| `vtol.tlog` (tlog splitter) | 23894 | 23894/0/0 |
+
+The tlog count is node-mavlink's when it gets the file in **one** chunk. With 64 KB chunks it
+finds 23887, and with 4 KB chunks 23630. When a frame is incomplete at the end of a chunk, its
+splitter fast-forwards to the start byte (`buffer.slice(offset)`) and drops the 8-byte
+timestamp; the next chunk then needs 8 bytes before that start byte, and the frame is lost. A
+first port reproduced that exactly, chunk size by chunk size. Pico keeps the timestamp, and finds
+all 23894 frames for chunks of any size, down to 1 byte. Worth fixing in node-mavlink too.
+
+### 4.4 MAVLink 2 payload truncation
 
 The MAVLink spec keeps a payload's first byte even when every byte is zero. node-mavlink 2.3.0
 sends an empty payload then. Pico MAVLink follows the spec. Both parsers accept either, and the

@@ -32,6 +32,8 @@ export class MavLinkPacketSplitter {
   /// The bytes waiting are buffer[start, end).
   start: int = 0
   end: int = 0
+  /// Where the search for the next start byte goes on from (start <= scan <= end).
+  scan: int = 0
   valid: int = 0
   invalid: int = 0
   unknown: int = 0
@@ -73,53 +75,63 @@ export class MavLinkPacketSplitter {
   public push(chunk: Uint8Array): RawPacket[] {
     append(chunk)
     const out: RawPacket[] = []
-    while (end > start) {
-      const at = findStart()
-      if (at < 0) {
-        // Keep up to 7 bytes in a tlog: they may be the next frame's timestamp.
-        start = if (tlog && end - start > 7) end - 7 else if (tlog) start else end
+    while (true) {
+      const f = findStart()
+      if (f < 0) {
+        // Nothing more to find. In a tlog keep the last 8 bytes: they may be the next frame's
+        // timestamp.
+        start = if (tlog && end - start > 8) end - 8 else if (tlog) start else end
+        scan = end
         break
       }
-      const timestamp = if (tlog) readTimestamp(at) else null
-      start = at
-      const v2 = buffer[start] == MavLinkProtocolV2.START_BYTE
+      const v2 = buffer[f] == MavLinkProtocolV2.START_BYTE
       const offset = if (v2) MavLinkProtocolV2.PAYLOAD_OFFSET else MavLinkProtocolV1.PAYLOAD_OFFSET
-      if (end - start < offset + CHECKSUM_LENGTH) {
+      const signed = end - f > 2 && v2 && (buffer[f + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0
+      const length = if (end - f < 2) -1 else offset + buffer[f + 1] + CHECKSUM_LENGTH + (if (signed) SIGNATURE_LENGTH else 0)
+      if (end - f < offset + CHECKSUM_LENGTH || end - f < length) {
+        // Wait for the rest. A tlog frame keeps its timestamp: dropping it lost frames that a
+        // chunk boundary cut (node-mavlink 2.3.0 does lose them).
+        start = if (tlog) f - 8 else f
+        scan = f
         break
       }
-      const signed = v2 && (buffer[start + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0
-      const length = offset + buffer[start + 1] + CHECKSUM_LENGTH + (if (signed) SIGNATURE_LENGTH else 0)
-      if (end - start < length) {
-        break
-      }
-      const msgid = if (v2) readUint(buffer, start + 7, 3) else buffer[start + 5]
+      const timestamp = if (tlog) readTimestamp(f) else null
+      const msgid = if (v2) readUint(buffer, f + 7, 3) else buffer[f + 5]
       const magic = magicNumbers.get(msgid)
       if (magic == null) {
         unknown += 1
-        start += length
+        start = f + length
+        scan = start
         continue
       }
-      const crcAt = start + offset + buffer[start + 1]
-      if (readUint(buffer, crcAt, 2) == x25crc(buffer, start + 1, crcAt, magic!)) {
+      const crcAt = f + offset + buffer[f + 1]
+      if (readUint(buffer, crcAt, 2) == x25crc(buffer, f + 1, crcAt, magic!)) {
         valid += 1
-        out.push({ buffer: buffer.slice(start, start + length), timestamp })
-        start += length
+        out.push({ buffer: buffer.slice(f, f + length), timestamp })
+        start = f + length
+        scan = start
       } else {
+        // A false start byte: look again from the next byte (a tlog frame there still needs the
+        // 8 bytes before it, so what's consumed stays).
         invalid += 1
         const report = onCrcError
         if (report != null) {
-          report!(buffer.slice(start, start + length))
+          report!(buffer.slice(f, f + length))
         }
-        start += 1
+        scan = f + 1
+        if (!tlog) {
+          start = scan
+        }
       }
     }
     bound()
     out
   }
 
-  /// The first start byte at or after `start` (in a tlog, with 8 bytes before it), or -1.
+  /// The first start byte from `scan` on (in a tlog, with 8 bytes before it), or -1.
   findStart(): int {
-    for (let i = if (tlog) start + 8 else start; i < end; i++) {
+    const lead = if (tlog) start + 8 else start
+    for (let i = if (scan > lead) scan else lead; i < end; i++) {
       const b = buffer[i]
       if (b == MavLinkProtocolV1.START_BYTE || b == MavLinkProtocolV2.START_BYTE) {
         return i
@@ -147,6 +159,7 @@ export class MavLinkPacketSplitter {
       const next = new Uint8Array(size)
       next.setAll(buffer.slice(start, end), 0)
       buffer = next
+      scan -= start
       start = 0
       end = waiting
     }
@@ -161,6 +174,9 @@ export class MavLinkPacketSplitter {
     if (end - start > maxBuffer) {
       invalid += 1
       start = end - maxBuffer
+      if (scan < start) {
+        scan = start
+      }
     }
   }
 }
