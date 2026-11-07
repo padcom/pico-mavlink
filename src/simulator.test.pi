@@ -7,7 +7,7 @@ import { AutopilotVersionRead, ParamList, ParamWrite, VehicleDiscovery } from ".
 import { ParamEncoding as Enc, encodingOf } from "./params"
 import { SimulatedAutopilot } from "./simulator"
 import { MavType } from "./dialects/minimal"
-import { Attitude, MavParamType, SysStatus } from "./dialects/common"
+import { Attitude, MavParamType, ParamValue, SysStatus } from "./dialects/common"
 
 async function looksLikeAVehicle(): Promise<void> throws Error {
   const ends = MemoryStream.pair()
@@ -32,6 +32,16 @@ async function looksLikeAVehicle(): Promise<void> throws Error {
   expect(version != null && encodingOf(version!.capabilities) == Enc.CCast).toBe(true)
   sim.answersVersion = false
   expect((await new AutopilotVersionRead(gcs, { system: 1, component: 1 }, { timeoutMs: 20, retries: 1 }).run()) == null).toBe(true)
+  let announced = ""
+  gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof ParamValue && m.paramId == "RTL_ALT") {
+      announced = `${m.paramId}=${m.paramValue}`
+    }
+  })
+  sim.change("RTL_ALT", TypedParamValue.Int(2500, MavParamType.INT32))
+  await delay(10)
+  expect(announced).toBe("RTL_ALT=2500")
   sim.rounding = ["LOIT_SPEED"]
   const w = await new ParamWrite(gcs, { system: 1, component: 1 }, ParamEncoding.CCast).run("LOIT_SPEED", TypedParamValue.Real(1000.6, MavParamType.REAL32))
   sim.stop()

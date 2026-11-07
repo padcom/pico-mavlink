@@ -60,6 +60,16 @@ export class SimulatedAutopilot {
     timer = setInterval(() => tick(), intervalMs)
   }
 
+  /// Changes a parameter as something else would (another ground station, the autopilot itself),
+  /// and broadcasts its PARAM_VALUE, as autopilots do.
+  public change(id: string, value: TypedParamValue): void {
+    const i = indexOf(id)
+    if (i >= 0) {
+      params[i] = { id: id, value: value }
+      send(i)
+    }
+  }
+
   public stop(): void {
     clearInterval(timer)
     conn.close()
