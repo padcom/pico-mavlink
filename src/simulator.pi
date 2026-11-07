@@ -7,7 +7,8 @@ import { MavLinkProtocolV2 } from "./protocol"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam } from "./params"
 import { ByteStream } from "./stream"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, MavParamType, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, SysStatus } from "./dialects/common"
+import { Attitude, CommandAck, CommandLong, MavCmd, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, SysStatus } from "./dialects/common"
+import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
 
 /// One parameter of the simulated vehicle.
 export struct SimParam {
@@ -42,6 +43,8 @@ export class SimulatedAutopilot {
   public ticks: int = 0
   /// Parameter writes it rounds to whole numbers (an autopilot that changes what it's given).
   public rounding: string[] = []
+  /// Whether it answers requests for AUTOPILOT_VERSION (an old autopilot may not).
+  public answersVersion: bool = true
   timer: int = -1
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams()) {
@@ -87,7 +90,22 @@ export class SimulatedAutopilot {
 
   handle(r: Received): void {
     const m = r.message
-    if (m instanceof ParamRequestList) {
+    if (m instanceof CommandLong) {
+      const wants = (m.command as int == MavCmd.REQUEST_MESSAGE && m._param1 as int == AutopilotVersion.MSG_ID)
+        || m.command as int == MavCmd.REQUEST_AUTOPILOT_CAPABILITIES
+      if (wants && answersVersion) {
+        const ack = new CommandAck()
+        ack.command = m.command
+        ack.result = MavResult.ACCEPTED as u8
+        conn.send(ack)
+        const v = new AutopilotVersion()
+        v.capabilities = (MavProtocolCapability.PARAM_ENCODE_C_CAST | MavProtocolCapability.MAVLINK2
+            | MavProtocolCapability.MISSION_INT | MavProtocolCapability.COMMAND_INT) as u64
+        v.flightSwVersion = 0x04050700   // 4.5.7 official
+        conn.send(v)
+      }
+      return
+    } else if (m instanceof ParamRequestList) {
       for (let i = 0; i < params.length; i++) {
         send(i)
       }

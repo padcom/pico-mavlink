@@ -37,6 +37,7 @@ export {
   showParam,
 } from "./src/params"
 export {
+  AutopilotVersionRequest,
   HeartbeatSender,
   Param,
   ParamList,

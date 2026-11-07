@@ -6,7 +6,8 @@ import { MavLinkConnection, Received } from "./connection"
 import { MavLinkError } from "./protocol"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam, sameParam } from "./params"
 import { Heartbeat, MavAutopilot, MavState, MavType } from "./dialects/minimal"
-import { ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
+import { CommandLong, MavCmd, ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
+import { AutopilotVersion } from "./dialects/standard"
 
 /// Which system and component an operation talks to (component 0: any component of the system).
 export struct Target {
@@ -335,4 +336,53 @@ function paramTypeOf(v: TypedParamValue): int {
     Int { type } => type,
     Real { type } => type,
   }
+}
+
+/// Asks the autopilot for AUTOPILOT_VERSION (its capabilities say how it encodes parameters, see
+/// `encodingOf`). MAV_CMD_REQUEST_MESSAGE first; after half the tries the older
+/// MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES, for autopilots that predate it.
+export class AutopilotVersionRequest {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly timeoutMs: int
+  readonly retries: int
+
+  constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.timeoutMs = options.timeoutMs ?? 1000
+    this.retries = options.retries ?? 3
+  }
+
+  /// The autopilot's AUTOPILOT_VERSION, or null when it never answers.
+  public async run(): Promise<AutopilotVersion?> throws Error {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const reply = conn.waitFor((r: Received) => isVersionFrom(r, this.target), timeoutMs)
+      const c = new CommandLong()
+      c.targetSystem = this.target.system as u8
+      c.targetComponent = this.target.component as u8
+      c.confirmation = attempt as u8
+      if (attempt <= retries / 2) {
+        c.command = MavCmd.REQUEST_MESSAGE as u16
+        c._param1 = AutopilotVersion.MSG_ID as f32
+      } else {
+        c.command = MavCmd.REQUEST_AUTOPILOT_CAPABILITIES as u16
+        c._param1 = 1.0 as f32
+      }
+      await conn.send(c)
+      const r = await reply
+      if (r != null) {
+        const m = r!.message
+        if (m instanceof AutopilotVersion) {
+          return m
+        }
+      }
+    }
+    null
+  }
+}
+
+function isVersionFrom(r: Received, target: Target): bool {
+  const m = r.message
+  (m instanceof AutopilotVersion) && from(r, target)
 }
