@@ -40,6 +40,31 @@ for await (const r of conn.messages()) {
 }
 ```
 
+Parameters, with their types kept (C-cast for ArduPilot, bytewise for PX4: ask the autopilot with
+`AutopilotVersionRead` and `encodingOf`):
+
+```pico
+import { MavParamType, ParamEncoding, ParamList, ParamWrite, TypedParamValue, showParam } from "padcom/pico-mavlink"
+
+conn.run()   // hands every message to the operations
+const target = { system: 1, component: 1 }
+const list = await new ParamList(conn, target, ParamEncoding.CCast).run()
+println(`${list.params.length} of ${list.count}${if (list.complete) "" else ", some missing"}`)
+
+const r = await new ParamWrite(conn, target, ParamEncoding.CCast).run("RTL_ALT", TypedParamValue.Int(2000, MavParamType.INT32))
+println(if (r.verified) "written" else `the vehicle reports ${showParam(r.param.value)}`)
+```
+
+Signing, as the sender and as the receiver:
+
+```pico
+const key = MavLinkPacketSignature.key("passphrase")
+await conn.sendSigned(new Heartbeat(), key)
+const strict = new MavLinkConnection(stream, { signing: new SigningPolicy(key, UnsignedPolicy.Reject) })
+```
+
+`SimulatedAutopilot` gives you a vehicle on the other end of a `MemoryStream.pair()` for tests and demos.
+
 Two dialects share some class names: ardupilotmega's `SIMSTATE` and its `MAV_CMD` additions
 clash with common's. The package exports the later ones with the dialect's name as a prefix
 (`ArdupilotmegaSimState`, `ArdupilotmegaMavCmd`).
