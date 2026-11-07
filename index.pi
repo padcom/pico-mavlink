@@ -25,6 +25,7 @@ export {
 export { MavLinkPacketSplitter, MavLinkTLogPacketSplitter, RawPacket, SplitterOptions } from "./src/splitter"
 export { ByteStream, FileStream, MemoryStream, TcpStream, UdpStream } from "./src/stream"
 export { ConnectionOptions, MavLinkConnection, Received, defaultRegistry, packets } from "./src/connection"
+export { Rejection, SigningPolicy, UnsignedPolicy } from "./src/signing"
 export {
   ParamEncoding,
   ParamError,

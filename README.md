@@ -19,7 +19,10 @@ Status: **in development (MV1).**
   missing, and says when a list stays incomplete), `ParamRead`, and `ParamWrite` (verifies the
   read-back; a changed value is reported, never taken as success). They're tested against a
   simulated autopilot.
-- **Next:** ArduPilot SITL over UDP/TCP, and signing policy (MV2).
+- **Done:** a signing policy for received packets: signatures checked, replays rejected per
+  system, component and link, and unsigned packets accepted, accepted for listed messages, or
+  rejected.
+- **Next:** ArduPilot SITL over UDP/TCP (MV2).
 
 ```pico
 import { bind } from "std/net"

@@ -1,0 +1,67 @@
+// Which received packets to trust: MAVLink 2 signing (https://mavlink.io/en/guide/message_signing.html).
+// A signed packet counts when its signature matches the key and its timestamp is newer than the
+// last one accepted from the same system, component and link (replays are rejected). Unsigned
+// packets are accepted, accepted only for listed messages (RADIO_STATUS from a radio that can't
+// sign, for example), or rejected.
+import { MavLinkPacket } from "./protocol"
+
+/// What happens to unsigned packets.
+export enum UnsignedPolicy {
+  Accept,
+  /// Only these message ids.
+  AcceptListed(ids: int[]),
+  Reject,
+}
+
+/// Why a packet wasn't accepted.
+export enum Rejection {
+  Unsigned,
+  BadSignature,
+  /// Its timestamp isn't newer than the last accepted from the same system, component and link.
+  Replay,
+}
+
+export class SigningPolicy {
+  readonly key: Uint8Array
+  readonly unsigned: UnsignedPolicy
+  /// The last timestamp accepted per system, component and link.
+  readonly last: Map<int, int> = new Map<int, int>()
+  public rejectedUnsigned: int = 0
+  public rejectedSignature: int = 0
+  public rejectedReplay: int = 0
+
+  constructor(key: Uint8Array, unsigned: UnsignedPolicy = UnsignedPolicy.Reject) {
+    this.key = key
+    this.unsigned = unsigned
+  }
+
+  /// Null when `p` is to be trusted; otherwise why not (and the matching counter goes up).
+  public check(p: MavLinkPacket): Rejection? {
+    const s = p.signature
+    if (s == null) {
+      const ok = match (unsigned) {
+        Accept { } => true,
+        AcceptListed { ids } => ids.includes(p.header.msgid),
+        Reject { } => false,
+      }
+      if (ok) {
+        return null
+      }
+      rejectedUnsigned += 1
+      return Rejection.Unsigned
+    }
+    const sig = s!
+    if (!sig.matches(key)) {
+      rejectedSignature += 1
+      return Rejection.BadSignature
+    }
+    const stream = (p.header.sysid << 16) | (p.header.compid << 8) | sig.linkId
+    const before = last.get(stream)
+    if (before != null && sig.timestamp <= before!) {
+      rejectedReplay += 1
+      return Rejection.Replay
+    }
+    last.set(stream, sig.timestamp)
+    null
+  }
+}

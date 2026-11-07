@@ -1,0 +1,71 @@
+import { describe, it, expect } from "std/test"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkPacketParser, MavLinkPacketSignature, MavLinkProtocolV2 } from "./protocol"
+import { SigningPolicy, UnsignedPolicy } from "./signing"
+import { Heartbeat } from "./dialects/minimal"
+import { RadioStatus } from "./dialects/common"
+
+const KEY = MavLinkPacketSignature.key("secret")
+const SIGNER = new MavLinkProtocolV2(1, 1, MavLinkProtocolV2.IFLAG_SIGNED)
+
+function signed(ts: int, key: Uint8Array = KEY, link: int = 1): Uint8Array {
+  SIGNER.sign(SIGNER.serialize(new Heartbeat(), 0), link, key, ts)
+}
+
+function verdict(policy: SigningPolicy, frame: Uint8Array): string {
+  const r = policy.check(new MavLinkPacketParser().parse(frame))
+  if (r == null) "ok" else match (r!) {
+    Unsigned { } => "unsigned",
+    BadSignature { } => "bad signature",
+    Replay { } => "replay",
+  }
+}
+
+function checksSignaturesAndReplays(): void {
+  const p = new SigningPolicy(KEY)
+  expect(verdict(p, signed(1_700_000_000_000))).toBe("ok")
+  expect(verdict(p, signed(1_700_000_000_001))).toBe("ok")
+  // The same timestamp again, or an older one: a replay.
+  expect(verdict(p, signed(1_700_000_000_001))).toBe("replay")
+  expect(verdict(p, signed(1_600_000_000_000))).toBe("replay")
+  // Another link has its own timeline.
+  expect(verdict(p, signed(1_600_000_000_000, KEY, 2))).toBe("ok")
+  expect(verdict(p, signed(1_700_000_000_005, MavLinkPacketSignature.key("wrong")))).toBe("bad signature")
+  // A tampered payload breaks the signature.
+  const t = signed(1_700_000_000_009)
+  t.set(10, t[10] ^ 1)
+  expect(verdict(p, t)).toBe("bad signature")
+  expect(`${p.rejectedReplay} ${p.rejectedSignature}`).toBe("2 2")
+}
+
+function unsignedPolicies(): void {
+  const plain = new MavLinkProtocolV2(1, 1).serialize(new Heartbeat(), 0)
+  const radio = new MavLinkProtocolV2(1, 1).serialize(new RadioStatus(), 0)
+  expect(verdict(new SigningPolicy(KEY), plain)).toBe("unsigned")
+  expect(verdict(new SigningPolicy(KEY, UnsignedPolicy.Accept), plain)).toBe("ok")
+  const listed = new SigningPolicy(KEY, UnsignedPolicy.AcceptListed([RadioStatus.MSG_ID]))
+  expect(`${verdict(listed, radio)} ${verdict(listed, plain)}`).toBe("ok unsigned")
+}
+
+async function connectionDropsUntrusted(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const policy = new SigningPolicy(KEY)
+  const gcs = new MavLinkConnection(ends[0], { signing: policy })
+  const vehicle = new MavLinkConnection(ends[1])
+  await vehicle.send(new Heartbeat())
+  await vehicle.sendSigned(new Heartbeat(), KEY, 1, 1_700_000_000_000)
+  await vehicle.sendSigned(new Heartbeat(), MavLinkPacketSignature.key("wrong"), 1, 1_700_000_000_001)
+  vehicle.close()
+  let n = 0
+  for await (const _ of gcs.messages()) {
+    n += 1
+  }
+  expect(`${n} kept, ${policy.rejectedUnsigned} unsigned, ${policy.rejectedSignature} forged`).toBe("1 kept, 1 unsigned, 1 forged")
+}
+
+describe("signing policy", () => {
+  it("checks signatures and rejects replays per system, component and link", checksSignaturesAndReplays)
+  it("accepts, lists or rejects unsigned packets", unsignedPolicies)
+  it("makes a connection drop what it doesn't trust", connectionDropsUntrusted)
+})
