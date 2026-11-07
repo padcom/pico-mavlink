@@ -278,4 +278,8 @@ byte on a CRC failure or a whole packet when the message is unknown.
 - The CRC matches the CRC-16/MCRF4XX check value (`0x6F91` for `"123456789"`).
 
 So framing needs nothing Pico lacks. The real splitter (MV1) replaces the spike's copy-per-chunk
-buffer with a bounded ring buffer, and the node-mavlink oracle script confirms the 3398/0/14 counts.
+buffer with a bounded ring buffer.
+
+The oracle agrees. `oracle/counts.mjs` runs the published `node-mavlink@2.3.0` and
+`mavlink-mappings@1.0.22-20260311` (dev-time, `npm install` in `oracle/`) over the same capture,
+and prints `3398 3398/0/14`, as the Pico spike does.
