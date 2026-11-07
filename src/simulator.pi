@@ -1,0 +1,142 @@
+// A simulated autopilot: a vehicle on the far end of a byte stream, for trying an application (or
+// testing it) without hardware or SITL. It's ArduPilot Copter-like: system 1, component 1,
+// C-cast parameters, HEARTBEAT, SYS_STATUS and ATTITUDE once a second (or as fast as asked), and it
+// answers PARAM_REQUEST_LIST, PARAM_REQUEST_READ and PARAM_SET. Its data is deterministic.
+import { MavLinkConnection, Received } from "./connection"
+import { MavLinkProtocolV2 } from "./protocol"
+import { ParamEncoding, TypedParamValue, decodeParam, encodeParam } from "./params"
+import { ByteStream } from "./stream"
+import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
+import { Attitude, MavParamType, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, SysStatus } from "./dialects/common"
+
+/// One parameter of the simulated vehicle.
+export struct SimParam {
+  id: string
+  value: TypedParamValue
+}
+
+/// ArduPilot Copter-like parameters (the Drone Configurator's fixtures use the same).
+export function defaultSimParams(): SimParam[] {
+  const i32 = MavParamType.INT32
+  const r32 = MavParamType.REAL32
+  [
+    { id: "ARMING_CHECK", value: TypedParamValue.Int(1, i32) },
+    { id: "BATT_CAPACITY", value: TypedParamValue.Int(5200, i32) },
+    { id: "BATT_LOW_VOLT", value: TypedParamValue.Real(10.5, r32) },
+    { id: "FENCE_ENABLE", value: TypedParamValue.Int(0, MavParamType.INT8) },
+    { id: "FENCE_RADIUS", value: TypedParamValue.Real(150.0, r32) },
+    { id: "FS_THR_ENABLE", value: TypedParamValue.Int(1, MavParamType.INT8) },
+    { id: "LOIT_SPEED", value: TypedParamValue.Real(1250.0, r32) },
+    { id: "PILOT_SPEED_UP", value: TypedParamValue.Int(250, MavParamType.INT16) },
+    { id: "RTL_ALT", value: TypedParamValue.Int(1500, i32) },
+    { id: "SERIAL0_BAUD", value: TypedParamValue.Int(115, i32) },
+    { id: "SYSID_THISMAV", value: TypedParamValue.Int(1, MavParamType.INT16) },
+    { id: "WPNAV_SPEED", value: TypedParamValue.Real(1000.0, r32) },
+  ]
+}
+
+export class SimulatedAutopilot {
+  public readonly conn: MavLinkConnection
+  public readonly params: SimParam[]
+  /// Telemetry ticks so far (the battery drains and the vehicle sways with them).
+  public ticks: int = 0
+  /// Parameter writes it rounds to whole numbers (an autopilot that changes what it's given).
+  public rounding: string[] = []
+  timer: int = -1
+
+  constructor(stream: ByteStream, params: SimParam[] = defaultSimParams()) {
+    this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(1, 1) })
+    this.params = params
+    conn.on((r: Received) => this.handle(r))
+  }
+
+  /// Starts answering and sending telemetry every `intervalMs`.
+  public start(intervalMs: int = 1000): void {
+    conn.run()
+    tick()
+    timer = setInterval(() => tick(), intervalMs)
+  }
+
+  public stop(): void {
+    clearInterval(timer)
+    conn.close()
+  }
+
+  tick(): void {
+    const armed = ticks >= 3
+    const h = new Heartbeat()
+    h.type = MavType.QUADROTOR as u8
+    h.autopilot = MavAutopilot.ARDUPILOTMEGA as u8
+    h.baseMode = (MavModeFlag.CUSTOM_MODE_ENABLED | (if (armed) MavModeFlag.SAFETY_ARMED else 0)) as u8
+    h.customMode = if (armed) 5 else 0   // ArduCopter: LOITER, STABILIZE
+    h.systemStatus = (if (armed) MavState.ACTIVE else MavState.STANDBY) as u8
+    h.mavlinkVersion = 3
+    conn.send(h)
+    const s = new SysStatus()
+    s.voltageBattery = (12600 - ticks * 10) as u16
+    s.batteryRemaining = (if (ticks > 100) 0 else 100 - ticks) as i8
+    conn.send(s)
+    const a = new Attitude()
+    a.timeBootMs = (ticks * 1000) as u32
+    a.roll = (Math.sin(ticks as f64 / 5.0) * 0.0524) as f32
+    a.pitch = (Math.cos(ticks as f64 / 7.0) * 0.0349) as f32
+    a.yaw = (((ticks * 3) % 360) as f64 * Math.PI / 180.0) as f32
+    conn.send(a)
+    ticks += 1
+  }
+
+  handle(r: Received): void {
+    const m = r.message
+    if (m instanceof ParamRequestList) {
+      for (let i = 0; i < params.length; i++) {
+        send(i)
+      }
+    } else if (m instanceof ParamRequestRead) {
+      const i = if (m.paramIndex >= 0) m.paramIndex as int else indexOf(m.paramId)
+      if (i >= 0 && i < params.length) {
+        send(i)
+      }
+    } else if (m instanceof ParamSet) {
+      const i = indexOf(m.paramId)
+      if (i >= 0) {
+        const v = decodeParam(m.paramValue, m.paramType as int, ParamEncoding.CCast)
+        params[i] = { id: params[i].id, value: rounded(params[i].id, v) }
+        send(i)
+      }
+    }
+  }
+
+  rounded(id: string, v: TypedParamValue): TypedParamValue {
+    match (v) {
+      Real { value, type } => if (rounding.includes(id)) TypedParamValue.Real(Math.round(value), type) else v,
+      Int { } => v,
+    }
+  }
+
+  indexOf(id: string): int {
+    for (let i = 0; i < params.length; i++) {
+      if (params[i].id == id) {
+        return i
+      }
+    }
+    -1
+  }
+
+  send(i: int): void {
+    const p = new ParamValue()
+    p.paramId = params[i].id
+    p.paramCount = params.length as u16
+    p.paramIndex = i as u16
+    const v = params[i].value
+    p.paramType = match (v) {
+      Int { type } => type as u8,
+      Real { type } => type as u8,
+    }
+    try {
+      p.paramValue = encodeParam(v, ParamEncoding.CCast)
+    } catch (e: Error) {
+      return
+    }
+    conn.send(p)
+  }
+}

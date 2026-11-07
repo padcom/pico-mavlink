@@ -22,6 +22,9 @@ Status: **in development (MV1).**
 - **Done:** a signing policy for received packets: signatures checked, replays rejected per
   system, component and link, and unsigned packets accepted, accepted for listed messages, or
   rejected.
+- **Done:** `SimulatedAutopilot`, an ArduPilot Copter-like vehicle on the far end of any byte
+  stream. It sends heartbeats and telemetry and answers parameter requests, with deterministic
+  data, for trying an application without hardware or SITL.
 - **Next:** ArduPilot SITL over UDP/TCP (MV2).
 
 ```pico

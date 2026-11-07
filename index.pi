@@ -49,4 +49,5 @@ export {
   Vehicle,
   VehicleDiscovery,
 } from "./src/operations"
+export { SimParam, SimulatedAutopilot, defaultSimParams } from "./src/simulator"
 export * from "./src/dialects/all"
