@@ -179,7 +179,31 @@ async function discoversAndBeats(): Promise<void> throws Error {
   expect(heard.vehicles().map((x) => `${x.sysid}/${x.compid} ${MavType.nameOf(x.type) ?? "?"}`).join(",")).toBe("254/1 GCS")
 }
 
+async function cancels(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const ap = new Autopilot(ends[1])
+  ap.silent = true
+  gcs.run()
+  ap.conn.run()
+  const ac = new AbortController()
+  const started = Date.now() as int
+  const pending = new ParamRead(gcs, VEHICLE, ParamEncoding.CCast, { timeoutMs: 5000, retries: 3, signal: ac.signal }).run("ARMING_CHECK")
+  await delay(30)
+  ac.abort()
+  let code = "read"
+  try {
+    await pending
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  gcs.close()
+  // Right away, not after 4 × 5 s.
+  expect(`${code} ${(Date.now() as int) - started < 1000}`).toBe("ABORTED true")
+}
+
 describe("operations", () => {
+  it("cancel through an AbortSignal", cancels)
   it("download the parameter list, asking again for what went missing", listsWithRetries)
   it("report an incomplete list as incomplete", incompleteSaysSo)
   it("read a parameter by name", readsByName)

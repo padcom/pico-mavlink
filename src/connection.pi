@@ -130,10 +130,24 @@ export class MavLinkConnection {
     }
   }
 
-  /// The first message (while `run()` runs) that `accept` accepts, or null after `timeoutMs`.
-  public waitFor(accept: (r: Received) => bool, timeoutMs: int): Promise<Received?, Error> {
+  /// The first message (while `run()` runs) that `accept` accepts, or null after `timeoutMs` (or
+  /// as soon as `signal` aborts).
+  public waitFor(accept: (r: Received) => bool, timeoutMs: int, signal: AbortSignal? = null): Promise<Received?, Error> {
     new Promise<Received?, Error>((resolve: (value: Received?) => void, _reject: (error: Error) => void) => {
       const w = new Waiter(resolve)
+      if (signal != null) {
+        const s = signal!
+        if (s.aborted) {
+          w.done = true
+          resolve(null)
+          return
+        }
+        s.addEventListener("abort", () => {
+          if (!w.done) {
+            w.finish(this, null)
+          }
+        })
+      }
       w.listener = this.on((r: Received) => {
         if (!w.done && accept(r)) {
           w.finish(this, r)

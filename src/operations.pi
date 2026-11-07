@@ -137,6 +137,14 @@ export struct ParamOptions {
   timeoutMs?: int
   /// How many times to ask again (default 3).
   retries?: int
+  /// Cancels the operation: it fails with an `ABORTED` MavLinkError (a disconnect, a closed window).
+  signal?: AbortSignal
+}
+
+function checkAborted(signal: AbortSignal?, what: string): void throws MavLinkError {
+  if (signal != null && signal!.aborted) {
+    throw new MavLinkError("ABORTED", `${what}: cancelled`)
+  }
 }
 
 function paramOf(m: ParamValue, encoding: ParamEncoding): Param {
@@ -155,6 +163,7 @@ export class ParamList {
   readonly encoding: ParamEncoding
   readonly quietMs: int
   readonly retries: int
+  readonly signal: AbortSignal?
   readonly received: Map<int, Param> = new Map<int, Param>()
   count: int = -1
   lastArrival: int = 0
@@ -165,6 +174,7 @@ export class ParamList {
     this.encoding = encoding
     this.quietMs = options.quietMs ?? 1000
     this.retries = options.retries ?? 3
+    this.signal = options.signal
   }
 
   public async run(): Promise<ParamListResult> throws Error {
@@ -177,6 +187,7 @@ export class ParamList {
     await quiet()
     let round = 0
     while (round < retries && missing().length > 0) {
+      checkAborted(signal, "the parameter list")
       for (const i of missing()) {
         const read = new ParamRequestRead()
         read.targetSystem = this.target.system as u8
@@ -229,8 +240,10 @@ export class ParamList {
   /// Until nothing arrived for `quietMs`, or everything has.
   async quiet(): Promise<void> throws Error {
     while ((Date.now() as int) - lastArrival < quietMs && (count < 0 || missing().length > 0)) {
+      checkAborted(signal, "the parameter list")
       await delay(if (quietMs / 10 > 5) quietMs / 10 else 5)
     }
+    checkAborted(signal, "the parameter list")
   }
 }
 
@@ -241,6 +254,7 @@ export class ParamRead {
   readonly encoding: ParamEncoding
   readonly timeoutMs: int
   readonly retries: int
+  readonly signal: AbortSignal?
 
   constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamOptions = {}) {
     this.conn = conn
@@ -248,12 +262,14 @@ export class ParamRead {
     this.encoding = encoding
     this.timeoutMs = options.timeoutMs ?? 1000
     this.retries = options.retries ?? 3
+    this.signal = options.signal
   }
 
   /// The parameter `id`; a `TIMEOUT` MavLinkError when no reply comes.
   public async run(id: string): Promise<Param> throws Error {
     for (let attempt = 0; attempt <= retries; attempt++) {
-      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs)
+      checkAborted(signal, `reading ${id}`)
+      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs, signal)
       const read = new ParamRequestRead()
       read.targetSystem = this.target.system as u8
       read.targetComponent = this.target.component as u8
@@ -268,6 +284,7 @@ export class ParamRead {
         }
       }
     }
+    checkAborted(signal, `reading ${id}`)
     throw new MavLinkError("TIMEOUT", `no PARAM_VALUE for ${id} from ${this.target.system}/${this.target.component} after ${retries + 1} tries`)
   }
 }
@@ -297,6 +314,7 @@ export class ParamWrite {
   readonly encoding: ParamEncoding
   readonly timeoutMs: int
   readonly retries: int
+  readonly signal: AbortSignal?
 
   constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamOptions = {}) {
     this.conn = conn
@@ -304,6 +322,7 @@ export class ParamWrite {
     this.encoding = encoding
     this.timeoutMs = options.timeoutMs ?? 1000
     this.retries = options.retries ?? 3
+    this.signal = options.signal
   }
 
   /// Sets `id` to `value`; a ParamError when the value can't travel, a `TIMEOUT` MavLinkError when
@@ -316,7 +335,8 @@ export class ParamWrite {
     request.paramValue = encodeParam(value, encoding)
     request.paramType = paramTypeOf(value) as u8
     for (let attempt = 0; attempt <= retries; attempt++) {
-      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs)
+      checkAborted(signal, `writing ${id}`)
+      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs, signal)
       await conn.send(request)
       const r = await reply
       if (r != null) {
@@ -327,6 +347,7 @@ export class ParamWrite {
         }
       }
     }
+    checkAborted(signal, `writing ${id}`)
     throw new MavLinkError("TIMEOUT", `no PARAM_VALUE for ${id} after PARAM_SET (${retries + 1} tries)`)
   }
 }
@@ -346,18 +367,21 @@ export class AutopilotVersionRead {
   readonly target: Target
   readonly timeoutMs: int
   readonly retries: int
+  readonly signal: AbortSignal?
 
   constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
     this.conn = conn
     this.target = target
     this.timeoutMs = options.timeoutMs ?? 1000
     this.retries = options.retries ?? 3
+    this.signal = options.signal
   }
 
   /// The autopilot's AUTOPILOT_VERSION, or null when it never answers.
   public async run(): Promise<AutopilotVersion?> throws Error {
     for (let attempt = 0; attempt <= retries; attempt++) {
-      const reply = conn.waitFor((r: Received) => isVersionFrom(r, this.target), timeoutMs)
+      checkAborted(signal, "AUTOPILOT_VERSION")
+      const reply = conn.waitFor((r: Received) => isVersionFrom(r, this.target), timeoutMs, signal)
       const c = new CommandLong()
       c.targetSystem = this.target.system as u8
       c.targetComponent = this.target.component as u8
@@ -378,6 +402,7 @@ export class AutopilotVersionRead {
         }
       }
     }
+    checkAborted(signal, "AUTOPILOT_VERSION")
     null
   }
 }

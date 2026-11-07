@@ -376,12 +376,13 @@ Built, with tests:
   - typed parameters (bytewise and C-cast);
   - operations: `HeartbeatSender`, `VehicleDiscovery`, `ParamList`, `ParamRead`, `ParamWrite`, `AutopilotVersionRead`;
   - a signing policy (replay, unsigned handling);
+  - cancelling any operation through `ParamOptions.signal` (it fails with `ABORTED` at once);
   - `SimulatedAutopilot`.
 
 Not yet:
 - ArduPilot SITL runs (they need its binaries);
-- `PARAM_EXT_*` (MV3);
-- operations' cancellation through an `AbortSignal`.
+- `PARAM_EXT_*` (MV3).
+
 
 Two compiler bugs were found on the way and fixed in pico-lang PRs:
 - #103: a subclass's fields after `instanceof` narrowing panicked the compiler. Decoded messages are narrowed this way.
