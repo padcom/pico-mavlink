@@ -93,6 +93,15 @@ export class Registry {
     byId.get(id)
   }
 
+  /// CRC-extra by message id, for a splitter that should accept exactly this registry's messages.
+  public magicNumbers(): Map<int, int> {
+    const out = new Map<int, int>()
+    for (const [id, info] of byId) {
+      out.set(id, info.magic)
+    }
+    out
+  }
+
   /// CRC-extra of message `id`, or null for a message this registry doesn't know.
   public magic(id: int): int? {
     const info = byId.get(id)

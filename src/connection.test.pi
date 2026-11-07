@@ -1,0 +1,89 @@
+import { describe, it, expect } from "std/test"
+import { bind } from "std/net"
+import { MavLinkConnection, packets } from "./connection"
+import { FileStream, MemoryStream, UdpStream } from "./stream"
+import { MavLinkPacketSignature, MavLinkProtocolV1 } from "./protocol"
+import { Heartbeat, MavType } from "./dialects/minimal"
+import { ParamValue } from "./dialects/common"
+
+async function talksOverAPipe(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV1(1, 1) })
+  const h = new Heartbeat()
+  h.type = MavType.QUADROTOR as u8
+  await vehicle.send(h)
+  const p = new ParamValue()
+  p.paramId = "ARMING_CHECK"
+  p.paramValue = 1.0 as f32
+  await vehicle.send(p)
+  await gcs.send(new Heartbeat())
+  vehicle.close()
+  const got: string[] = []
+  for await (const r of gcs.messages()) {
+    const m = r.message
+    if (m instanceof Heartbeat) {
+      got.push(`HEARTBEAT type ${m.type} via ${r.packet.protocol.name()} from ${r.packet.header.sysid}`)
+    } else if (m instanceof ParamValue) {
+      got.push(`PARAM_VALUE ${m.paramId}=${m.paramValue} seq ${r.packet.header.seq}`)
+    }
+  }
+  expect(got.join("; ")).toBe("HEARTBEAT type 2 via MAV_V1 from 1; PARAM_VALUE ARMING_CHECK=1 seq 1")
+}
+
+async function signedOverAPipe(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const key = MavLinkPacketSignature.key("secret")
+  await new MavLinkConnection(ends[1]).sendSigned(new Heartbeat(), key, 3, 1_700_000_000_000)
+  ends[1].close()
+  let verdict = "none"
+  for await (const p of packets(ends[0])) {
+    const s = p.signature
+    verdict = if (s == null) "unsigned" else `link ${s!.linkId} ${s!.matches(key)}`
+  }
+  expect(verdict).toBe("link 3 true")
+}
+
+async function readsACapture(): Promise<void> throws Error {
+  const conn = new MavLinkConnection(new FileStream("../../node-mavlink/examples/mavlink-v2-3412-packets.bin", 1000))
+  let decoded = 0
+  let unknown = 0
+  for await (const r of conn.messages()) {
+    if (r.message == null) {
+      unknown += 1
+    } else {
+      decoded += 1
+    }
+  }
+  // The splitter skips the 14 frames of messages the registry doesn't know.
+  expect(`${decoded}/${unknown}`).toBe("3398/0")
+}
+
+async function overUdp(): Promise<void> throws Error {
+  const a = await bind(0)
+  const b = await bind(0)
+  // b learns its peer from a's first datagram.
+  const sender = new MavLinkConnection(new UdpStream(a, b.addr.port))
+  const receiver = new MavLinkConnection(new UdpStream(b))
+  const h = new Heartbeat()
+  h.type = MavType.FIXED_WING as u8
+  await sender.send(h)
+  let got = "nothing"
+  for await (const r of receiver.messages()) {
+    const m = r.message
+    if (m instanceof Heartbeat) {
+      got = `type ${m.type}`
+      break
+    }
+  }
+  sender.close()
+  receiver.close()
+  expect(got).toBe("type 1")
+}
+
+describe("connections", () => {
+  it("send and receive over an in-memory pipe, v1 and v2 mixed", talksOverAPipe)
+  it("sign, and the receiver verifies", signedOverAPipe)
+  it("decode a whole capture through the default registry", readsACapture)
+  it("work over UDP", overUdp)
+})

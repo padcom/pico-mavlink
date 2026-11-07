@@ -1,0 +1,179 @@
+// Byte streams: what MAVLink travels over. A serial port, a TCP connection, a UDP peer, a file or
+// a test double: the library sees only `ByteStream`.
+import { Conn, UdpSocket } from "std/net"
+import { readBytes } from "std/fs"
+
+/// Bytes in and out (the same shape as padcom/serialport's `ByteStream`; an application adapts one
+/// to the other in three lines).
+export interface ByteStream {
+  /// The next chunk, as soon as some bytes are there; null at the end.
+  read(): Promise<Uint8Array?, Error>
+  write(bytes: Uint8Array): Promise<void, Error>
+  close(): void
+}
+
+/// One end of an in-memory pipe pair: what one end writes, the other reads.
+export class MemoryStream implements ByteStream {
+  chunks: Uint8Array[] = []
+  /// chunks[head..] are waiting to be read.
+  head: int = 0
+  waiting: ((value: Uint8Array?) => void)? = null
+  closed: bool = false
+  public peer: MemoryStream? = null
+
+  /// Two connected ends.
+  public static pair(): MemoryStream[] {
+    const a = new MemoryStream()
+    const b = new MemoryStream()
+    a.peer = b
+    b.peer = a
+    [a, b]
+  }
+
+  /// Bytes for this end to read (what the peer writes).
+  public deliver(bytes: Uint8Array): void {
+    const w = waiting
+    if (w != null) {
+      waiting = null
+      w!(bytes)
+    } else {
+      chunks.push(bytes)
+    }
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    if (head < chunks.length) {
+      const c = chunks[head]
+      head += 1
+      if (head == chunks.length) {
+        chunks = []
+        head = 0
+      }
+      return Promise.resolve<Uint8Array?>(c)
+    }
+    if (closed) {
+      return Promise.resolve<Uint8Array?>(null)
+    }
+    new Promise<Uint8Array?, Error>((resolve: (value: Uint8Array?) => void, _reject: (error: Error) => void) => {
+      this.waiting = resolve
+    })
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    const p = peer
+    if (p != null && !p!.closed) {
+      p!.deliver(bytes.slice(0, bytes.length))
+    }
+  }
+
+  /// Ends both directions: reads here and on the peer get null once the queued chunks are read.
+  public close(): void {
+    end()
+    const p = peer
+    if (p != null) {
+      p!.end()
+    }
+  }
+
+  end(): void {
+    closed = true
+    const w = waiting
+    if (w != null) {
+      waiting = null
+      w!(null)
+    }
+  }
+}
+
+/// A TCP connection (`std/net` `connect`), e.g. to ArduPilot SITL's port 5760.
+export class TcpStream implements ByteStream {
+  readonly conn: Conn
+
+  constructor(conn: Conn) {
+    this.conn = conn
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    conn.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    await conn.write(bytes)
+  }
+
+  public close(): void {
+    conn.close()
+  }
+}
+
+/// A UDP peer: datagrams from anyone are read; writes go to `peerPort`/`peerHost`, or, until one
+/// is given, to whoever sent the last datagram (as MAVESP8266 and SITL's UDP out expect).
+export class UdpStream implements ByteStream {
+  readonly socket: UdpSocket
+  public peerHost: string?
+  public peerPort: int?
+
+  constructor(socket: UdpSocket, peerPort: int? = null, peerHost: string? = null) {
+    this.socket = socket
+    this.peerPort = peerPort
+    this.peerHost = peerHost
+  }
+
+  public async read(): Promise<Uint8Array?> throws Error {
+    const d = await socket.receive()
+    if (d == null) {
+      return null
+    }
+    if (peerPort == null) {
+      peerPort = d!.addr.port
+      peerHost = d!.addr.hostname
+    }
+    d!.data
+  }
+
+  /// Sends one datagram (dropped while no peer is known yet).
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    const port = peerPort
+    if (port != null) {
+      await socket.send(bytes, port!, peerHost ?? "127.0.0.1")
+    }
+  }
+
+  public close(): void {
+    socket.close()
+  }
+}
+
+/// A recorded stream (a .bin capture or a .tlog), read in chunks; writes are dropped.
+export class FileStream implements ByteStream {
+  readonly path: string
+  readonly chunkSize: int
+  bytes: Uint8Array? = null
+  at: int = 0
+
+  constructor(path: string, chunkSize: int = 4096) {
+    this.path = path
+    this.chunkSize = chunkSize
+  }
+
+  public async read(): Promise<Uint8Array?> throws Error {
+    if (bytes == null) {
+      bytes = await readBytes(path)
+    }
+    const b = bytes!
+    if (at >= b.length) {
+      return null
+    }
+    const end = if (at + chunkSize < b.length) at + chunkSize else b.length
+    const chunk = b.slice(at, end)
+    at = end
+    chunk
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+  }
+
+  public close(): void {
+    at = if (bytes == null) 0 else bytes!.length
+  }
+}

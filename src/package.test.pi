@@ -1,0 +1,14 @@
+// The package's entry point exports what an application needs, dialects included.
+import { describe, it, expect } from "std/test"
+import { ArdupilotmegaSimState, Heartbeat, MavLinkProtocolV2, MavType, SimState, commonRegistry } from "../index"
+
+function exportsEverything(): void {
+  expect(new MavLinkProtocolV2().serialize(new Heartbeat(), 0)[0]).toBe(0xFD)
+  expect(MavType.nameOf(MavType.QUADROTOR) ?? "?").toBe("QUADROTOR")
+  expect(`${SimState.MSG_NAME} ${ArdupilotmegaSimState.MSG_NAME}`).toBe("SIM_STATE SIMSTATE")
+  expect(commonRegistry.get(22)!.name).toBe("PARAM_VALUE")
+}
+
+describe("index.pi", () => {
+  it("exports the library and every dialect, clashing names prefixed", exportsEverything)
+})

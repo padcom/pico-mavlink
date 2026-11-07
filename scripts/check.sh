@@ -20,8 +20,8 @@ pico fmt src/interop.test.pi > /dev/null
 git diff --exit-code --stat -- src/interop.test.pi
 
 echo "==> pico fmt and lint (hand-written code; the dialects keep mavlink-mappings' names)"
-pico fmt --check src/*.pi spike
-pico lint src/*.pi spike
+pico fmt --check index.pi src/*.pi spike
+pico lint index.pi src/*.pi spike
 
 echo "==> pico test"
 pico test "$PWD"

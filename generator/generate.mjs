@@ -233,6 +233,29 @@ async function main() {
     writeFileSync(join(out, `${module.name}.pi`), lines.join('\n') + '\n')
     console.log(`${module.name}: ${enumDefs.length} enums, ${messages.length} messages`)
   }
+  // One module re-exporting every dialect (a package exposes only its index.pi). Names two
+  // dialects share (SimState, MavCmd, REGISTRY) get the later dialect's name as a prefix.
+  const taken = new Set()
+  const all = [
+    '// Every generated dialect\'s classes and registries in one place, for index.pi. Generated: don\'t edit.',
+    '// A name two dialects share keeps its first meaning; the later dialect\'s gets its name as a',
+    '// prefix (ardupilotmega\'s SIMSTATE is ArdupilotmegaSimState; common\'s SIM_STATE is SimState).',
+  ]
+  for (const module of MODULES) {
+    const text = readFileSync(join(out, `${module.name}.pi`), 'utf8')
+    const names = [...text.matchAll(/^export class (\w+)/gm)].map(m => m[1])
+    const prefix = module.name[0].toUpperCase() + module.name.slice(1)
+    const items = names.map(n => {
+      const alias = taken.has(n) ? `${prefix}${n}` : n
+      taken.add(alias)
+      return alias === n ? n : `${n} as ${alias}`
+    })
+    items.push(`REGISTRY as ${module.name}Registry`)
+    all.push(`export { ${items.join(', ')} } from "./${module.name}"`)
+  }
+  all.push('export { MSG_ID_MAGIC_NUMBER } from "./magic-numbers"')
+  writeFileSync(join(out, 'all.pi'), all.join('\n') + '\n')
+
   const m = [
     '// CRC-extra by message id for every generated dialect (mavlink-mappings\' MSG_ID_MAGIC_NUMBER).',
     '// Generated: don\'t edit.',

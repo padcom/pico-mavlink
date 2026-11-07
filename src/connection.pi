@@ -1,0 +1,96 @@
+// Packets from a byte stream, and a connection that sends and receives messages over one
+// (node-mavlink's createMavLinkStream, send and sendSigned, with the sequence number kept per
+// connection instead of per module).
+import { MavLinkData, Registry } from "./data"
+import { MavLinkPacket, MavLinkPacketParser, MavLinkProtocol, MavLinkProtocolV2 } from "./protocol"
+import { MavLinkPacketSplitter, SplitterOptions } from "./splitter"
+import { ByteStream } from "./stream"
+import { REGISTRY as MINIMAL } from "./dialects/minimal"
+import { REGISTRY as STANDARD } from "./dialects/standard"
+import { REGISTRY as COMMON } from "./dialects/common"
+import { REGISTRY as ARDUPILOTMEGA } from "./dialects/ardupilotmega"
+
+/// Every generated dialect: minimal, standard, common and ardupilotmega.
+export function defaultRegistry(): Registry {
+  new Registry([MINIMAL, STANDARD, COMMON, ARDUPILOTMEGA])
+}
+
+/// The packets in `stream`, until it ends (createMavLinkStream).
+export async function* packets(stream: ByteStream, options: SplitterOptions = {}): AsyncIterator<MavLinkPacket> throws Error {
+  const splitter = new MavLinkPacketSplitter(options)
+  const parser = new MavLinkPacketParser()
+  while (true) {
+    const chunk = await stream.read()
+    if (chunk == null) {
+      return
+    }
+    for (const raw of splitter.push(chunk!)) {
+      yield parser.parse(raw.buffer, raw.timestamp)
+    }
+  }
+}
+
+/// A packet and, when the registry knows its message, the message.
+export struct Received {
+  packet: MavLinkPacket
+  message: MavLinkData?
+}
+
+export struct ConnectionOptions {
+  /// The messages to decode (default: `defaultRegistry()`).
+  registry?: Registry
+  /// What to send with: its version, system id and component id (default: MAVLink 2 from
+  /// system 254, component 1, as node-mavlink).
+  protocol?: MavLinkProtocol
+}
+
+/// Messages over a byte stream.
+export class MavLinkConnection {
+  public readonly stream: ByteStream
+  public readonly registry: Registry
+  public readonly protocol: MavLinkProtocol
+  seq: int = 0
+
+  constructor(stream: ByteStream, options: ConnectionOptions = {}) {
+    this.stream = stream
+    this.registry = options.registry ?? defaultRegistry()
+    const v2: MavLinkProtocol = new MavLinkProtocolV2()
+    this.protocol = options.protocol ?? v2
+  }
+
+  /// The next sequence number (0 to 255, then around again).
+  nextSeq(): int {
+    const s = seq
+    seq = (seq + 1) & 0xFF
+    s
+  }
+
+  /// Sends `message`; the count of bytes sent.
+  public async send(message: MavLinkData): Promise<int> throws Error {
+    const frame = protocol.serialize(message, nextSeq())
+    await stream.write(frame)
+    frame.length
+  }
+
+  /// Sends `message` signed with `key` (MAVLink 2 only) for `linkId`, at `timestamp` (ms since
+  /// 1970; default now); the count of bytes sent.
+  public async sendSigned(message: MavLinkData, key: Uint8Array, linkId: int = 1, timestamp: int? = null): Promise<int> throws Error {
+    const signer = new MavLinkProtocolV2(protocol.sysid, protocol.compid, MavLinkProtocolV2.IFLAG_SIGNED)
+    const frame = signer.sign(signer.serialize(message, nextSeq()), linkId, key, timestamp ?? (Date.now() as int))
+    await stream.write(frame)
+    frame.length
+  }
+
+  /// Every packet received, decoded when the registry knows its message, until the stream ends.
+  public async* messages(): AsyncIterator<Received> throws Error {
+    for await (const p of packets(stream, { magicNumbers: registry.magicNumbers() })) {
+      const info = registry.get(p.header.msgid)
+      const r: Received = { packet: p, message: if (info == null) null else p.protocol.data(p.payload, info!) }
+      yield r
+    }
+  }
+
+  public close(): void {
+    stream.close()
+  }
+}
