@@ -341,7 +341,7 @@ function paramTypeOf(v: TypedParamValue): int {
 /// Asks the autopilot for AUTOPILOT_VERSION (its capabilities say how it encodes parameters, see
 /// `encodingOf`). MAV_CMD_REQUEST_MESSAGE first; after half the tries the older
 /// MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES, for autopilots that predate it.
-export class AutopilotVersionRequest {
+export class AutopilotVersionRead {
   readonly conn: MavLinkConnection
   readonly target: Target
   readonly timeoutMs: int
