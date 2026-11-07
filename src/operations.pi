@@ -1,0 +1,338 @@
+// Operations: small classes over a MavLinkConnection, each doing one job of a ground station
+// (PROJECT_DESCRIPTION §9.1: heartbeats, vehicle discovery, parameter list/read/write). They
+// listen through `conn.on`/`waitFor`, so `conn.run()` must be running.
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MavLinkError } from "./protocol"
+import { ParamEncoding, TypedParamValue, decodeParam, encodeParam, sameParam } from "./params"
+import { Heartbeat, MavAutopilot, MavState, MavType } from "./dialects/minimal"
+import { ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
+
+/// Which system and component an operation talks to (component 0: any component of the system).
+export struct Target {
+  system: int
+  component: int
+}
+
+function from(r: Received, t: Target): bool {
+  r.packet.header.sysid == t.system && (t.component == 0 || r.packet.header.compid == t.component)
+}
+
+/// Sends HEARTBEAT every `intervalMs` (1 s by default) as a ground station, so autopilots know
+/// someone is listening.
+export class HeartbeatSender {
+  readonly conn: MavLinkConnection
+  readonly intervalMs: int
+  public type: int = MavType.GCS
+  public autopilot: int = MavAutopilot.INVALID
+  timer: int = -1
+
+  constructor(conn: MavLinkConnection, intervalMs: int = 1000) {
+    this.conn = conn
+    this.intervalMs = intervalMs
+  }
+
+  /// One HEARTBEAT now, then every interval.
+  public start(): void {
+    beat()
+    timer = setInterval(() => beat(), intervalMs)
+  }
+
+  public stop(): void {
+    clearInterval(timer)
+    timer = -1
+  }
+
+  beat(): void {
+    const h = new Heartbeat()
+    h.type = type as u8
+    h.autopilot = autopilot as u8
+    h.systemStatus = MavState.ACTIVE as u8
+    h.mavlinkVersion = 3
+    conn.send(h)
+  }
+}
+
+/// A system and component seen sending heartbeats.
+export class Vehicle {
+  public readonly sysid: int
+  public readonly compid: int
+  public type: int = 0
+  public autopilot: int = 0
+  /// When its last heartbeat arrived (ms since 1970).
+  public lastSeen: int = 0
+
+  constructor(sysid: int, compid: int) {
+    this.sysid = sysid
+    this.compid = compid
+  }
+}
+
+/// Keeps track of who sends heartbeats.
+export class VehicleDiscovery {
+  readonly found: Map<int, Vehicle> = new Map<int, Vehicle>()
+  readonly listener: int
+  readonly conn: MavLinkConnection
+
+  constructor(conn: MavLinkConnection) {
+    this.conn = conn
+    this.listener = conn.on((r: Received) => this.seen(r))
+  }
+
+  seen(r: Received): void {
+    const m = r.message
+    if (m instanceof Heartbeat) {
+      const key = r.packet.header.sysid * 256 + r.packet.header.compid
+      let v = found.get(key)
+      if (v == null) {
+        v = new Vehicle(r.packet.header.sysid, r.packet.header.compid)
+        found.set(key, v!)
+      }
+      const vehicle = v!
+      vehicle.type = m.type as int
+      vehicle.autopilot = m.autopilot as int
+      vehicle.lastSeen = Date.now() as int
+    }
+  }
+
+  /// Everyone seen so far (ground stations included), in order of system then component id.
+  public vehicles(): Vehicle[] {
+    const keys: int[] = []
+    for (const [k, _] of found) {
+      keys.push(k)
+    }
+    keys.sort((a: int, b: int) => a - b)
+    keys.map((k: int) => found.get(k)!)
+  }
+
+  public stop(): void {
+    conn.off(listener)
+  }
+}
+
+/// A parameter as the autopilot reported it.
+export struct Param {
+  id: string
+  /// Its place in the list (65535 when the autopilot doesn't say).
+  index: int
+  value: TypedParamValue
+}
+
+export struct ParamListResult {
+  /// By index; the ones still missing aren't there.
+  params: Param[]
+  /// How many the autopilot says it has.
+  count: int
+  /// Indexes that never arrived, even after asking for each again.
+  missing: int[]
+  /// Whether every parameter arrived.
+  complete: bool
+}
+
+export struct ParamOptions {
+  /// How long a quiet link means the autopilot has sent all it will (default 1000 ms).
+  quietMs?: int
+  /// How long to wait for one reply (default 1000 ms).
+  timeoutMs?: int
+  /// How many times to ask again (default 3).
+  retries?: int
+}
+
+function paramOf(m: ParamValue, encoding: ParamEncoding): Param {
+  const p: Param = { id: m.paramId, index: m.paramIndex as int, value: decodeParam(m.paramValue, m.paramType as int, encoding) }
+  p
+}
+
+/// Downloads the whole parameter list: PARAM_REQUEST_LIST, then PARAM_REQUEST_READ by index for
+/// whatever didn't arrive, a few rounds. A list that stays incomplete says so (`complete`,
+/// `missing`) rather than pretending.
+// In the async `run` methods, `target` is written `this.target`: a bare `target` there is taken
+// for the build constant until pico-lang #104 is fixed.
+export class ParamList {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly encoding: ParamEncoding
+  readonly quietMs: int
+  readonly retries: int
+  readonly received: Map<int, Param> = new Map<int, Param>()
+  count: int = -1
+  lastArrival: int = 0
+
+  constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.encoding = encoding
+    this.quietMs = options.quietMs ?? 1000
+    this.retries = options.retries ?? 3
+  }
+
+  public async run(): Promise<ParamListResult> throws Error {
+    const listener = conn.on((r: Received) => this.arrived(r))
+    const request = new ParamRequestList()
+    request.targetSystem = this.target.system as u8
+    request.targetComponent = this.target.component as u8
+    lastArrival = Date.now() as int
+    await conn.send(request)
+    await quiet()
+    let round = 0
+    while (round < retries && missing().length > 0) {
+      for (const i of missing()) {
+        const read = new ParamRequestRead()
+        read.targetSystem = this.target.system as u8
+        read.targetComponent = this.target.component as u8
+        read.paramIndex = i as i16
+        await conn.send(read)
+      }
+      lastArrival = Date.now() as int
+      await quiet()
+      round += 1
+    }
+    conn.off(listener)
+    const params: Param[] = []
+    for (let i = 0; i < (if (count < 0) 0 else count); i++) {
+      const p = received.get(i)
+      if (p != null) {
+        params.push(p!)
+      }
+    }
+    const gone = missing()
+    const result: ParamListResult = { params, count: if (count < 0) 0 else count, missing: gone, complete: count >= 0 && gone.length == 0 }
+    result
+  }
+
+  arrived(r: Received): void {
+    const m = r.message
+    if (m instanceof ParamValue) {
+      if (from(r, target)) {
+        count = m.paramCount as int
+        const i = m.paramIndex as int
+        if (i < count) {
+          received.set(i, paramOf(m, encoding))
+        }
+        lastArrival = Date.now() as int
+      }
+    }
+  }
+
+  /// Indexes not received yet (all of them while the count is unknown: none).
+  missing(): int[] {
+    const out: int[] = []
+    for (let i = 0; i < count; i++) {
+      if (!received.has(i)) {
+        out.push(i)
+      }
+    }
+    out
+  }
+
+  /// Until nothing arrived for `quietMs`, or everything has.
+  async quiet(): Promise<void> throws Error {
+    while ((Date.now() as int) - lastArrival < quietMs && (count < 0 || missing().length > 0)) {
+      await delay(if (quietMs / 10 > 5) quietMs / 10 else 5)
+    }
+  }
+}
+
+/// Reads one parameter by name, asking again on a timeout.
+export class ParamRead {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly encoding: ParamEncoding
+  readonly timeoutMs: int
+  readonly retries: int
+
+  constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.encoding = encoding
+    this.timeoutMs = options.timeoutMs ?? 1000
+    this.retries = options.retries ?? 3
+  }
+
+  /// The parameter `id`; a `TIMEOUT` MavLinkError when no reply comes.
+  public async run(id: string): Promise<Param> throws Error {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs)
+      const read = new ParamRequestRead()
+      read.targetSystem = this.target.system as u8
+      read.targetComponent = this.target.component as u8
+      read.paramId = id
+      read.paramIndex = -1
+      await conn.send(read)
+      const r = await reply
+      if (r != null) {
+        const m = r!.message
+        if (m instanceof ParamValue) {
+          return paramOf(m, encoding)
+        }
+      }
+    }
+    throw new MavLinkError("TIMEOUT", `no PARAM_VALUE for ${id} from ${this.target.system}/${this.target.component} after ${retries + 1} tries`)
+  }
+}
+
+function isValueOf(r: Received, target: Target, id: string): bool {
+  const m = r.message
+  if (m instanceof ParamValue) {
+    return from(r, target) && m.paramId == id
+  }
+  false
+}
+
+/// What a PARAM_SET came back as.
+export struct ParamSetResult {
+  /// The value the autopilot reports after the set.
+  param: Param
+  /// Whether that's the value asked for (an autopilot may refuse or round it).
+  verified: bool
+}
+
+/// Writes one parameter and reads the value back from the autopilot's PARAM_VALUE reply. Only a
+/// reply for this parameter counts, and a value the autopilot changed is reported as unverified,
+/// never as success.
+export class ParamWrite {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly encoding: ParamEncoding
+  readonly timeoutMs: int
+  readonly retries: int
+
+  constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.encoding = encoding
+    this.timeoutMs = options.timeoutMs ?? 1000
+    this.retries = options.retries ?? 3
+  }
+
+  /// Sets `id` to `value`; a ParamError when the value can't travel, a `TIMEOUT` MavLinkError when
+  /// no reply comes.
+  public async run(id: string, value: TypedParamValue): Promise<ParamSetResult> throws Error {
+    const request = new ParamSet()
+    request.targetSystem = this.target.system as u8
+    request.targetComponent = this.target.component as u8
+    request.paramId = id
+    request.paramValue = encodeParam(value, encoding)
+    request.paramType = paramTypeOf(value) as u8
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const reply = conn.waitFor((r: Received) => isValueOf(r, this.target, id), timeoutMs)
+      await conn.send(request)
+      const r = await reply
+      if (r != null) {
+        const m = r!.message
+        if (m instanceof ParamValue) {
+          const p = paramOf(m, encoding)
+          return { param: p, verified: sameParam(p.value, value) }
+        }
+      }
+    }
+    throw new MavLinkError("TIMEOUT", `no PARAM_VALUE for ${id} after PARAM_SET (${retries + 1} tries)`)
+  }
+}
+
+function paramTypeOf(v: TypedParamValue): int {
+  match (v) {
+    Int { type } => type,
+    Real { type } => type,
+  }
+}

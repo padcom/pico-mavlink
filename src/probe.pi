@@ -1,0 +1,6 @@
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { ParamEncoding, TypedParamValue } from "./params"
+import { ParamWrite } from "./operations"
+const c = new MavLinkConnection(MemoryStream.pair()[0])
+new ParamWrite(c, { system: 1, component: 1 }, ParamEncoding.CCast).run("X", TypedParamValue.Int(1, 6))

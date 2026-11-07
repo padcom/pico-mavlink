@@ -260,6 +260,18 @@ export function encodeParam(value: ParamValue, encoding: ParamEncoding): f32 thr
   that doesn't report it.
 - `PARAM_EXT_*` is deferred (MV3).
 
+### 5.1 As built
+
+- The typed value is `TypedParamValue` (`Int(value, type)` or `Real(value, type)`), not
+  `ParamValue`: that name belongs to the generated `PARAM_VALUE` message. For the same reason, the
+  write operation is `ParamWrite`, since `ParamSet` is `PARAM_SET`.
+- Operations listen through `MavLinkConnection.on`/`waitFor`, and `run()` hands every message
+  to them. `waitFor(accept, timeoutMs)` is set up *before* the request goes out, so a fast reply
+  isn't missed.
+- Only a reply from the target (system, and component unless it's 0) for the same parameter ID
+  counts. A late reply after the operation has finished is dropped: its listener is gone.
+- 64-bit parameters are refused (`UNSUPPORTED_TYPE`) until `PARAM_EXT_*` (MV3).
+
 ## 6. Generator
 
 The generator follows `mavlink-mappings-gen`: it reads the XML, resolves `<include>`s, orders fields

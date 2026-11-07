@@ -14,7 +14,12 @@ Status: **in development (MV1).**
   values.
 - **Done:** `packets(stream)`, `MavLinkConnection` (send, sendSigned, decoded `messages()`), and
   byte streams over UDP, TCP, files and an in-memory pipe.
-- **Next:** the operations (heartbeats, discovery, parameters) and SITL (MV2).
+- **Done:** typed parameter values (bytewise and C-cast, nothing silently made a float) and the
+  operations: `HeartbeatSender`, `VehicleDiscovery`, `ParamList` (asks again for what went
+  missing, and says when a list stays incomplete), `ParamRead`, and `ParamWrite` (verifies the
+  read-back; a changed value is reported, never taken as success). They're tested against a
+  simulated autopilot.
+- **Next:** ArduPilot SITL over UDP/TCP, and signing policy (MV2).
 
 ```pico
 import { bind } from "std/net"
@@ -33,8 +38,9 @@ Two dialects share some class names: ardupilotmega's `SIMSTATE` and its `MAV_CMD
 clash with common's. The package exports the later ones with the dialect's name as a prefix
 (`ArdupilotmegaSimState`, `ArdupilotmegaMavCmd`).
 
-The framing tests narrow decoded messages with `instanceof`, which needs the fix for
-[pico-lang #102](https://github.com/padcom/pico-lang/issues/102) until it's merged.
+The tests narrow decoded messages with `instanceof`, which needs pico-lang PR
+[#103](https://github.com/padcom/pico-lang/pull/103) (#102). Until it's released, use a pico
+built with it; pico 0.4.2 has everything else.
 
 The design is in [docs/design.md](docs/design.md).
 

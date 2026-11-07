@@ -1,0 +1,189 @@
+// Operations against a simulated autopilot on the other end of an in-memory pipe.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError, MavLinkProtocolV2 } from "./protocol"
+import { ParamEncoding, TypedParamValue, decodeParam, encodeParam, showParam } from "./params"
+import { HeartbeatSender, ParamList, ParamOptions, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
+import { Heartbeat, MavAutopilot, MavType } from "./dialects/minimal"
+import { MavParamType, ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
+
+/// A pretend ArduPilot (system 1, component 1, C-cast encoding) with a few parameters.
+class Autopilot {
+  public readonly conn: MavLinkConnection
+  readonly names: string[] = ["ARMING_CHECK", "BATT_CAPACITY", "SERIAL0_BAUD", "WPNAV_SPEED", "FENCE_ENABLE"]
+  readonly values: TypedParamValue[] = [
+    TypedParamValue.Int(1, MavParamType.INT32),
+    TypedParamValue.Int(5200, MavParamType.INT32),
+    TypedParamValue.Int(115, MavParamType.INT32),
+    TypedParamValue.Real(1000.0, MavParamType.REAL32),
+    TypedParamValue.Int(0, MavParamType.INT8),
+  ]
+  /// Indexes the first list download leaves out (a lossy link).
+  public drop: int[] = [1, 3]
+  public silent: bool = false
+  /// Rounds REAL32 writes to whole numbers (an autopilot that changes what it's given).
+  public rounding: bool = false
+  lists: int = 0
+
+  constructor(stream: MemoryStream) {
+    this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(1, 1) })
+    conn.on((r: Received) => this.handle(r))
+  }
+
+  handle(r: Received): void {
+    if (silent) {
+      return
+    }
+    const m = r.message
+    if (m instanceof ParamRequestList) {
+      lists += 1
+      for (let i = 0; i < names.length; i++) {
+        if (lists > 1 || !drop.includes(i)) {
+          send(i)
+        }
+      }
+    } else if (m instanceof ParamRequestRead) {
+      const i = if (m.paramIndex >= 0) m.paramIndex as int else names.indexOf(m.paramId)
+      if (i >= 0) {
+        send(i)
+      }
+    } else if (m instanceof ParamSet) {
+      const i = names.indexOf(m.paramId)
+      if (i >= 0) {
+        const v = decodeParam(m.paramValue, m.paramType as int, ParamEncoding.CCast)
+        values[i] = match (v) {
+          Real { value, type } => if (rounding) TypedParamValue.Real(Math.round(value), type) else v,
+          Int { } => v,
+        }
+        send(i)
+      }
+    }
+  }
+
+  send(i: int): void {
+    const p = new ParamValue()
+    p.paramId = names[i]
+    p.paramCount = names.length as u16
+    p.paramIndex = i as u16
+    const v = values[i]
+    p.paramType = match (v) {
+      Int { type } => type as u8,
+      Real { type } => type as u8,
+    }
+    try {
+      p.paramValue = encodeParam(v, ParamEncoding.CCast)
+    } catch (e: Error) {
+      return
+    }
+    conn.send(p)
+  }
+}
+
+const VEHICLE: Target = { system: 1, component: 1 }
+const FAST: ParamOptions = { quietMs: 50, timeoutMs: 100, retries: 2 }
+
+async function listsWithRetries(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const ap = new Autopilot(ends[1])
+  gcs.run()
+  ap.conn.run()
+  const result = await new ParamList(gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  gcs.close()
+  expect(`${result.count} ${result.complete} missing ${result.missing.length}`).toBe("5 true missing 0")
+  expect(result.params.map((p) => `${p.id}=${showParam(p.value)}`).join(",")).toBe(
+    "ARMING_CHECK=1,BATT_CAPACITY=5200,SERIAL0_BAUD=115,WPNAV_SPEED=1000,FENCE_ENABLE=0")
+}
+
+async function incompleteSaysSo(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const ap = new Autopilot(ends[1])
+  gcs.run()
+  ap.conn.run()
+  // It answers the list once (without two of them), then nothing: the reads by index go unanswered.
+  const result = new ParamList(gcs, VEHICLE, ParamEncoding.CCast, FAST)
+  const pending = result.run()
+  await delay(20)
+  ap.silent = true
+  const r = await pending
+  gcs.close()
+  expect(`${r.count} ${r.complete} missing ${r.missing.join(",")} got ${r.params.length}`).toBe("5 false missing 1,3 got 3")
+}
+
+async function readsByName(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const ap = new Autopilot(ends[1])
+  gcs.run()
+  ap.conn.run()
+  const p = await new ParamRead(gcs, VEHICLE, ParamEncoding.CCast, FAST).run("BATT_CAPACITY")
+  gcs.close()
+  expect(`${p.id} ${p.index} ${showParam(p.value)}`).toBe("BATT_CAPACITY 1 5200")
+}
+
+async function readTimesOut(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const ap = new Autopilot(ends[1])
+  ap.silent = true
+  gcs.run()
+  ap.conn.run()
+  let code = "read"
+  try {
+    await new ParamRead(gcs, VEHICLE, ParamEncoding.CCast, FAST).run("ARMING_CHECK")
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  gcs.close()
+  expect(code).toBe("TIMEOUT")
+}
+
+async function writesAndVerifies(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const ap = new Autopilot(ends[1])
+  gcs.run()
+  ap.conn.run()
+  const w = new ParamWrite(gcs, VEHICLE, ParamEncoding.CCast, FAST)
+  const ok = await w.run("WPNAV_SPEED", TypedParamValue.Real(750.0, MavParamType.REAL32))
+  expect(`${showParam(ok.param.value)} ${ok.verified}`).toBe("750 true")
+  // An autopilot that rounds: the reply is reported, but not as verified.
+  ap.rounding = true
+  const rounded = await w.run("WPNAV_SPEED", TypedParamValue.Real(512.75, MavParamType.REAL32))
+  gcs.close()
+  expect(`${showParam(rounded.param.value)} ${rounded.verified}`).toBe("513 false")
+}
+
+async function discoversAndBeats(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  const seen = new VehicleDiscovery(gcs)
+  const heard = new VehicleDiscovery(vehicle)
+  gcs.run()
+  vehicle.run()
+  const h = new Heartbeat()
+  h.type = MavType.QUADROTOR as u8
+  h.autopilot = MavAutopilot.ARDUPILOTMEGA as u8
+  await vehicle.send(h)
+  const beats = new HeartbeatSender(gcs, 20)
+  beats.start()
+  await delay(70)
+  beats.stop()
+  gcs.close()
+  const v = seen.vehicles()
+  expect(v.map((x) => `${x.sysid}/${x.compid} ${MavType.nameOf(x.type) ?? "?"}`).join(",")).toBe("1/1 QUADROTOR")
+  expect(heard.vehicles().map((x) => `${x.sysid}/${x.compid} ${MavType.nameOf(x.type) ?? "?"}`).join(",")).toBe("254/1 GCS")
+}
+
+describe("operations", () => {
+  it("download the parameter list, asking again for what went missing", listsWithRetries)
+  it("report an incomplete list as incomplete", incompleteSaysSo)
+  it("read a parameter by name", readsByName)
+  it("time out a read nobody answers", readTimesOut)
+  it("write a parameter and verify the read-back, reporting a changed value", writesAndVerifies)
+  it("discover vehicles and send heartbeats", discoversAndBeats)
+})

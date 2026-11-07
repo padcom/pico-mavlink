@@ -50,6 +50,8 @@ export class MavLinkConnection {
   public readonly registry: Registry
   public readonly protocol: MavLinkProtocol
   seq: int = 0
+  readonly listeners: Map<int, (r: Received) => void> = new Map<int, (r: Received) => void>()
+  nextListener: int = 0
 
   constructor(stream: ByteStream, options: ConnectionOptions = {}) {
     this.stream = stream
@@ -90,7 +92,72 @@ export class MavLinkConnection {
     }
   }
 
+  /// Calls `handler` with every message `run()` receives; its id, for `off`.
+  public on(handler: (r: Received) => void): int {
+    const id = nextListener
+    nextListener += 1
+    listeners.set(id, handler)
+    id
+  }
+
+  /// Stops calling the handler `on` returned `id` for.
+  public off(id: int): void {
+    listeners.delete(id)
+  }
+
+  /// Receives until the stream ends, handing every message to the `on` handlers (operations
+  /// listen this way). Use either this or `messages()`, not both.
+  public async run(): Promise<void> throws Error {
+    for await (const r of messages()) {
+      // A handler may remove itself (or others) while called.
+      const handlers: ((r: Received) => void)[] = []
+      for (const [_, h] of listeners) {
+        handlers.push(h)
+      }
+      for (const h of handlers) {
+        h(r)
+      }
+    }
+  }
+
+  /// The first message (while `run()` runs) that `accept` accepts, or null after `timeoutMs`.
+  public waitFor(accept: (r: Received) => bool, timeoutMs: int): Promise<Received?, Error> {
+    new Promise<Received?, Error>((resolve: (value: Received?) => void, _reject: (error: Error) => void) => {
+      const w = new Waiter(resolve)
+      w.listener = this.on((r: Received) => {
+        if (!w.done && accept(r)) {
+          w.finish(this, r)
+        }
+      })
+      w.timer = setTimeout(() => {
+        if (!w.done) {
+          w.finish(this, null)
+        }
+      }, timeoutMs)
+    })
+  }
+
   public close(): void {
     stream.close()
+  }
+}
+
+/// One `waitFor`: settles once, by a message or by its timer.
+class Waiter {
+  readonly resolve: (value: Received?) => void
+  public done: bool = false
+  public listener: int = -1
+  public timer: int = -1
+
+  constructor(resolve: (value: Received?) => void) {
+    this.resolve = resolve
+  }
+
+  public finish(conn: MavLinkConnection, r: Received?): void {
+    done = true
+    conn.off(listener)
+    clearTimeout(timer)
+    const f = resolve
+    f(r)
   }
 }

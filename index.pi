@@ -25,4 +25,27 @@ export {
 export { MavLinkPacketSplitter, MavLinkTLogPacketSplitter, RawPacket, SplitterOptions } from "./src/splitter"
 export { ByteStream, FileStream, MemoryStream, TcpStream, UdpStream } from "./src/stream"
 export { ConnectionOptions, MavLinkConnection, Received, defaultRegistry, packets } from "./src/connection"
+export {
+  ParamEncoding,
+  ParamError,
+  TypedParamValue,
+  decodeParam,
+  encodeParam,
+  encodingOf,
+  sameParam,
+  showParam,
+} from "./src/params"
+export {
+  HeartbeatSender,
+  Param,
+  ParamList,
+  ParamListResult,
+  ParamOptions,
+  ParamRead,
+  ParamSetResult,
+  ParamWrite,
+  Target,
+  Vehicle,
+  VehicleDiscovery,
+} from "./src/operations"
 export * from "./src/dialects/all"

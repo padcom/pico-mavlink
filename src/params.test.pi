@@ -1,0 +1,71 @@
+import { describe, it, expect } from "std/test"
+import { ParamEncoding, ParamError, TypedParamValue, decodeParam, encodeParam, encodingOf, sameParam, showParam } from "./params"
+import { MavParamType } from "./dialects/common"
+import { MavProtocolCapability } from "./dialects/standard"
+
+function roundTrip(v: TypedParamValue, e: ParamEncoding): string throws ParamError {
+  const wire = encodeParam(v, e)
+  const back = match (v) {
+    Int { type } => decodeParam(wire, type, e),
+    Real { type } => decodeParam(wire, type, e),
+  }
+  showParam(back)
+}
+
+function intsBothWays(): void throws ParamError {
+  for (const e of [ParamEncoding.Bytewise, ParamEncoding.CCast]) {
+    expect(roundTrip(TypedParamValue.Int(-5, MavParamType.INT8), e)).toBe("-5")
+    expect(roundTrip(TypedParamValue.Int(250, MavParamType.UINT8), e)).toBe("250")
+    expect(roundTrip(TypedParamValue.Int(-32768, MavParamType.INT16), e)).toBe("-32768")
+    expect(roundTrip(TypedParamValue.Int(65535, MavParamType.UINT16), e)).toBe("65535")
+    expect(roundTrip(TypedParamValue.Int(16_777_216, MavParamType.INT32), e)).toBe("16777216")
+  }
+}
+
+function bytewiseCarriesAll32Bits(): void throws ParamError {
+  // These aren't exact as floats, and some are NaN bit patterns: bytewise still carries them.
+  for (const v of [16_777_217, 2_139_095_041, -1, -2_147_483_648, 2_147_483_647]) {
+    expect(roundTrip(TypedParamValue.Int(v, MavParamType.INT32), ParamEncoding.Bytewise)).toBe(`${v}`)
+  }
+  expect(roundTrip(TypedParamValue.Int(4_294_967_295, MavParamType.UINT32), ParamEncoding.Bytewise)).toBe("4294967295")
+  // The float of a bytewise 1 is a denormal, not 1.0.
+  expect((encodeParam(TypedParamValue.Int(1, MavParamType.INT32), ParamEncoding.Bytewise) as f64) < 1e-40).toBe(true)
+}
+
+function codeOf(v: TypedParamValue, e: ParamEncoding): string {
+  try {
+    encodeParam(v, e)
+    "ok"
+  } catch (err: ParamError) {
+    err.code
+  }
+}
+
+function refusesWhatDoesntFit(): void {
+  expect(codeOf(TypedParamValue.Int(256, MavParamType.UINT8), ParamEncoding.Bytewise)).toBe("OUT_OF_RANGE")
+  expect(codeOf(TypedParamValue.Int(-1, MavParamType.UINT16), ParamEncoding.CCast)).toBe("OUT_OF_RANGE")
+  expect(codeOf(TypedParamValue.Int(16_777_217, MavParamType.INT32), ParamEncoding.CCast)).toBe("NOT_EXACT")
+  expect(codeOf(TypedParamValue.Int(1, MavParamType.INT64), ParamEncoding.CCast)).toBe("UNSUPPORTED_TYPE")
+}
+
+function reals(): void throws ParamError {
+  for (const e of [ParamEncoding.Bytewise, ParamEncoding.CCast]) {
+    expect(roundTrip(TypedParamValue.Real(0.1, MavParamType.REAL32), e)).toBe(showParam(TypedParamValue.Real(0.1, MavParamType.REAL32)))
+  }
+  expect(sameParam(TypedParamValue.Real(0.1, MavParamType.REAL32), TypedParamValue.Real((0.1 as f32) as f64, MavParamType.REAL32))).toBe(true)
+  expect(sameParam(TypedParamValue.Int(1, MavParamType.INT32), TypedParamValue.Real(1.0, MavParamType.REAL32))).toBe(false)
+}
+
+function encodings(): void {
+  expect(encodingOf(MavProtocolCapability.PARAM_ENCODE_BYTEWISE as u64) == ParamEncoding.Bytewise).toBe(true)
+  expect(encodingOf((MavProtocolCapability.PARAM_ENCODE_C_CAST | MavProtocolCapability.MAVLINK2) as u64) == ParamEncoding.CCast).toBe(true)
+  expect(encodingOf(0 as u64) == null).toBe(true)
+}
+
+describe("typed parameter values", () => {
+  it("round-trip integers of every width in both encodings", intsBothWays)
+  it("carry all 32 bits bytewise, NaN patterns included", bytewiseCarriesAll32Bits)
+  it("refuse values that don't fit or that C-cast can't carry exactly", refusesWhatDoesntFit)
+  it("carry reals as the float that travels", reals)
+  it("read the encoding from AUTOPILOT_VERSION capabilities", encodings)
+})

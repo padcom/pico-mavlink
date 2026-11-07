@@ -1,0 +1,154 @@
+// Typed parameter values: PARAM_VALUE and PARAM_SET carry every parameter in a float field, with
+// its MAV_PARAM_TYPE beside it. How an integer travels in that float depends on the autopilot:
+// bytewise (PX4: the integer's bytes are the float's bytes) or C-cast (ArduPilot: the float's
+// value is the integer's value). Nothing is silently coerced: a value that doesn't fit its type,
+// or that the encoding can't carry exactly, is an error.
+import { readF32, readUint, writeF32, writeUint } from "./bytes"
+import { MavParamType } from "./dialects/common"
+import { MavProtocolCapability } from "./dialects/standard"
+
+/// How an autopilot puts integers in a parameter's float field.
+export enum ParamEncoding {
+  /// The integer's bytes are the float's bytes (MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_BYTEWISE).
+  Bytewise,
+  /// The float's value is the integer's value (MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_C_CAST).
+  CCast,
+}
+
+/// The encoding an autopilot reports in AUTOPILOT_VERSION's `capabilities`, or null if it reports
+/// neither (then ask the user, or use what's known about that autopilot).
+export function encodingOf(capabilities: u64): ParamEncoding? {
+  const c = capabilities as int
+  if ((c & MavProtocolCapability.PARAM_ENCODE_BYTEWISE) != 0) {
+    return ParamEncoding.Bytewise
+  }
+  if ((c & MavProtocolCapability.PARAM_ENCODE_C_CAST) != 0) {
+    return ParamEncoding.CCast
+  }
+  null
+}
+
+/// A parameter's value with its type: an integer, or a real number.
+export enum TypedParamValue {
+  /// UINT8 … INT64.
+  Int(value: int, type: int),
+  /// REAL32 or REAL64.
+  Real(value: f64, type: int),
+}
+
+/// Why a value can't be put on the wire.
+export class ParamError extends Error {
+  /// `OUT_OF_RANGE`, `NOT_EXACT` (C-cast can't carry this integer exactly in a float),
+  /// `UNSUPPORTED_TYPE` (64-bit types need PARAM_EXT_*).
+  public readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.code = code
+  }
+}
+
+/// Bytes and limits of the integer types.
+function intBits(type: int): int {
+  if (type == MavParamType.UINT8 || type == MavParamType.INT8) {
+    return 8
+  }
+  if (type == MavParamType.UINT16 || type == MavParamType.INT16) {
+    return 16
+  }
+  if (type == MavParamType.UINT32 || type == MavParamType.INT32) {
+    return 32
+  }
+  if (type == MavParamType.UINT64 || type == MavParamType.INT64) {
+    return 64
+  }
+  0
+}
+
+function isSigned(type: int): bool {
+  type == MavParamType.INT8 || type == MavParamType.INT16 || type == MavParamType.INT32 || type == MavParamType.INT64
+}
+
+function isReal(type: int): bool {
+  type == MavParamType.REAL32 || type == MavParamType.REAL64
+}
+
+/// The float's 4 bytes as an unsigned integer.
+function bitsOf(wire: f32): int {
+  const b = new Uint8Array(4)
+  writeF32(b, 0, wire)
+  readUint(b, 0, 4)
+}
+
+/// The value a PARAM_VALUE (`wire`, `type`) carries.
+export function decodeParam(wire: f32, type: int, encoding: ParamEncoding): TypedParamValue {
+  if (isReal(type)) {
+    return TypedParamValue.Real(wire as f64, type)
+  }
+  const bits = intBits(type)
+  if (encoding == ParamEncoding.Bytewise && bits > 0 && bits <= 32) {
+    let v = bitsOf(wire) & ((1 << bits) - 1)
+    if (isSigned(type) && v >= (1 << (bits - 1))) {
+      v -= 1 << bits
+    }
+    return TypedParamValue.Int(v, type)
+  }
+  // C-cast (and 64-bit types, which PARAM_VALUE can only carry as a float's value).
+  TypedParamValue.Int((wire as f64) as int, type)
+}
+
+/// The float field for `value` (its type goes in `param_type`).
+export function encodeParam(value: TypedParamValue, encoding: ParamEncoding): f32 throws ParamError {
+  match (value) {
+    Real { value } => value as f32,
+    Int { value, type } => encodeInt(value, type, encoding),
+  }
+}
+
+function encodeInt(v: int, type: int, encoding: ParamEncoding): f32 throws ParamError {
+  const bits = intBits(type)
+  if (bits == 0) {
+    throw new ParamError("UNSUPPORTED_TYPE", `MAV_PARAM_TYPE ${type} isn't an integer type`)
+  }
+  if (bits == 64) {
+    throw new ParamError("UNSUPPORTED_TYPE", "64-bit parameters need PARAM_EXT_* (not supported yet)")
+  }
+  const lo = if (isSigned(type)) -(1 << (bits - 1)) else 0
+  const hi = if (isSigned(type)) (1 << (bits - 1)) - 1 else (1 << bits) - 1
+  if (v < lo || v > hi) {
+    throw new ParamError("OUT_OF_RANGE", `${v} doesn't fit ${MavParamType.nameOf(type) ?? "the type"} (${lo} to ${hi})`)
+  }
+  if (encoding == ParamEncoding.Bytewise) {
+    const b = new Uint8Array(4)
+    writeUint(b, 0, bits / 8, v)
+    return readF32(b, 0)
+  }
+  const f = v as f32
+  if ((f as f64) as int != v) {
+    throw new ParamError("NOT_EXACT", `${v} can't travel exactly as a float (C-cast encoding)`)
+  }
+  f
+}
+
+/// Whether two values are the same parameter value (what a PARAM_SET's read-back is checked
+/// against). Reals compare as the float that travelled.
+export function sameParam(a: TypedParamValue, b: TypedParamValue): bool {
+  match (a) {
+    Int { value } => match (b) {
+      Int { value: v2 } => value == v2,
+      Real { } => false,
+    },
+    Real { value } => match (b) {
+      Real { value: v2 } => (value as f32) == (v2 as f32),
+      Int { } => false,
+    },
+  }
+}
+
+/// The value as text (an integer, or the float's shortest form).
+export function showParam(v: TypedParamValue): string {
+  match (v) {
+    Int { value } => `${value}`,
+    Real { value } => `${value as f32}`,
+  }
+}
