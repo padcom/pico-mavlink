@@ -169,7 +169,11 @@ The package is universal: it reads and writes both versions, as node-mavlink doe
 sending, and parses whatever arrives. A v1 frame is limited in what it can carry, so sending one is
 checked rather than silently cut:
 - message IDs above 255 don't fit v1's one-byte ID: `send` fails with `UNSUPPORTED_BY_V1`;
-- v1 has no extension fields: they aren't sent, and the payload is the base length;
+- v1 has no extension fields: they aren't sent, and the payload is the base length (31 bytes for
+  `SYS_STATUS`, not 43). **This departs from node-mavlink 2.3.0.** Its v1 serializer writes
+  `PAYLOAD_LENGTH` bytes, and that length includes the extensions. Pico MAVLink follows the
+  MAVLink spec here, and the fixture comparison lists it as the one expected difference. Parsing
+  accepts both forms.
 - v1 has no signing: `sendSigned` is V2 only, as in node-mavlink;
 - v1 frames aren't truncated; v2 frames drop trailing zero bytes.
 
