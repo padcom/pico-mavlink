@@ -92,6 +92,11 @@ export class MavLinkConnection {
   /// Every packet received, decoded when the registry knows its message, until the stream ends.
   public async* messages(): AsyncIterator<Received> throws Error {
     for await (const p of packets(stream, { magicNumbers: registry.magicNumbers() })) {
+      // MAVLink 2: a packet with an incompatibility flag this end doesn't understand is dropped
+      // (only "signed" is defined).
+      if ((p.header.incompatibilityFlags & ~MavLinkProtocolV2.IFLAG_SIGNED) != 0) {
+        continue
+      }
       const policy = signing
       if (policy != null && policy!.check(p) != null) {
         continue
