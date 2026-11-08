@@ -51,5 +51,6 @@ export {
   Vehicle,
   VehicleDiscovery,
 } from "./src/operations"
+export { StatusMessage, StatusTextAssembler, StatusTextReader, splitStatusText } from "./src/statustext"
 export { SimParam, SimulatedAutopilot, defaultSimParams } from "./src/simulator"
 export * from "./src/dialects/all"
