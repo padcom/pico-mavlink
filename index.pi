@@ -53,5 +53,6 @@ export {
 } from "./src/operations"
 export { StatusMessage, StatusTextAssembler, StatusTextReader, splitStatusText, statusTextFields } from "./src/statustext"
 export { LinkInfo, MavLinkRouter, RouterOptions } from "./src/router"
+export { HeldRate, RateResult, RatesOptions, TelemetryRates } from "./src/rates"
 export { SimParam, SimulatedAutopilot, defaultSimParams } from "./src/simulator"
 export * from "./src/dialects/all"

@@ -895,6 +895,26 @@ async function writesToALinkOneAtATime(): Promise<void> throws Error {
   expect(`${slow.writes} ${slow.peak} ${seqs.join(",")}`).toBe("5 1 0,1,2,3,4")
 }
 
+async function keepsReadingWhenAskedToAfterEveryLinkEnded(): Promise<void> throws Error {
+  const l1 = MemoryStream.pair()
+  const router = new MavLinkRouter({ keepOpen: true })
+  router.addLink(l1[0])
+  const waiting = router.read()
+  l1[1].close()
+  await delay(30)
+  expect(router.linkInfo()[0].up).toBe(false)
+  // The only link is gone and the read is still waiting: a new link can bring more.
+  const l2 = MemoryStream.pair()
+  router.addLink(l2[0])
+  await l2[1].write(heartbeatFrame(7, 3))
+  const frame = await waiting
+  expect(frame != null && frame![4] == 3).toBe(true)
+  // Only close() ends it.
+  const last = router.read()
+  router.close()
+  expect((await last) == null).toBe(true)
+}
+
 async function endsWhenEveryLinkEnds(): Promise<void> throws Error {
   const l1 = MemoryStream.pair()
   const l2 = MemoryStream.pair()
@@ -932,5 +952,6 @@ describe("the router", () => {
   it("does not send a frame on the route after it went by the fallback", doesNotSendOldFramesOnTheRouteAfterTheyWentByTheFallback)
   it("routes MAVLink 1 and forwards signed frames untouched", routesMavlink1AndForwardsSignedFramesUntouched)
   it("writes to a link one frame at a time, in order", writesToALinkOneAtATime)
+  it("keeps reading after every link ended, when asked to", keepsReadingWhenAskedToAfterEveryLinkEnded)
   it("ends when every link has ended", endsWhenEveryLinkEnds)
 })

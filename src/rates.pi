@@ -1,0 +1,305 @@
+// Telemetry rates: the rate of each message a vehicle sends, asked for in one place and held.
+//
+// MAV_CMD_SET_MESSAGE_INTERVAL sets the interval of one message (https://mavlink.io/en/services/command.html).
+// Where the vehicle does not honour it, REQUEST_DATA_STREAM asks for the stream the message belongs to
+// instead. A stream is a group of messages with one rate, so the rate asked for a stream is the highest of
+// the messages held in it, and the others in the group come at that rate too.
+//
+// A vehicle that reboots forgets what it was asked. The manager notices a reboot (the vehicle's
+// time_boot_ms goes back) or a reconnect (it was silent, then speaks again), and asks again for everything
+// it holds. It works on any `MavLinkConnection`, so over a `MavLinkRouter` too, one manager per vehicle.
+import { MavLinkConnection, Received } from "./connection"
+import { MavLinkError } from "./protocol"
+import { CommandCall, Target } from "./operations"
+import { readU32 } from "./bytes"
+import { MavResult, RequestDataStream } from "./dialects/common"
+
+export struct RatesOptions {
+  /// How long a vehicle may say nothing before its next message counts as a reconnect (default 5000 ms).
+  silenceMs?: int
+  /// How long to wait after noticing a reboot before asking again, for the vehicle to be ready (default 500 ms).
+  settleMs?: int
+  /// How long to wait for the acknowledgement of one request (default 500 ms).
+  timeoutMs?: int
+  /// How many times to ask again when no acknowledgement comes (default 2).
+  retries?: int
+  /// How far behind its own clock a vehicle's time_boot_ms may be before that is taken as a reboot (default 250 ms).
+  toleranceMs?: int
+}
+
+/// How one rate was asked for.
+export struct RateResult {
+  messageId: int
+  /// `interval` (SET_MESSAGE_INTERVAL was acknowledged as accepted), `stream` (REQUEST_DATA_STREAM, which is not
+  /// acknowledged: it is sent, not confirmed) or `none` (neither works for this message).
+  method: string
+  /// Whether the request was accepted or sent.
+  ok: bool
+  /// The MAV_RESULT of SET_MESSAGE_INTERVAL, or -1 when no acknowledgement came.
+  result: int
+}
+
+/// A rate that is held.
+export struct HeldRate {
+  messageId: int
+  /// Microseconds between messages; -1 for off.
+  intervalUs: int
+  /// How it was last asked for, as in `RateResult`.
+  method: string
+}
+
+/// The stream each message is in, as ArduPilot documents its SRn_ parameters (message id, MAV_DATA_STREAM).
+/// Other messages have no stream to fall back to.
+const STREAM_OF: int[][] = [
+  [1, 2], // SYS_STATUS: EXTENDED_STATUS
+  [24, 2], // GPS_RAW_INT
+  [42, 2], // MISSION_CURRENT
+  [62, 2], // NAV_CONTROLLER_OUTPUT
+  [125, 2], // POWER_STATUS
+  [27, 1], // RAW_IMU: RAW_SENSORS
+  [29, 1], // SCALED_PRESSURE
+  [116, 1], // SCALED_IMU2
+  [36, 3], // SERVO_OUTPUT_RAW: RC_CHANNELS
+  [65, 3], // RC_CHANNELS
+  [32, 6], // LOCAL_POSITION_NED: POSITION
+  [33, 6], // GLOBAL_POSITION_INT
+  [30, 10], // ATTITUDE: EXTRA1
+  [74, 11], // VFR_HUD: EXTRA2
+  [2, 12], // SYSTEM_TIME: EXTRA3
+  [241, 12], // VIBRATION
+]
+
+function streamOf(messageId: int): int {
+  for (const pair of STREAM_OF) {
+    if (pair[0] == messageId) {
+      return pair[1]
+    }
+  }
+  -1
+}
+
+export class TelemetryRates {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly silenceMs: int
+  readonly settleMs: int
+  readonly timeoutMs: int
+  readonly retries: int
+  readonly toleranceMs: int
+  /// message id -> interval in microseconds (-1: off), in the order they were asked for.
+  readonly wanted: Map<int, int> = new Map<int, int>()
+  readonly methods: Map<int, string> = new Map<int, string>()
+  /// message id -> where time_boot_ms is in its payload, or -1 if it has none.
+  readonly bootField: Map<int, int> = new Map<int, int>()
+  readonly handlers: ((results: RateResult[]) => void)[] = []
+  readonly listener: int
+  lastSeen: int = 0
+  /// The vehicle's time_boot_ms at the last message that had one, and when (ms since 1970) that arrived.
+  lastBoot: int = -1
+  lastBootAt: int = 0
+  reapplying: bool = false
+  reboots: int = 0
+  stopped: bool = false
+
+  constructor(conn: MavLinkConnection, target: Target, options: RatesOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.silenceMs = options.silenceMs ?? 5000
+    this.settleMs = options.settleMs ?? 500
+    this.timeoutMs = options.timeoutMs ?? 500
+    this.retries = options.retries ?? 2
+    this.toleranceMs = options.toleranceMs ?? 250
+    this.listener = conn.on((r: Received) => this.seen(r))
+  }
+
+  /// Asks for `messageId` at `hz` messages a second (0.001 to 1000), and holds the rate.
+  public async set(messageId: int, hz: f64): Promise<RateResult> throws Error {
+    if (!(hz >= 0.001 && hz <= 1000.0)) {
+      throw new MavLinkError("INVALID_RATE", `a rate is 0.001 to 1000 Hz, not ${hz}`)
+    }
+    const intervalUs = Math.round(1_000_000.0 / hz) as int
+    await ask(messageId, if (intervalUs < 1) 1 else intervalUs)
+  }
+
+  /// Switches `messageId` off, and holds that.
+  public async off(messageId: int): Promise<RateResult> throws Error {
+    await ask(messageId, -1)
+  }
+
+  /// Gives `messageId` back to the vehicle's own rate, and stops holding anything for it. Only
+  /// SET_MESSAGE_INTERVAL can do that; a vehicle that has only streams keeps the rate it was last given.
+  public async reset(messageId: int): Promise<RateResult> throws Error {
+    wanted.delete(messageId)
+    methods.delete(messageId)
+    const r = await request(messageId, 0)
+    r
+  }
+
+  /// What is held, in the order it was asked for.
+  public held(): HeldRate[] {
+    const out: HeldRate[] = []
+    for (const [id, interval] of wanted) {
+      out.push({ messageId: id, intervalUs: interval, method: methods.get(id) ?? "none" })
+    }
+    out
+  }
+
+  /// How many reboots or reconnects were noticed.
+  public rebootCount(): int {
+    reboots
+  }
+
+  /// Calls `handler` with the results each time the rates were asked for again after a reboot or reconnect.
+  public onReapplied(handler: (results: RateResult[]) => void): void {
+    handlers.push(handler)
+  }
+
+  /// Asks for everything held again, one after the other (after a reconnect that the manager could not see,
+  /// say, such as a new connection). Never throws for a rate that fails: that is in its result.
+  public async reapply(): Promise<RateResult[]> throws Error {
+    const results: RateResult[] = []
+    const ids: int[] = []
+    for (const [id, _] of wanted) {
+      ids.push(id)
+    }
+    for (const id of ids) {
+      const interval = wanted.get(id)
+      if (interval != null) {
+        results.push(await request(id, interval!))
+      }
+    }
+    results
+  }
+
+  /// Stops watching the connection. What was asked for stays asked for, on the vehicle.
+  public stop(): void {
+    stopped = true
+    conn.off(listener)
+  }
+
+  async ask(messageId: int, intervalUs: int): Promise<RateResult> throws Error {
+    wanted.set(messageId, intervalUs)
+    await request(messageId, intervalUs)
+  }
+
+  /// SET_MESSAGE_INTERVAL; or, if the vehicle does not accept it (or does not answer), REQUEST_DATA_STREAM.
+  async request(messageId: int, intervalUs: int): Promise<RateResult> throws Error {
+    let result = -1
+    try {
+      const calls = new CommandCall(conn, target, { timeoutMs: timeoutMs, retries: retries })
+      result = await calls.setMessageInterval(messageId, intervalUs)
+    } catch (e: MavLinkError) {
+      // No acknowledgement. An unsupported command is often just not answered, so try the streams.
+      result = -1
+    }
+    if (result == MavResult.ACCEPTED) {
+      methods.set(messageId, "interval")
+      return { messageId: messageId, method: "interval", ok: true, result: result }
+    }
+    const stream = streamOf(messageId)
+    if (stream < 0 || intervalUs == 0) {
+      methods.set(messageId, "none")
+      return { messageId: messageId, method: "none", ok: false, result: result }
+    }
+    await requestStream(stream)
+    methods.set(messageId, "stream")
+    const sent: RateResult = { messageId: messageId, method: "stream", ok: true, result: result }
+    sent
+  }
+
+  /// REQUEST_DATA_STREAM for `stream`, at the highest rate any message held in it needs (off if they are all off).
+  async requestStream(stream: int): Promise<void> throws Error {
+    let hz = 0
+    for (const [id, interval] of wanted) {
+      if (streamOf(id) == stream && interval > 0) {
+        const needed = Math.ceil(1_000_000.0 / (interval as f64)) as int
+        if (needed > hz) {
+          hz = needed
+        }
+      }
+    }
+    const m = new RequestDataStream()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    m.reqStreamId = stream as u8
+    m.reqMessageRate = (if (hz > 65535) 65535 else hz) as u16
+    m.startStop = (if (hz > 0) 1 else 0) as u8
+    await conn.send(m)
+  }
+
+  /// Whether a message is from the vehicle this manager looks after.
+  fromTarget(r: Received): bool {
+    r.packet.header.sysid == target.system && (target.component == 0 || r.packet.header.compid == target.component)
+  }
+
+  /// The vehicle's time since boot in a message that has it, or -1.
+  bootTimeOf(r: Received): int {
+    const msgid = r.packet.header.msgid
+    let at = bootField.get(msgid)
+    if (at == null) {
+      let found = -1
+      const info = conn.registry.get(msgid)
+      if (info != null) {
+        for (const f of info!.fields) {
+          if (f.source == "time_boot_ms") {
+            found = f.offset
+          }
+        }
+      }
+      bootField.set(msgid, found)
+      at = found
+    }
+    if (at! < 0) {
+      return -1
+    }
+    readU32(r.packet.payload, at!) as int
+  }
+
+  seen(r: Received): void {
+    if (stopped || !fromTarget(r)) {
+      return
+    }
+    const now = Date.now() as int
+    const quiet = lastSeen > 0 && now - lastSeen >= silenceMs
+    lastSeen = now
+    const boot = bootTimeOf(r)
+    let rebooted = false
+    if (boot >= 0) {
+      // Where its clock should be by now if it had not rebooted.
+      if (lastBoot >= 0 && boot + toleranceMs < lastBoot + (now - lastBootAt)) {
+        rebooted = true
+      }
+      lastBoot = boot
+      lastBootAt = now
+    }
+    if ((quiet || rebooted) && wanted.size > 0) {
+      reboots += 1
+      reapplyLater()
+    } else if (quiet || rebooted) {
+      reboots += 1
+    }
+  }
+
+  /// Asks again once the vehicle has had `settleMs` to get ready, unless that is already going to happen.
+  reapplyLater(): void {
+    if (reapplying) {
+      return
+    }
+    reapplying = true
+    setTimeout(() => {
+      this.runReapply()
+    }, settleMs)
+  }
+
+  async runReapply(): Promise<void> {
+    try {
+      const results = await reapply()
+      for (const h of handlers) {
+        h(results)
+      }
+    } catch (e: Error) {
+      // The connection is gone or the vehicle is not answering: the next reboot or reconnect tries again.
+    }
+    reapplying = false
+  }
+}
