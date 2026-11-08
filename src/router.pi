@@ -3,17 +3,23 @@
 // A `MavLinkRouter` is a `ByteStream` that a `MavLinkConnection` can sit on. Each link added to it is
 // another byte stream (a serial port, a UDP peer, a TCP connection). The router
 //   - reads whole, checked frames from every link and hands them on in one stream, once: a frame that
-//     arrives on two links (redundant links) is delivered once, found by its sender, sequence number,
-//     message id and checksum;
+//     arrives on a second link (redundant links) is delivered once, found by its sender, sequence number,
+//     message id and checksum, and by having identical bytes;
 //   - learns which link reaches which system and component, from what each link delivers;
 //   - sends an outgoing frame only to the links that reach its target system and component, or to all links
-//     when it is a broadcast or its target has not been heard yet;
+//     when it is a broadcast or its target has not been heard yet, and falls back to the other links when
+//     the ones that reach the target fail;
 //   - with `forward`, passes what one link delivers on to the others by the same rules, never back to the
 //     link it came from (a ground station that bridges a radio and a companion computer, say).
 // Operations (`ParamList` and the rest) already match replies by target system and component, so with
 // the router in place they work with more than one vehicle on a connection.
+//
+// The router sits below the connection, so it does not check signatures: it learns routes from every frame
+// that is well formed, signed or not, and passes frames on byte for byte. Put a `SigningPolicy` on the
+// connection to refuse what is not signed; the routes a forged frame teaches only steer where a message
+// goes, they do not make it be believed.
 import { Registry } from "./data"
-import { MavLinkPacket, MavLinkPacketParser } from "./protocol"
+import { MavLinkError, MavLinkPacket, MavLinkPacketParser } from "./protocol"
 import { MavLinkPacketSplitter } from "./splitter"
 import { ByteStream } from "./stream"
 import { defaultRegistry } from "./connection"
@@ -26,6 +32,11 @@ export struct RouterOptions {
   dedupeMs?: int
   /// How long a system stays reachable through a link after it was last heard on it (default 10 s).
   routeTtlMs?: int
+  /// How many senders (system and component) the router remembers per link, the least recently heard
+  /// going first (default 256).
+  maxRoutesPerLink?: int
+  /// How many frames may wait to be read; past that the oldest are dropped (default 4096).
+  maxQueued?: int
   /// The messages whose target fields are looked up (default: `defaultRegistry()`).
   registry?: Registry
 }
@@ -33,7 +44,7 @@ export struct RouterOptions {
 /// What the router knows about a link.
 export struct LinkInfo {
   id: int
-  /// Whether the link still delivers (it ended, or failed, when false).
+  /// Whether the link is in use: it still delivers and has not failed to take a frame.
   up: bool
   /// Frames it delivered, duplicates included.
   frames: int
@@ -44,24 +55,39 @@ export struct LinkInfo {
 class Link {
   public readonly id: int
   public readonly stream: ByteStream
+  /// Whether it still delivers (false once its stream ends or fails to read).
   public up: bool = true
+  /// Whether it failed to take a frame: it is not written to again.
+  public failed: bool = false
   public frames: int = 0
   public duplicates: int = 0
   public writeErrors: int = 0
+  /// The senders heard on it, by (system * 256 + component), in order of when they were last heard.
+  public readonly heard: Map<int, int> = new Map<int, int>()
+  /// Writes go one at a time: whoever holds the link writes, the others wait their turn.
+  public busy: bool = false
+  public waiters: ((value: bool) => void)[] = []
 
   constructor(id: int, stream: ByteStream) {
     this.id = id
     this.stream = stream
   }
+
+  /// Whether to write to it and route to it.
+  public usable(): bool {
+    up && !failed
+  }
 }
 
-/// A frame delivered, and when.
+/// A frame delivered, when, and over which link.
 class Seen {
   public readonly at: int
+  public readonly link: int
   public readonly frame: Uint8Array
 
-  constructor(at: int, frame: Uint8Array) {
+  constructor(at: int, link: int, frame: Uint8Array) {
     this.at = at
+    this.link = link
     this.frame = frame
   }
 }
@@ -88,10 +114,13 @@ export class MavLinkRouter implements ByteStream {
   public readonly forward: bool
   public readonly dedupeMs: int
   public readonly routeTtlMs: int
+  public readonly maxRoutesPerLink: int
+  public readonly maxQueued: int
   readonly registry: Registry
   readonly links: Link[] = []
-  /// (link * 65536 + system * 256 + component) -> when it was last heard there (ms).
-  readonly routes: Map<int, int> = new Map<int, int>()
+  /// For each sender (system * 256 + component) heard on some link, the links it was heard on. Which links
+  /// reach a system is looked up here, not by going through every route.
+  readonly index: Map<int, int[]> = new Map<int, int[]>()
   /// Frames delivered lately, by sender, sequence number, message id and checksum (in the order they
   /// were delivered).
   readonly recent: Map<string, Seen> = new Map<string, Seen>()
@@ -100,11 +129,14 @@ export class MavLinkRouter implements ByteStream {
   waiting: ((value: Uint8Array?) => void)? = null
   closed: bool = false
   forwarded: int = 0
+  dropped: int = 0
 
   constructor(options: RouterOptions = {}) {
     this.forward = options.forward ?? false
     this.dedupeMs = options.dedupeMs ?? 1000
     this.routeTtlMs = options.routeTtlMs ?? 10_000
+    this.maxRoutesPerLink = options.maxRoutesPerLink ?? 256
+    this.maxQueued = options.maxQueued ?? 4096
     this.registry = options.registry ?? defaultRegistry()
   }
 
@@ -119,7 +151,7 @@ export class MavLinkRouter implements ByteStream {
   /// What the router knows about each link.
   public linkInfo(): LinkInfo[] {
     links.map((l: Link) => {
-      const i: LinkInfo = { id: l.id, up: l.up, frames: l.frames, duplicates: l.duplicates }
+      const i: LinkInfo = { id: l.id, up: l.usable(), frames: l.frames, duplicates: l.duplicates }
       i
     })
   }
@@ -143,6 +175,20 @@ export class MavLinkRouter implements ByteStream {
     n
   }
 
+  /// How many frames were dropped from the queue because nobody read them in time.
+  public droppedCount(): int {
+    dropped
+  }
+
+  /// How many senders are remembered, over all links.
+  public routeCount(): int {
+    let n = 0
+    for (const l of links) {
+      n += l.heard.size
+    }
+    n
+  }
+
   /// The next frame from any link, once; null when every link has ended (or after `close()`).
   public read(): Promise<Uint8Array?, Error> {
     if (head < queue.length) {
@@ -162,19 +208,33 @@ export class MavLinkRouter implements ByteStream {
     })
   }
 
-  /// Sends a frame on the links that reach its target, or on all of them when it is a broadcast or the
-  /// target has not been heard yet. A link that fails to take it is counted and passed over.
+  /// Sends a frame on the links that reach its target; on all of them when it is a broadcast or the target has
+  /// not been heard yet; and on the others when the ones that reach it fail. A link that fails to take a frame
+  /// is marked down and left alone from then on. A `NO_LINK` MavLinkError when no link took the frame, or there
+  /// is none.
   public async write(bytes: Uint8Array): Promise<void> throws Error {
     const to = addressee(bytes)
-    let chosen: int[] = []
-    // (Only a frame that names a system is steered; everything else goes to every link.)
+    const tried: int[] = []
+    let accepted = false
     if (to.system != 0) {
-      chosen = reaching(to.system, to.component, Date.now() as int, -1)
-    }
-    for (const l of links) {
-      if (l.up && (to.system == 0 || chosen.length == 0 || chosen.includes(l.id))) {
-        await sendTo(l, bytes)
+      for (const id of reaching(to.system, to.component, Date.now() as int, -1)) {
+        tried.push(id)
+        if (await sendTo(links[id], bytes)) {
+          accepted = true
+        }
       }
+    }
+    if (!accepted) {
+      for (const l of links) {
+        if (l.usable() && !tried.includes(l.id)) {
+          if (await sendTo(l, bytes)) {
+            accepted = true
+          }
+        }
+      }
+    }
+    if (!accepted) {
+      throw new MavLinkError("NO_LINK", if (links.length == 0) "the router has no links" else "no link took the frame")
     }
   }
 
@@ -243,60 +303,121 @@ export class MavLinkRouter implements ByteStream {
     const p = packet!
     const h = p.header
     link.frames += 1
-    routes.set(link.id * 65536 + h.sysid * 256 + h.compid, now)
+    hear(link, h.sysid * 256 + h.compid, now)
     forget(now)
     const key = `${h.sysid}/${h.compid}/${h.seq}/${h.msgid}/${p.crc}`
     const before = recent.get(key)
-    // A duplicate is the same bytes. The sequence number is one byte and the checksum two, so a burst can
-    // produce another frame with the same key; that one is a different message and is delivered.
-    if (before != null && sameBytes(before!.frame, frame)) {
+    // A duplicate is the same bytes, delivered by another link. The same link repeating a frame is a new
+    // message: the sequence number is one byte and goes round in under a second on a busy link.
+    if (before != null && before!.link != link.id && sameBytes(before!.frame, frame)) {
       link.duplicates += 1
       return
     }
     recent.delete(key)
-    recent.set(key, new Seen(now, frame))
+    recent.set(key, new Seen(now, link.id, frame))
     const w = waiting
     if (w != null) {
       waiting = null
       w!(frame)
     } else {
+      if (queue.length - head >= maxQueued) {
+        head += 1
+        dropped += 1
+      }
       queue.push(frame)
     }
     if (forward) {
       const to = addressee(frame)
       const targets = if (to.system == 0) others(link.id) else reaching(to.system, to.component, now, link.id)
-      for (const l of links) {
-        if (targets.includes(l.id)) {
-          forwarded += 1
-          sendTo(l, frame)
-        }
+      for (const id of targets) {
+        forwarded += 1
+        sendTo(links[id], frame)
       }
     }
   }
 
-  /// Every other link that is up (a broadcast goes to them all).
+  /// Notes that `source` was heard on `link` at `now`, and forgets the senders on that link that were heard
+  /// longest ago when they are stale or past the cap.
+  hear(link: Link, source: int, now: int): void {
+    const known = link.heard.has(source)
+    link.heard.delete(source)
+    link.heard.set(source, now)
+    if (!known) {
+      const on = index.get(source)
+      const list: int[] = if (on == null) [] else on!
+      if (!list.includes(link.id)) {
+        list.push(link.id)
+      }
+      index.set(source, list)
+    }
+    while (link.heard.size > 0) {
+      // The oldest is first: the map is kept in the order the senders were last heard.
+      let oldest = -1
+      let oldestAt = 0
+      for (const [s, at] of link.heard) {
+        oldest = s
+        oldestAt = at
+        break
+      }
+      if (link.heard.size > maxRoutesPerLink || now - oldestAt > routeTtlMs) {
+        forgetRoute(link, oldest)
+      } else {
+        break
+      }
+    }
+  }
+
+  forgetRoute(link: Link, source: int): void {
+    link.heard.delete(source)
+    const on = index.get(source)
+    if (on != null) {
+      const rest = on!.filter((id: int) => id != link.id)
+      if (rest.length == 0) {
+        index.delete(source)
+      }
+      if (rest.length > 0) {
+        index.set(source, rest)
+      }
+    }
+  }
+
+  /// Every other link that is in use (a broadcast goes to them all).
   others(except: int): int[] {
     const out: int[] = []
     for (const l of links) {
-      if (l.up && l.id != except) {
+      if (l.usable() && l.id != except) {
         out.push(l.id)
       }
     }
     out
   }
 
-  /// The links, other than `except`, that are up and reach the system (and component, unless 0).
+  /// The links, other than `except`, that are in use and reach the system (and component, unless 0): looked
+  /// up by sender, 256 at the most for a system with no component given.
   reaching(system: int, component: int, now: int, except: int): int[] {
     const out: int[] = []
-    for (const [key, heard] of routes) {
-      const link = key / 65536
-      const source = key % 65536
-      if (link != except && source / 256 == system && (component == 0 || source % 256 == component) && now - heard <= routeTtlMs
-          && links[link].up && !out.includes(link)) {
-        out.push(link)
+    if (component != 0) {
+      collect(system * 256 + component, now, except, out)
+    } else {
+      for (let c = 0; c < 256; c++) {
+        collect(system * 256 + c, now, except, out)
       }
     }
     out
+  }
+
+  collect(source: int, now: int, except: int, out: int[]): void {
+    const on = index.get(source)
+    if (on == null) {
+      return
+    }
+    for (const id of on!) {
+      const l = links[id]
+      const at = l.heard.get(source)
+      if (id != except && l.usable() && at != null && now - at! <= routeTtlMs && !out.includes(id)) {
+        out.push(id)
+      }
+    }
   }
 
   /// Forgets the frames older than `dedupeMs`, and the oldest beyond 4096.
@@ -348,11 +469,45 @@ export class MavLinkRouter implements ByteStream {
     }
   }
 
-  async sendTo(link: Link, frame: Uint8Array): Promise<void> {
+  /// Takes the link's turn to write, waiting behind whoever holds it.
+  async acquire(link: Link): Promise<void> throws Error {
+    if (!link.busy) {
+      link.busy = true
+      return
+    }
+    await new Promise<bool, Error>((resolve: (value: bool) => void, _reject: (error: Error) => void) => {
+      link.waiters.push(resolve)
+    })
+  }
+
+  /// Hands the link's turn to the one that has waited longest, or frees it.
+  release(link: Link): void {
+    if (link.waiters.length == 0) {
+      link.busy = false
+      return
+    }
+    const next = link.waiters[0]
+    link.waiters = link.waiters.slice(1)
+    next(true)
+  }
+
+  /// Writes a frame to a link, after those before it; whether the link took it. A link that does not is
+  /// marked failed.
+  async sendTo(link: Link, frame: Uint8Array): Promise<bool> {
+    try {
+      await acquire(link)
+    } catch (e: Error) {
+      return false
+    }
+    let taken = true
     try {
       await link.stream.write(frame)
     } catch (e: Error) {
       link.writeErrors += 1
+      link.failed = true
+      taken = false
     }
+    release(link)
+    taken
   }
 }
