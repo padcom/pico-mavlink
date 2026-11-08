@@ -2,7 +2,7 @@ import { describe, it, expect } from "std/test"
 import { readBytes } from "std/fs"
 import { Splitter, x25crc } from "./splitter"
 
-const FIXTURE = "/home/padcom/projects/padcom/node-mavlink/examples/mavlink-v2-3412-packets.bin"
+const FIXTURE = "../../node-mavlink/examples/mavlink-v2-3412-packets.bin"
 
 async function counts(chunk: int): Promise<string> throws Error {
   const bytes = await readBytes(FIXTURE)
