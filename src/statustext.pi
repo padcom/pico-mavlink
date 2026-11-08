@@ -33,6 +33,30 @@ function chunkText(text: Uint8Array): Uint8Array {
   text.slice(0, n)
 }
 
+function sameBytes(a: Uint8Array, b: Uint8Array): bool {
+  if (a.length != b.length) {
+    return false
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false
+    }
+  }
+  true
+}
+
+/// What is remembered of a message that is over, to drop its late and repeated chunks.
+class Finished {
+  public readonly at: int
+  /// Its chunk 0, or null if that never arrived.
+  public readonly first: Uint8Array?
+
+  constructor(at: int, first: Uint8Array?) {
+    this.at = at
+    this.first = first
+  }
+}
+
 /// The chunks of one message that have arrived so far.
 class Pending {
   readonly system: int
@@ -96,6 +120,8 @@ export class StatusTextAssembler {
   /// How many incomplete messages are kept; past that the oldest is delivered as truncated.
   public readonly maxPending: int
   readonly pending: Map<int, Pending> = new Map<int, Pending>()
+  /// Messages that finished (whole, or given up on) in the last `timeoutMs`, by key.
+  readonly finished: Map<int, Finished> = new Map<int, Finished>()
 
   constructor(timeoutMs: int = 1000, maxPending: int = 64) {
     this.timeoutMs = timeoutMs
@@ -117,17 +143,33 @@ export class StatusTextAssembler {
       out.push(single.message(false))
       return out
     }
+    forgetOld(now)
     const key = (system * 256 + component) * 65536 + id
+    const over = finished.get(key)
+    if (over != null) {
+      // A chunk of a message that is over. A late chunk, or one repeated (a retransmit, a second link),
+      // is dropped; only a chunk 0 that differs from the old message's starts a new one.
+      const first = over!.first
+      if (chunkSeq != 0 || first == null || sameBytes(first!, part)) {
+        return out
+      }
+      finished.delete(key)
+    }
     let found = pending.get(key)
     if (found != null && chunkSeq == 0 && found!.parts.has(0)) {
-      // The id came round again: the old message will not get its other chunks now.
+      if (sameBytes(found!.parts.get(0)!, part)) {
+        // Chunk 0 again, as it was: a repeat, not a new message.
+        return out
+      }
+      // The id came round again with a new chunk 0: the old message will not get its other chunks now.
+      // (The key is not remembered as finished: the new message is using it.)
       out.push(found!.message(true))
       pending.delete(key)
       found = null
     }
     if (found == null) {
       if (pending.size >= maxPending) {
-        out.push(evictOldest())
+        out.push(evictOldest(now))
       }
       found = new Pending(system, component, severity, now)
       pending.set(key, found!)
@@ -143,6 +185,7 @@ export class StatusTextAssembler {
     p.updated = now
     if (p.complete()) {
       out.push(p.message(false))
+      remember(key, p, now)
       pending.delete(key)
     }
     out
@@ -150,13 +193,14 @@ export class StatusTextAssembler {
 
   /// The messages that have waited `timeoutMs` for a chunk, as truncated.
   public expire(now: int): StatusMessage[] {
+    forgetOld(now)
     const keys: int[] = []
     for (const [key, p] of pending) {
       if (now - p.updated >= timeoutMs) {
         keys.push(key)
       }
     }
-    deliver(keys)
+    deliver(keys, now)
   }
 
   /// Everything still incomplete, as truncated (the link is closing).
@@ -165,7 +209,7 @@ export class StatusTextAssembler {
     for (const [key, _] of pending) {
       keys.push(key)
     }
-    deliver(keys)
+    deliver(keys, -1)
   }
 
   /// How many messages are waiting for chunks.
@@ -173,16 +217,26 @@ export class StatusTextAssembler {
     pending.size
   }
 
-  deliver(keys: int[]): StatusMessage[] {
+  /// How many finished messages are remembered, to drop their late chunks.
+  public remembered(): int {
+    finished.size
+  }
+
+  /// Gives up on the messages under `keys`, delivering them as truncated (`now` -1: don't remember them).
+  deliver(keys: int[], now: int): StatusMessage[] {
     const out: StatusMessage[] = []
     for (const key of keys) {
-      out.push(pending.get(key)!.message(true))
+      const p = pending.get(key)!
+      out.push(p.message(true))
+      if (now >= 0) {
+        remember(key, p, now)
+      }
       pending.delete(key)
     }
     out
   }
 
-  evictOldest(): StatusMessage {
+  evictOldest(now: int): StatusMessage {
     let oldest = -1
     let oldestAt = 0
     for (const [key, p] of pending) {
@@ -191,9 +245,39 @@ export class StatusTextAssembler {
         oldestAt = p.updated
       }
     }
-    const m = pending.get(oldest)!.message(true)
+    const p = pending.get(oldest)!
+    const m = p.message(true)
+    remember(oldest, p, now)
     pending.delete(oldest)
     m
+  }
+
+  /// Notes that the message under `key` is over, for `timeoutMs`. At most 256 are kept.
+  remember(key: int, p: Pending, now: int): void {
+    finished.set(key, new Finished(now, p.parts.get(0)))
+    if (finished.size > 256) {
+      let oldest = -1
+      let oldestAt = 0
+      for (const [k, f] of finished) {
+        if (oldest < 0 || f.at < oldestAt) {
+          oldest = k
+          oldestAt = f.at
+        }
+      }
+      finished.delete(oldest)
+    }
+  }
+
+  forgetOld(now: int): void {
+    const old: int[] = []
+    for (const [key, f] of finished) {
+      if (now - f.at >= timeoutMs) {
+        old.push(key)
+      }
+    }
+    for (const key of old) {
+      finished.delete(key)
+    }
   }
 }
 
@@ -251,35 +335,44 @@ export class StatusTextReader {
   }
 }
 
-/// A status text as the chunks a vehicle sends: up to 50 bytes of text each, numbered from 0. A text that
-/// fits one chunk has `id` 0; a longer one has `id`, and ends with a chunk that has a NUL (an extra,
-/// empty chunk when the text fills its last chunk exactly).
-export function splitStatusText(severity: int, text: string, id: int): StatusText[] {
+/// The 50-byte text fields a vehicle sends `text` in, as ArduPilot does: cut every 50 bytes of its
+/// UTF-8, wherever that falls, so a character can be cut in two. The last has a NUL (an extra, empty
+/// one when the text fills its last chunk exactly). A text that fits one field is that one field.
+export function statusTextFields(text: string): Uint8Array[] {
   const bytes = new TextEncoder().encode(text)
-  const out: StatusText[] = []
-  if (bytes.length < 50) {
-    const only = new StatusText()
-    only.severity = severity as u8
-    only.text = text
-    out.push(only)
-    return out
-  }
+  const out: Uint8Array[] = []
   let at = 0
-  let seq = 0
   while (at <= bytes.length) {
-    const take = if (bytes.length - at < 50) bytes.length - at else 50
-    const piece = new Uint8Array(take)
-    for (let i = 0; i < take; i++) {
-      piece.set(i, bytes[at + i])
+    const field = new Uint8Array(50)
+    for (let i = 0; i < 50 && at + i < bytes.length; i++) {
+      field.set(i, bytes[at + i])
     }
+    out.push(field)
+    at += 50
+  }
+  out
+}
+
+/// A status text as the STATUSTEXT messages a vehicle sends: up to 50 bytes of text each, numbered from 0.
+/// A text that fits one message has `id` 0; a longer one has `id`.
+///
+/// A STATUSTEXT holds its text as a string, so it cannot carry half a UTF-8 character. A text with a
+/// character across a 50-byte boundary (which a real vehicle may send, see `statusTextFields`) is refused.
+export function splitStatusText(severity: int, text: string, id: int): StatusText[] throws Error {
+  const fields = statusTextFields(text)
+  const out: StatusText[] = []
+  for (let seq = 0; seq < fields.length; seq++) {
     const chunk = new StatusText()
     chunk.severity = severity as u8
-    chunk.text = readChars(piece, 0, take)
-    chunk.id = id as u16
-    chunk.chunkSeq = seq as u8
+    chunk.text = readChars(fields[seq], 0, 50)
+    if (new TextEncoder().encode(chunk.text).length != chunkText(fields[seq]).length) {
+      throw new Error(`a character of the text is cut by the 50-byte boundary of chunk ${seq}`)
+    }
+    if (fields.length > 1) {
+      chunk.id = id as u16
+      chunk.chunkSeq = seq as u8
+    }
     out.push(chunk)
-    at += 50
-    seq += 1
   }
   out
 }

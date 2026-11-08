@@ -6,7 +6,7 @@ import { MavLinkConnection } from "./connection"
 import { MemoryStream } from "./stream"
 import { MavLinkPacketParser } from "./protocol"
 import { byteAt } from "./bytes"
-import { StatusMessage, StatusTextAssembler, StatusTextReader, splitStatusText } from "./statustext"
+import { StatusMessage, StatusTextAssembler, StatusTextReader, splitStatusText, statusTextFields } from "./statustext"
 import { SimulatedAutopilot } from "./simulator"
 
 /// `s` as the 50-byte text field of a chunk (cut at 50, NUL-padded).
@@ -148,6 +148,91 @@ function aRepeatedChunkIsHarmless(): void throws Error {
   expect(a.waiting()).toBe(0)
 }
 
+function aRepeatedChunkZeroIsNotANewMessage(): void throws Error {
+  const a = new StatusTextAssembler()
+  const f = fields(utf8(A50 + B50 + C20))
+  // 0, 1, 0, 2: the second 0 is a repeat (a retransmit, or the other of two links), not the id coming round.
+  expect(show(a.push(1, 1, 4, 5, 0, f[0], 0))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 1))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 0, f[0], 2))).toBe("")
+  expect(a.waiting()).toBe(1)
+  expect(show(a.push(1, 1, 4, 5, 2, f[2], 3))).toBe(`1/1 sev 4 whole 3: ${A50}${B50}${C20}`)
+  expect(a.waiting()).toBe(0)
+}
+
+function lateAndRepeatedChunksOfAFinishedMessageAreDropped(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const f = fields(utf8(A50 + C20))
+  a.push(1, 1, 4, 5, 0, f[0], 0)
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 1))).toBe(`1/1 sev 4 whole 2: ${A50}${C20}`)
+  expect(a.remembered()).toBe(1)
+  // Both again, and the last one on its own: nothing is waiting afterwards, so nothing comes out later.
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 100))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 0, f[0], 101))).toBe("")
+  expect(a.waiting()).toBe(0)
+  expect(show(a.expire(5000))).toBe("")
+  // The memory lasts the timeout and is then forgotten.
+  expect(a.remembered()).toBe(0)
+}
+
+function aMessageThatTimedOutDropsItsLateChunks(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const f = fields(utf8(A50 + B50 + C20))
+  a.push(1, 1, 4, 5, 0, f[0], 0)
+  expect(show(a.expire(500))).toBe(`1/1 sev 4 truncated 1: ${A50}`)
+  // The chunks that were late arrive: they would have started a message that is delivered later, empty.
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 600))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 2, f[2], 601))).toBe("")
+  expect(a.waiting()).toBe(0)
+  expect(show(a.expire(5000))).toBe("")
+}
+
+function aNewMessageOnAFinishedIdStillGetsThrough(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const first = fields(utf8(A50 + C20))
+  const second = fields(utf8(B50 + C20))
+  a.push(1, 1, 4, 5, 0, first[0], 0)
+  a.push(1, 1, 4, 5, 1, first[1], 0)
+  // A chunk 0 that differs from the finished message's is a new message, even inside the timeout.
+  a.push(1, 1, 4, 5, 0, second[0], 10)
+  expect(show(a.push(1, 1, 4, 5, 1, second[1], 11))).toBe(`1/1 sev 4 whole 2: ${B50}${C20}`)
+}
+
+function remembersABoundedNumberOfFinishedMessages(): void throws Error {
+  const a = new StatusTextAssembler(1_000_000)
+  const f = fields(utf8(A50 + C20))
+  for (let id = 1; id <= 400; id++) {
+    a.push(1, 1, 4, id, 0, f[0], id)
+    a.push(1, 1, 4, id, 1, f[1], id)
+  }
+  expect(a.remembered()).toBe(256)
+}
+
+function splitsAtBytesAsAVehicleDoes(): void throws Error {
+  // 49 ASCII bytes and "é": the 50-byte boundary falls in the middle of the character.
+  const fs = statusTextFields("x".repeat(49) + "é end")
+  expect(fs.length).toBe(2)
+  expect(fs[0][49]).toBe(0xC3)
+  expect(fs[1][0]).toBe(0xA9)
+  const a = new StatusTextAssembler()
+  expect(show(a.push(1, 1, 6, 3, 0, fs[0], 0))).toBe("")
+  expect(show(a.push(1, 1, 6, 3, 1, fs[1], 0))).toBe(`1/1 sev 6 whole 2: ${"x".repeat(49)}é end`)
+}
+
+function refusesToMakeAHalfCharacterAMessage(): void throws Error {
+  // A STATUSTEXT holds a string, so it can't carry half of "é"; it must not turn into U+FFFD quietly.
+  let said = ""
+  try {
+    splitStatusText(6, "x".repeat(49) + "é end", 3)
+  } catch (e: Error) {
+    said = e.message
+  }
+  expect(said).toBe("a character of the text is cut by the 50-byte boundary of chunk 0")
+  // Multibyte text that doesn't straddle a boundary is fine: 48 bytes, then "é" (bytes 48 and 49).
+  const ok = splitStatusText(6, "x".repeat(48) + "é" + "é end", 3)
+  expect(ok.map((c) => `${c.id}/${c.chunkSeq}:${c.text}`).join(",")).toBe(`3/0:${"x".repeat(48)}é,3/1:é end`)
+}
+
 function utf8CutBetweenChunks(): void throws Error {
   const a = new StatusTextAssembler()
   // 49 ASCII bytes and then "é" (two bytes): the first chunk ends in half a character.
@@ -273,6 +358,13 @@ describe("long STATUSTEXT", () => {
   it("starts again when an id is used again after the message finished", sameIdAgainAfterCompletion)
   it("gives up on a message when its id restarts at chunk 0", aNewMessageOnAnIdThatNeverFinished)
   it("takes a repeated chunk as no more than one", aRepeatedChunkIsHarmless)
+  it("takes a repeated chunk 0 in the middle of a message as a repeat", aRepeatedChunkZeroIsNotANewMessage)
+  it("drops late and repeated chunks of a message that finished", lateAndRepeatedChunksOfAFinishedMessageAreDropped)
+  it("drops the late chunks of a message that timed out", aMessageThatTimedOutDropsItsLateChunks)
+  it("lets a new message with a different chunk 0 use a finished id", aNewMessageOnAFinishedIdStillGetsThrough)
+  it("remembers a bounded number of finished messages", remembersABoundedNumberOfFinishedMessages)
+  it("cuts a text every 50 bytes as a vehicle does, even through a character", splitsAtBytesAsAVehicleDoes)
+  it("refuses to make half a character into a STATUSTEXT", refusesToMakeAHalfCharacterAMessage)
   it("joins UTF-8 that was cut between chunks", utf8CutBetweenChunks)
   it("keeps a bounded number of messages waiting", keepsABoundedNumberWaiting)
   it("reads node-mavlink's STATUSTEXT frames (MAVLink 1 whole, MAVLink 2 as a lone last chunk)", nodeMavlinkFrames)
