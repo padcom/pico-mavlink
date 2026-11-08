@@ -1,0 +1,374 @@
+// Long STATUSTEXT messages: the assembler with chunks in every order, and the reader on a connection
+// with a simulated autopilot.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkPacketParser } from "./protocol"
+import { byteAt } from "./bytes"
+import { StatusMessage, StatusTextAssembler, StatusTextReader, splitStatusText, statusTextFields } from "./statustext"
+import { SimulatedAutopilot } from "./simulator"
+
+/// `s` as the 50-byte text field of a chunk (cut at 50, NUL-padded).
+function field(bytes: Uint8Array, from: int): Uint8Array {
+  const f = new Uint8Array(50)
+  for (let i = 0; i < 50 && from + i < bytes.length; i++) {
+    f.set(i, bytes[from + i])
+  }
+  f
+}
+
+/// The chunks a vehicle sends for `bytes`: 50 bytes each; the last has a NUL, in an extra empty chunk
+/// if the text fills its last chunk exactly.
+function fields(bytes: Uint8Array): Uint8Array[] {
+  const out: Uint8Array[] = []
+  let at = 0
+  while (at <= bytes.length) {
+    out.push(field(bytes, at))
+    at += 50
+  }
+  out
+}
+
+function utf8(s: string): Uint8Array {
+  new TextEncoder().encode(s)
+}
+
+function show(messages: StatusMessage[]): string {
+  messages.map((m) => `${m.system}/${m.component} sev ${m.severity} ${if (m.truncated) "truncated" else "whole"} ${m.chunks}: ${m.text}`).join(" | ")
+}
+
+const A50: string = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+const B50: string = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+const C20: string = "CCCCCCCCCCCCCCCCCCCC"
+const C50: string = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+
+function oneChunk(): void throws Error {
+  const a = new StatusTextAssembler()
+  // id 0: the message is this chunk, now.
+  expect(show(a.push(1, 1, 6, 0, 0, field(utf8("Arming motors"), 0), 100))).toBe("1/1 sev 6 whole 1: Arming motors")
+  expect(a.waiting()).toBe(0)
+}
+
+function inOrder(): void throws Error {
+  const a = new StatusTextAssembler()
+  const f = fields(utf8(A50 + B50 + C20))
+  expect(f.length).toBe(3)
+  expect(show(a.push(1, 1, 4, 77, 0, f[0], 0))).toBe("")
+  expect(show(a.push(1, 1, 4, 77, 1, f[1], 1))).toBe("")
+  expect(a.waiting()).toBe(1)
+  expect(show(a.push(1, 1, 4, 77, 2, f[2], 2))).toBe(`1/1 sev 4 whole 3: ${A50}${B50}${C20}`)
+  expect(a.waiting()).toBe(0)
+}
+
+function outOfOrder(): void throws Error {
+  const a = new StatusTextAssembler()
+  const f = fields(utf8(A50 + B50 + C20))
+  // The last chunk first: it says how long the message is, but not that it is whole.
+  expect(show(a.push(1, 1, 4, 77, 2, f[2], 0))).toBe("")
+  expect(show(a.push(1, 1, 4, 77, 0, f[0], 1))).toBe("")
+  expect(show(a.push(1, 1, 4, 77, 1, f[1], 2))).toBe(`1/1 sev 4 whole 3: ${A50}${B50}${C20}`)
+}
+
+function exactMultipleOf50(): void throws Error {
+  const a = new StatusTextAssembler()
+  // 100 bytes: no NUL in either chunk, so a third, empty one ends the message.
+  const f = fields(utf8(A50 + B50))
+  expect(f.length).toBe(3)
+  expect(show(a.push(1, 1, 5, 9, 0, f[0], 0))).toBe("")
+  expect(show(a.push(1, 1, 5, 9, 1, f[1], 0))).toBe("")
+  expect(show(a.push(1, 1, 5, 9, 2, f[2], 0))).toBe(`1/1 sev 5 whole 3: ${A50}${B50}`)
+}
+
+function lostChunk(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const f = fields(utf8(A50 + B50 + C20))
+  expect(show(a.push(1, 1, 3, 12, 0, f[0], 1000))).toBe("")
+  // Chunk 1 never arrives.
+  expect(show(a.push(1, 1, 3, 12, 2, f[2], 1100))).toBe("")
+  expect(show(a.expire(1599))).toBe("")
+  // 500 ms after the last chunk: what is certain, marked, and nothing after the gap.
+  expect(show(a.expire(1600))).toBe(`1/1 sev 3 truncated 1: ${A50}`)
+  expect(a.waiting()).toBe(0)
+  expect(show(a.expire(5000))).toBe("")
+}
+
+function lostFirstChunk(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const f = fields(utf8(A50 + B50 + C20))
+  a.push(1, 1, 3, 12, 1, f[1], 0)
+  a.push(1, 1, 3, 12, 2, f[2], 0)
+  // Without chunk 0 there is no text that can be trusted; the loss is still reported.
+  expect(show(a.expire(500))).toBe("1/1 sev 3 truncated 0: ")
+}
+
+function twoComponentsInterleaved(): void throws Error {
+  const a = new StatusTextAssembler()
+  const one = fields(utf8(A50 + C20))
+  const two = fields(utf8(B50 + C20))
+  // The same id from two components, and a second id from the first, all at once.
+  expect(show(a.push(1, 1, 4, 5, 0, one[0], 0))).toBe("")
+  expect(show(a.push(1, 100, 6, 5, 0, two[0], 0))).toBe("")
+  expect(show(a.push(1, 1, 2, 6, 0, field(utf8(C20 + C20 + C20), 0), 0))).toBe("")
+  expect(a.waiting()).toBe(3)
+  expect(show(a.push(1, 100, 6, 5, 1, two[1], 0))).toBe(`1/100 sev 6 whole 2: ${B50}${C20}`)
+  expect(show(a.push(1, 1, 4, 5, 1, one[1], 0))).toBe(`1/1 sev 4 whole 2: ${A50}${C20}`)
+  expect(a.waiting()).toBe(1)
+  // The third message only ever got the 50 bytes of its first chunk.
+  expect(show(a.expire(1000))).toBe(`1/1 sev 2 truncated 1: ${C50}`)
+}
+
+function sameIdAgainAfterCompletion(): void throws Error {
+  const a = new StatusTextAssembler()
+  const first = fields(utf8(A50 + C20))
+  const second = fields(utf8(B50 + C20))
+  a.push(1, 1, 4, 5, 0, first[0], 0)
+  expect(show(a.push(1, 1, 4, 5, 1, first[1], 0))).toBe(`1/1 sev 4 whole 2: ${A50}${C20}`)
+  a.push(1, 1, 4, 5, 0, second[0], 10)
+  expect(show(a.push(1, 1, 4, 5, 1, second[1], 10))).toBe(`1/1 sev 4 whole 2: ${B50}${C20}`)
+}
+
+function aNewMessageOnAnIdThatNeverFinished(): void throws Error {
+  const a = new StatusTextAssembler()
+  const first = fields(utf8(A50 + A50 + C20))
+  const second = fields(utf8(B50 + C20))
+  a.push(1, 1, 4, 5, 0, first[0], 0)
+  // The id comes round with a new chunk 0: the first message is given up on, truncated, and the new one starts.
+  expect(show(a.push(1, 1, 6, 5, 0, second[0], 5))).toBe(`1/1 sev 4 truncated 1: ${A50}`)
+  expect(show(a.push(1, 1, 6, 5, 1, second[1], 6))).toBe(`1/1 sev 6 whole 2: ${B50}${C20}`)
+}
+
+function aRepeatedChunkIsHarmless(): void throws Error {
+  const a = new StatusTextAssembler()
+  const f = fields(utf8(A50 + C20))
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 0))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 1))).toBe("")
+  // Chunk 1 came twice and counts once.
+  expect(show(a.push(1, 1, 4, 5, 0, f[0], 2))).toBe(`1/1 sev 4 whole 2: ${A50}${C20}`)
+  expect(a.waiting()).toBe(0)
+}
+
+function aRepeatedChunkZeroIsNotANewMessage(): void throws Error {
+  const a = new StatusTextAssembler()
+  const f = fields(utf8(A50 + B50 + C20))
+  // 0, 1, 0, 2: the second 0 is a repeat (a retransmit, or the other of two links), not the id coming round.
+  expect(show(a.push(1, 1, 4, 5, 0, f[0], 0))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 1))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 0, f[0], 2))).toBe("")
+  expect(a.waiting()).toBe(1)
+  expect(show(a.push(1, 1, 4, 5, 2, f[2], 3))).toBe(`1/1 sev 4 whole 3: ${A50}${B50}${C20}`)
+  expect(a.waiting()).toBe(0)
+}
+
+function lateAndRepeatedChunksOfAFinishedMessageAreDropped(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const f = fields(utf8(A50 + C20))
+  a.push(1, 1, 4, 5, 0, f[0], 0)
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 1))).toBe(`1/1 sev 4 whole 2: ${A50}${C20}`)
+  expect(a.remembered()).toBe(1)
+  // Both again, and the last one on its own: nothing is waiting afterwards, so nothing comes out later.
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 100))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 0, f[0], 101))).toBe("")
+  expect(a.waiting()).toBe(0)
+  expect(show(a.expire(5000))).toBe("")
+  // The memory lasts the timeout and is then forgotten.
+  expect(a.remembered()).toBe(0)
+}
+
+function aMessageThatTimedOutDropsItsLateChunks(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const f = fields(utf8(A50 + B50 + C20))
+  a.push(1, 1, 4, 5, 0, f[0], 0)
+  expect(show(a.expire(500))).toBe(`1/1 sev 4 truncated 1: ${A50}`)
+  // The chunks that were late arrive: they would have started a message that is delivered later, empty.
+  expect(show(a.push(1, 1, 4, 5, 1, f[1], 600))).toBe("")
+  expect(show(a.push(1, 1, 4, 5, 2, f[2], 601))).toBe("")
+  expect(a.waiting()).toBe(0)
+  expect(show(a.expire(5000))).toBe("")
+}
+
+function aNewMessageOnAFinishedIdStillGetsThrough(): void throws Error {
+  const a = new StatusTextAssembler(500)
+  const first = fields(utf8(A50 + C20))
+  const second = fields(utf8(B50 + C20))
+  a.push(1, 1, 4, 5, 0, first[0], 0)
+  a.push(1, 1, 4, 5, 1, first[1], 0)
+  // A chunk 0 that differs from the finished message's is a new message, even inside the timeout.
+  a.push(1, 1, 4, 5, 0, second[0], 10)
+  expect(show(a.push(1, 1, 4, 5, 1, second[1], 11))).toBe(`1/1 sev 4 whole 2: ${B50}${C20}`)
+}
+
+function remembersABoundedNumberOfFinishedMessages(): void throws Error {
+  const a = new StatusTextAssembler(1_000_000)
+  const f = fields(utf8(A50 + C20))
+  for (let id = 1; id <= 400; id++) {
+    a.push(1, 1, 4, id, 0, f[0], id)
+    a.push(1, 1, 4, id, 1, f[1], id)
+  }
+  expect(a.remembered()).toBe(256)
+}
+
+function splitsAtBytesAsAVehicleDoes(): void throws Error {
+  // 49 ASCII bytes and "é": the 50-byte boundary falls in the middle of the character.
+  const fs = statusTextFields("x".repeat(49) + "é end")
+  expect(fs.length).toBe(2)
+  expect(fs[0][49]).toBe(0xC3)
+  expect(fs[1][0]).toBe(0xA9)
+  const a = new StatusTextAssembler()
+  expect(show(a.push(1, 1, 6, 3, 0, fs[0], 0))).toBe("")
+  expect(show(a.push(1, 1, 6, 3, 1, fs[1], 0))).toBe(`1/1 sev 6 whole 2: ${"x".repeat(49)}é end`)
+}
+
+function refusesToMakeAHalfCharacterAMessage(): void throws Error {
+  // A STATUSTEXT holds a string, so it can't carry half of "é"; it must not turn into U+FFFD quietly.
+  let said = ""
+  try {
+    splitStatusText(6, "x".repeat(49) + "é end", 3)
+  } catch (e: Error) {
+    said = e.message
+  }
+  expect(said).toBe("a character of the text is cut by the 50-byte boundary of chunk 0")
+  // Multibyte text that doesn't straddle a boundary is fine: 48 bytes, then "é" (bytes 48 and 49).
+  const ok = splitStatusText(6, "x".repeat(48) + "é" + "é end", 3)
+  expect(ok.map((c) => `${c.id}/${c.chunkSeq}:${c.text}`).join(",")).toBe(`3/0:${"x".repeat(48)}é,3/1:é end`)
+}
+
+function utf8CutBetweenChunks(): void throws Error {
+  const a = new StatusTextAssembler()
+  // 49 ASCII bytes and then "é" (two bytes): the first chunk ends in half a character.
+  const text = "x".repeat(49) + "é end"
+  const bytes = utf8(text)
+  expect(bytes.length).toBe(55)
+  const f = fields(bytes)
+  expect(show(a.push(1, 1, 6, 3, 1, f[1], 0))).toBe("")
+  expect(show(a.push(1, 1, 6, 3, 0, f[0], 0))).toBe(`1/1 sev 6 whole 2: ${text}`)
+}
+
+function keepsABoundedNumberWaiting(): void throws Error {
+  const a = new StatusTextAssembler(1000, 2)
+  const f = fields(utf8(A50 + C20))
+  a.push(1, 1, 4, 1, 0, f[0], 10)
+  a.push(1, 1, 4, 2, 0, f[0], 20)
+  // A third incomplete message pushes the oldest out, truncated.
+  expect(show(a.push(1, 1, 4, 3, 0, f[0], 30))).toBe(`1/1 sev 4 truncated 1: ${A50}`)
+  expect(a.waiting()).toBe(2)
+  expect(show(a.flush())).toBe(`1/1 sev 4 truncated 1: ${A50} | 1/1 sev 4 truncated 1: ${A50}`)
+  expect(a.waiting()).toBe(0)
+}
+
+/// node-mavlink 2.3.0's own frames (the STATUSTEXT interop case): MAVLink 1 has no id or chunk_seq, so the
+/// text is whole; MAVLink 2 carries them.
+function nodeMavlinkFrames(): void throws Error {
+  const v1 = new MavLinkPacketParser().parse(unhex("fe332f5a16fdce44687748424a644e6b50316e586d7146535f79354f6e59737500000000000000000000000000000000000000000000000000cd2f"))
+  const a = new StatusTextAssembler()
+  expect(show(a.push(v1.header.sysid, v1.header.compid, byteAt(v1.payload, 0), 0, 0, textOf(v1.payload), 0))).toBe("90/22 sev 206 whole 1: DhwHBJdNkP1nXmqFS_y5OnYsu")
+  // The v2 frame says it is chunk 220 of message 43633 and has a NUL: the last chunk of a message whose
+  // other 220 chunks never came.
+  const v2 = new MavLinkPacketParser().parse(unhex("fd3600002f5a16fd0000ce44687748424a644e6b50316e586d7146535f79354f6e5973750000000000000000000000000000000000000000000000000071aadcde67"))
+  expect(show(a.push(v2.header.sysid, v2.header.compid, byteAt(v2.payload, 0), 43633, 220, textOf(v2.payload), 0))).toBe("")
+  expect(show(a.expire(1000))).toBe("90/22 sev 206 truncated 0: ")
+}
+
+function textOf(payload: Uint8Array): Uint8Array {
+  const text = new Uint8Array(50)
+  for (let i = 0; i < 50; i++) {
+    text.set(i, byteAt(payload, 1 + i))
+  }
+  text
+}
+
+function nibble(s: string, i: int): int {
+  "0123456789abcdef".indexOf(s.slice(i, i + 1))
+}
+
+function unhex(s: string): Uint8Array {
+  const b = new Uint8Array(s.length / 2)
+  for (let i = 0; i < b.length; i++) {
+    b.set(i, nibble(s, i * 2) * 16 + nibble(s, i * 2 + 1))
+  }
+  b
+}
+
+function splitsTextIntoChunks(): void throws Error {
+  expect(splitStatusText(6, "short", 9).map((c) => `${c.id}/${c.chunkSeq}:${c.text}`).join(",")).toBe("0/0:short")
+  expect(splitStatusText(6, A50 + B50 + C20, 9).map((c) => `${c.id}/${c.chunkSeq}:${c.text.length}`).join(",")).toBe("9/0:50,9/1:50,9/2:20")
+  // Filling its last chunk exactly, it gets an empty one to say it ended.
+  expect(splitStatusText(6, A50 + B50, 9).map((c) => `${c.id}/${c.chunkSeq}:${c.text.length}`).join(",")).toBe("9/0:50,9/1:50,9/2:0")
+}
+
+async function readerJoinsOverAConnection(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  const reader = new StatusTextReader(gcs, 60)
+  const heard: string[] = []
+  reader.onMessage((m: StatusMessage) => {
+    heard.push(show([m]))
+  })
+  gcs.run()
+  sim.conn.run()
+  const chunks = splitStatusText(4, A50 + B50 + C20, 31)
+  // Out of order, and one text in a single chunk in between.
+  await sim.conn.send(chunks[2])
+  await sim.conn.send(splitStatusText(6, "Arming motors", 0)[0])
+  await sim.conn.send(chunks[0])
+  await sim.conn.send(chunks[1])
+  await delay(20)
+  expect(heard.join(" | ")).toBe(`1/1 sev 6 whole 1: Arming motors | 1/1 sev 4 whole 3: ${A50}${B50}${C20}`)
+  // One that loses its middle chunk is delivered after the timeout, truncated.
+  const lossy = splitStatusText(3, A50 + B50 + C20, 32)
+  await sim.conn.send(lossy[0])
+  await sim.conn.send(lossy[2])
+  await delay(20)
+  expect(heard.length).toBe(2)
+  await delay(150)
+  reader.stop()
+  gcs.close()
+  expect(heard[2]).toBe(`1/1 sev 3 truncated 1: ${A50}`)
+  expect(heard.length).toBe(3)
+}
+
+async function readerDeliversWhatIsWaitingWhenItStops(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  const reader = new StatusTextReader(gcs, 60_000)
+  const heard: string[] = []
+  reader.onMessage((m: StatusMessage) => {
+    heard.push(show([m]))
+  })
+  gcs.run()
+  sim.conn.run()
+  await sim.conn.send(splitStatusText(3, A50 + B50 + C20, 40)[0])
+  await delay(20)
+  expect(heard.length).toBe(0)
+  reader.stop()
+  gcs.close()
+  expect(heard.join("")).toBe(`1/1 sev 3 truncated 1: ${A50}`)
+}
+
+describe("long STATUSTEXT", () => {
+  it("delivers a text in one chunk (id 0) at once", oneChunk)
+  it("joins chunks that arrive in order", inOrder)
+  it("joins chunks that arrive out of order, the last first", outOfOrder)
+  it("ends a text that fills its last chunk with the empty chunk", exactMultipleOf50)
+  it("delivers a message with a lost chunk after the timeout, truncated at the gap", lostChunk)
+  it("reports a message whose first chunk was lost, with no text", lostFirstChunk)
+  it("keeps messages apart by component and id when they are interleaved", twoComponentsInterleaved)
+  it("starts again when an id is used again after the message finished", sameIdAgainAfterCompletion)
+  it("gives up on a message when its id restarts at chunk 0", aNewMessageOnAnIdThatNeverFinished)
+  it("takes a repeated chunk as no more than one", aRepeatedChunkIsHarmless)
+  it("takes a repeated chunk 0 in the middle of a message as a repeat", aRepeatedChunkZeroIsNotANewMessage)
+  it("drops late and repeated chunks of a message that finished", lateAndRepeatedChunksOfAFinishedMessageAreDropped)
+  it("drops the late chunks of a message that timed out", aMessageThatTimedOutDropsItsLateChunks)
+  it("lets a new message with a different chunk 0 use a finished id", aNewMessageOnAFinishedIdStillGetsThrough)
+  it("remembers a bounded number of finished messages", remembersABoundedNumberOfFinishedMessages)
+  it("cuts a text every 50 bytes as a vehicle does, even through a character", splitsAtBytesAsAVehicleDoes)
+  it("refuses to make half a character into a STATUSTEXT", refusesToMakeAHalfCharacterAMessage)
+  it("joins UTF-8 that was cut between chunks", utf8CutBetweenChunks)
+  it("keeps a bounded number of messages waiting", keepsABoundedNumberWaiting)
+  it("reads node-mavlink's STATUSTEXT frames (MAVLink 1 whole, MAVLink 2 as a lone last chunk)", nodeMavlinkFrames)
+  it("splits a text into the chunks a vehicle sends", splitsTextIntoChunks)
+  it("reads from a connection: out of order, interleaved with a short text, and a lost chunk", readerJoinsOverAConnection)
+  it("delivers what is waiting when the reader stops", readerDeliversWhatIsWaitingWhenItStops)
+})

@@ -25,6 +25,9 @@ Status: **in development (MV1).**
 - **Done:** `SimulatedAutopilot`, an ArduPilot Copter-like vehicle on the far end of any byte
   stream. It sends heartbeats and telemetry and answers parameter requests, with deterministic
   data, for trying an application without hardware or SITL.
+- **Done:** long STATUSTEXT messages: `StatusTextAssembler` joins the chunks (by system, component
+  and `id`, in any order, interleaved), and delivers one whose chunks went missing after a timeout,
+  marked truncated. `StatusTextReader` does it on a connection.
 - **Next:** ArduPilot SITL over UDP/TCP (MV2).
 
 ```pico
@@ -54,6 +57,17 @@ println(`${list.params.length} of ${list.count}${if (list.complete) "" else ", s
 const r = await new ParamWrite(conn, target, ParamEncoding.CCast).run("RTL_ALT", TypedParamValue.Int(2000, MavParamType.INT32))
 println(if (r.verified) "written" else `the vehicle reports ${showParam(r.param.value)}`)
 ```
+
+Status texts longer than the 50 bytes a STATUSTEXT carries arrive as chunks. `StatusTextReader` hands them
+over whole:
+
+```pico
+conn.run()
+const texts = new StatusTextReader(conn, 1000)   // gives up on a message 1 s after its last chunk
+texts.onMessage((m: StatusMessage) => println(`${m.severity} ${m.text}${if (m.truncated) " [truncated]" else ""}`))
+```
+
+A message that lost a chunk is delivered with the text before the gap (`truncated`), not guessed at.
 
 Signing, as the sender and as the receiver:
 

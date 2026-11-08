@@ -1,0 +1,378 @@
+// Long STATUSTEXT messages. A status text longer than the 50 bytes one STATUSTEXT carries is sent as
+// chunks that share a non-zero `id`, numbered by `chunk_seq` from 0; a NUL in a chunk's text means it
+// was the last (MAVLink common.xml, STATUSTEXT). An `id` of 0 is a message in one chunk.
+//
+// `StatusTextAssembler` joins the chunks, whatever order they arrive in and however they are
+// interleaved with other messages (kept apart by system, component and id). It knows no clock: the
+// caller passes the time, so it can be tested without waiting. `StatusTextReader` is that, on a
+// `MavLinkConnection`.
+import { MavLinkConnection, Received } from "./connection"
+import { byteAt, readChars } from "./bytes"
+import { StatusText } from "./dialects/common"
+
+/// One status text, joined.
+export struct StatusMessage {
+  system: int
+  component: int
+  /// MAV_SEVERITY, from the first chunk.
+  severity: int
+  text: string
+  /// Whether chunks never arrived. `text` then stops at the first gap: what comes after it is not
+  /// shown, as it would read as if nothing was missing.
+  truncated: bool
+  /// How many chunks went into `text`.
+  chunks: int
+}
+
+/// The bytes of a chunk's text field before its first NUL.
+function chunkText(text: Uint8Array): Uint8Array {
+  let n = 0
+  while (n < text.length && text[n] != 0) {
+    n += 1
+  }
+  text.slice(0, n)
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): bool {
+  if (a.length != b.length) {
+    return false
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false
+    }
+  }
+  true
+}
+
+/// What is remembered of a message that is over, to drop its late and repeated chunks.
+class Finished {
+  public readonly at: int
+  /// Its chunk 0, or null if that never arrived.
+  public readonly first: Uint8Array?
+
+  constructor(at: int, first: Uint8Array?) {
+    this.at = at
+    this.first = first
+  }
+}
+
+/// The chunks of one message that have arrived so far.
+class Pending {
+  readonly system: int
+  readonly component: int
+  public severity: int
+  public readonly parts: Map<int, Uint8Array> = new Map<int, Uint8Array>()
+  /// The sequence number of the chunk that said it was the last, or -1 while none has.
+  public last: int = -1
+  /// When a chunk last arrived (ms).
+  public updated: int
+
+  constructor(system: int, component: int, severity: int, now: int) {
+    this.system = system
+    this.component = component
+    this.severity = severity
+    this.updated = now
+  }
+
+  /// Whether the last chunk is known and every chunk before it is here.
+  public complete(): bool {
+    if (last < 0) {
+      return false
+    }
+    for (let i = 0; i <= last; i++) {
+      if (!parts.has(i)) {
+        return false
+      }
+    }
+    true
+  }
+
+  /// The message from the chunks in a row from 0 (up to the last, when that is known).
+  public message(truncated: bool): StatusMessage {
+    const chunks: Uint8Array[] = []
+    let size = 0
+    let i = 0
+    while ((last < 0 || i <= last) && parts.has(i)) {
+      const part = parts.get(i)!
+      chunks.push(part)
+      size += part.length
+      i += 1
+    }
+    const joined = new Uint8Array(size)
+    let at = 0
+    for (const part of chunks) {
+      for (let j = 0; j < part.length; j++) {
+        joined.set(at + j, part[j])
+      }
+      at += part.length
+    }
+    // UTF-8 may be cut between two chunks, so it is decoded only now.
+    const m: StatusMessage = { system: system, component: component, severity: severity, text: readChars(joined, 0, size), truncated: truncated, chunks: chunks.length }
+    m
+  }
+}
+
+/// Joins STATUSTEXT chunks into messages.
+export class StatusTextAssembler {
+  /// How long a message may go without a new chunk before it is delivered as truncated (ms).
+  public readonly timeoutMs: int
+  /// How many incomplete messages are kept; past that the oldest is delivered as truncated.
+  public readonly maxPending: int
+  readonly pending: Map<int, Pending> = new Map<int, Pending>()
+  /// Messages that finished (whole, or given up on) in the last `timeoutMs`, by key.
+  readonly finished: Map<int, Finished> = new Map<int, Finished>()
+
+  constructor(timeoutMs: int = 1000, maxPending: int = 64) {
+    this.timeoutMs = timeoutMs
+    this.maxPending = maxPending
+  }
+
+  /// One STATUSTEXT chunk. Returns the messages it finishes: this one, and any older message it
+  /// pushes out.
+  ///
+  /// `text` is the chunk's 50-byte text field, as it came off the wire (zeros past a shorter payload).
+  public push(system: int, component: int, severity: int, id: int, chunkSeq: int, text: Uint8Array, now: int): StatusMessage[] {
+    const out: StatusMessage[] = []
+    const part = chunkText(text)
+    if (id == 0) {
+      // A message of its own.
+      const single = new Pending(system, component, severity, now)
+      single.parts.set(0, part)
+      single.last = 0
+      out.push(single.message(false))
+      return out
+    }
+    forgetOld(now)
+    const key = (system * 256 + component) * 65536 + id
+    const over = finished.get(key)
+    if (over != null) {
+      // A chunk of a message that is over. A late chunk, or one repeated (a retransmit, a second link),
+      // is dropped; only a chunk 0 that differs from the old message's starts a new one.
+      const first = over!.first
+      if (chunkSeq != 0 || first == null || sameBytes(first!, part)) {
+        return out
+      }
+      finished.delete(key)
+    }
+    let found = pending.get(key)
+    if (found != null && chunkSeq == 0 && found!.parts.has(0)) {
+      if (sameBytes(found!.parts.get(0)!, part)) {
+        // Chunk 0 again, as it was: a repeat, not a new message.
+        return out
+      }
+      // The id came round again with a new chunk 0: the old message will not get its other chunks now.
+      // (The key is not remembered as finished: the new message is using it.)
+      out.push(found!.message(true))
+      pending.delete(key)
+      found = null
+    }
+    if (found == null) {
+      if (pending.size >= maxPending) {
+        out.push(evictOldest(now))
+      }
+      found = new Pending(system, component, severity, now)
+      pending.set(key, found!)
+    }
+    const p = found!
+    if (chunkSeq == 0) {
+      p.severity = severity
+    }
+    p.parts.set(chunkSeq, part)
+    if (text.length > part.length && (p.last < 0 || chunkSeq < p.last)) {
+      p.last = chunkSeq
+    }
+    p.updated = now
+    if (p.complete()) {
+      out.push(p.message(false))
+      remember(key, p, now)
+      pending.delete(key)
+    }
+    out
+  }
+
+  /// The messages that have waited `timeoutMs` for a chunk, as truncated.
+  public expire(now: int): StatusMessage[] {
+    forgetOld(now)
+    const keys: int[] = []
+    for (const [key, p] of pending) {
+      if (now - p.updated >= timeoutMs) {
+        keys.push(key)
+      }
+    }
+    deliver(keys, now)
+  }
+
+  /// Everything still incomplete, as truncated (the link is closing).
+  public flush(): StatusMessage[] {
+    const keys: int[] = []
+    for (const [key, _] of pending) {
+      keys.push(key)
+    }
+    deliver(keys, -1)
+  }
+
+  /// How many messages are waiting for chunks.
+  public waiting(): int {
+    pending.size
+  }
+
+  /// How many finished messages are remembered, to drop their late chunks.
+  public remembered(): int {
+    finished.size
+  }
+
+  /// Gives up on the messages under `keys`, delivering them as truncated (`now` -1: don't remember them).
+  deliver(keys: int[], now: int): StatusMessage[] {
+    const out: StatusMessage[] = []
+    for (const key of keys) {
+      const p = pending.get(key)!
+      out.push(p.message(true))
+      if (now >= 0) {
+        remember(key, p, now)
+      }
+      pending.delete(key)
+    }
+    out
+  }
+
+  evictOldest(now: int): StatusMessage {
+    let oldest = -1
+    let oldestAt = 0
+    for (const [key, p] of pending) {
+      if (oldest < 0 || p.updated < oldestAt) {
+        oldest = key
+        oldestAt = p.updated
+      }
+    }
+    const p = pending.get(oldest)!
+    const m = p.message(true)
+    remember(oldest, p, now)
+    pending.delete(oldest)
+    m
+  }
+
+  /// Notes that the message under `key` is over, for `timeoutMs`. At most 256 are kept.
+  remember(key: int, p: Pending, now: int): void {
+    finished.set(key, new Finished(now, p.parts.get(0)))
+    if (finished.size > 256) {
+      let oldest = -1
+      let oldestAt = 0
+      for (const [k, f] of finished) {
+        if (oldest < 0 || f.at < oldestAt) {
+          oldest = k
+          oldestAt = f.at
+        }
+      }
+      finished.delete(oldest)
+    }
+  }
+
+  forgetOld(now: int): void {
+    const old: int[] = []
+    for (const [key, f] of finished) {
+      if (now - f.at >= timeoutMs) {
+        old.push(key)
+      }
+    }
+    for (const key of old) {
+      finished.delete(key)
+    }
+  }
+}
+
+/// Hands a connection's status texts to its handlers, long ones joined. Needs `conn.run()` to be
+/// running. An incomplete message is delivered, truncated, `timeoutMs` after its last chunk.
+export class StatusTextReader {
+  readonly conn: MavLinkConnection
+  readonly assembler: StatusTextAssembler
+  readonly handlers: ((m: StatusMessage) => void)[] = []
+  readonly listener: int
+  timer: int = -1
+
+  constructor(conn: MavLinkConnection, timeoutMs: int = 1000) {
+    this.conn = conn
+    this.assembler = new StatusTextAssembler(timeoutMs)
+    this.listener = conn.on((r: Received) => this.arrived(r))
+    this.timer = setInterval(() => this.sweep(), if (timeoutMs / 4 > 5) timeoutMs / 4 else 5)
+  }
+
+  /// Calls `handler` with every status text from now on.
+  public onMessage(handler: (m: StatusMessage) => void): void {
+    handlers.push(handler)
+  }
+
+  /// Stops listening; what is still waiting for chunks is delivered, truncated.
+  public stop(): void {
+    conn.off(listener)
+    clearInterval(timer)
+    timer = -1
+    hand(assembler.flush())
+  }
+
+  arrived(r: Received): void {
+    const m = r.message
+    if (m instanceof StatusText) {
+      // The text field is read from the wire bytes: a UTF-8 character can be cut between chunks.
+      const text = new Uint8Array(50)
+      for (let i = 0; i < 50; i++) {
+        text.set(i, byteAt(r.packet.payload, 1 + i))
+      }
+      hand(assembler.push(r.packet.header.sysid, r.packet.header.compid, m.severity as int, m.id as int, m.chunkSeq as int, text, Date.now() as int))
+    }
+  }
+
+  sweep(): void {
+    hand(assembler.expire(Date.now() as int))
+  }
+
+  hand(messages: StatusMessage[]): void {
+    for (const m of messages) {
+      for (const h of handlers) {
+        h(m)
+      }
+    }
+  }
+}
+
+/// The 50-byte text fields a vehicle sends `text` in, as ArduPilot does: cut every 50 bytes of its
+/// UTF-8, wherever that falls, so a character can be cut in two. The last has a NUL (an extra, empty
+/// one when the text fills its last chunk exactly). A text that fits one field is that one field.
+export function statusTextFields(text: string): Uint8Array[] {
+  const bytes = new TextEncoder().encode(text)
+  const out: Uint8Array[] = []
+  let at = 0
+  while (at <= bytes.length) {
+    const field = new Uint8Array(50)
+    for (let i = 0; i < 50 && at + i < bytes.length; i++) {
+      field.set(i, bytes[at + i])
+    }
+    out.push(field)
+    at += 50
+  }
+  out
+}
+
+/// A status text as the STATUSTEXT messages a vehicle sends: up to 50 bytes of text each, numbered from 0.
+/// A text that fits one message has `id` 0; a longer one has `id`.
+///
+/// A STATUSTEXT holds its text as a string, so it cannot carry half a UTF-8 character. A text with a
+/// character across a 50-byte boundary (which a real vehicle may send, see `statusTextFields`) is refused.
+export function splitStatusText(severity: int, text: string, id: int): StatusText[] throws Error {
+  const fields = statusTextFields(text)
+  const out: StatusText[] = []
+  for (let seq = 0; seq < fields.length; seq++) {
+    const chunk = new StatusText()
+    chunk.severity = severity as u8
+    chunk.text = readChars(fields[seq], 0, 50)
+    if (new TextEncoder().encode(chunk.text).length != chunkText(fields[seq]).length) {
+      throw new Error(`a character of the text is cut by the 50-byte boundary of chunk ${seq}`)
+    }
+    if (fields.length > 1) {
+      chunk.id = id as u16
+      chunk.chunkSeq = seq as u8
+    }
+    out.push(chunk)
+  }
+  out
+}
