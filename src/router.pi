@@ -1,0 +1,633 @@
+// Several links under one connection (https://mavlink.io/en/guide/routing.html).
+//
+// A `MavLinkRouter` is a `ByteStream` that a `MavLinkConnection` can sit on. Each link added to it is
+// another byte stream (a serial port, a UDP peer, a TCP connection). The router
+//   - reads whole, checked frames from every link and hands them on in one stream, once: a frame that
+//     arrives on a second link (redundant links) is delivered once, found by its sender, sequence number,
+//     message id and checksum, and by having identical bytes;
+//   - learns which link reaches which system and component, from what each link delivers;
+//   - sends an outgoing frame only to the links that reach its target system and component, or to all links
+//     when it is a broadcast or its target has not been heard yet, and falls back to the other links when
+//     the ones that reach the target fail;
+//   - with `forward`, passes what one link delivers on to the others by the same rules, never back to the
+//     link it came from (a ground station that bridges a radio and a companion computer, say).
+// Operations (`ParamList` and the rest) already match replies by target system and component, so with
+// the router in place they work with more than one vehicle on a connection.
+//
+// The router sits below the connection, so it does not check signatures: it learns routes from every frame
+// that is well formed, signed or not, and passes frames on byte for byte. Put a `SigningPolicy` on the
+// connection to refuse what is not signed; the routes a forged frame teaches only steer where a message
+// goes, they do not make it be believed.
+import { Registry } from "./data"
+import { MavLinkError, MavLinkPacket, MavLinkPacketParser } from "./protocol"
+import { MavLinkPacketSplitter } from "./splitter"
+import { ByteStream } from "./stream"
+import { defaultRegistry } from "./connection"
+import { byteAt } from "./bytes"
+
+export struct RouterOptions {
+  /// Pass what one link delivers on to the others (default false).
+  forward?: bool
+  /// How long a delivered frame is remembered, to drop its duplicate from another link (default 1000 ms).
+  dedupeMs?: int
+  /// How long a system stays reachable through a link after it was last heard on it (default 10 s).
+  routeTtlMs?: int
+  /// How many senders (system and component) the router remembers per link, the least recently heard
+  /// going first (default 256; at least 1).
+  maxRoutesPerLink?: int
+  /// How many frames may wait to be read; past that the oldest are dropped (default 4096; at least 1).
+  maxQueued?: int
+  /// How many writes may wait behind one that has not finished on a link; past that, writes to that link are
+  /// refused rather than piled up (default 256; at least 1).
+  maxWaitingWrites?: int
+  /// How long `write` waits for a link to take a frame before it tries the others, or gives up (default
+  /// 3000 ms; at least 1). A write that has not settled by then goes on in the background.
+  writeTimeoutMs?: int
+  /// The messages whose target fields are looked up (default: `defaultRegistry()`).
+  registry?: Registry
+}
+
+/// What the router knows about a link.
+export struct LinkInfo {
+  id: int
+  /// Whether the link is in use: it still delivers and has not failed to take a frame.
+  up: bool
+  /// Frames it delivered, duplicates included.
+  frames: int
+  /// Of those, the ones that had already arrived on another link.
+  duplicates: int
+}
+
+class Link {
+  public readonly id: int
+  public readonly stream: ByteStream
+  /// Whether it still delivers (false once its stream ends or fails to read).
+  public up: bool = true
+  /// Whether it failed to take a frame: it is not written to again.
+  public failed: bool = false
+  public frames: int = 0
+  public duplicates: int = 0
+  public writeErrors: int = 0
+  /// Writes refused because too many were already waiting behind a stalled one.
+  public skipped: int = 0
+  /// Writes that waited so long for their turn (or for the link to be usable again) that they were not sent.
+  public expired: int = 0
+  /// The senders heard on it, by (system * 256 + component), in order of when they were last heard.
+  public readonly heard: Map<int, int> = new Map<int, int>()
+  /// Writes go one at a time: whoever holds the link writes, the others wait their turn.
+  public busy: bool = false
+  public waiters: ((value: bool) => void)[] = []
+
+  constructor(id: int, stream: ByteStream) {
+    this.id = id
+    this.stream = stream
+  }
+
+  /// Whether to write to it and route to it.
+  public usable(): bool {
+    up && !failed
+  }
+}
+
+/// A frame delivered, when, and over which link.
+class Seen {
+  public readonly at: int
+  public readonly link: int
+  public readonly frame: Uint8Array
+
+  constructor(at: int, link: int, frame: Uint8Array) {
+    this.at = at
+    this.link = link
+    this.frame = frame
+  }
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): bool {
+  if (a.length != b.length) {
+    return false
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false
+    }
+  }
+  true
+}
+
+/// What a dropped slot of the read queue holds.
+const EMPTY: Uint8Array = new Uint8Array(0)
+
+/// Where a frame is addressed (0: everyone).
+struct Addressee {
+  system: int
+  component: int
+}
+
+export class MavLinkRouter implements ByteStream {
+  public readonly forward: bool
+  public readonly dedupeMs: int
+  public readonly routeTtlMs: int
+  public readonly maxRoutesPerLink: int
+  public readonly maxQueued: int
+  public readonly maxWaitingWrites: int
+  public readonly writeTimeoutMs: int
+  readonly registry: Registry
+  readonly links: Link[] = []
+  /// For each sender (system * 256 + component) heard on some link, the links it was heard on. Which links
+  /// reach a system is looked up here, not by going through every route.
+  readonly index: Map<int, int[]> = new Map<int, int[]>()
+  /// Frames delivered lately, by sender, sequence number, message id and checksum (in the order they
+  /// were delivered).
+  readonly recent: Map<string, Seen> = new Map<string, Seen>()
+  queue: Uint8Array[] = []
+  head: int = 0
+  waiting: ((value: Uint8Array?) => void)? = null
+  closed: bool = false
+  forwarded: int = 0
+  dropped: int = 0
+
+  constructor(options: RouterOptions = {}) {
+    this.forward = options.forward ?? false
+    this.dedupeMs = options.dedupeMs ?? 1000
+    this.routeTtlMs = options.routeTtlMs ?? 10_000
+    const routes = options.maxRoutesPerLink ?? 256
+    this.maxRoutesPerLink = if (routes < 1) 1 else routes
+    const queued = options.maxQueued ?? 4096
+    this.maxQueued = if (queued < 1) 1 else queued
+    const waiting = options.maxWaitingWrites ?? 256
+    this.maxWaitingWrites = if (waiting < 1) 1 else waiting
+    const timeout = options.writeTimeoutMs ?? 3000
+    this.writeTimeoutMs = if (timeout < 1) 1 else timeout
+    this.registry = options.registry ?? defaultRegistry()
+  }
+
+  /// Adds a link and starts reading it; its id (0, 1, 2, ...).
+  public addLink(stream: ByteStream): int {
+    const link = new Link(links.length, stream)
+    links.push(link)
+    pump(link)
+    link.id
+  }
+
+  /// What the router knows about each link.
+  public linkInfo(): LinkInfo[] {
+    links.map((l: Link) => {
+      const i: LinkInfo = { id: l.id, up: l.usable(), frames: l.frames, duplicates: l.duplicates }
+      i
+    })
+  }
+
+  /// The links that reach `system` (and `component`, unless 0) and have been heard from lately.
+  public linksTo(system: int, component: int): int[] {
+    reaching(system, component, Date.now() as int, -1)
+  }
+
+  /// How many frames the router passed on to another link.
+  public forwardedCount(): int {
+    forwarded
+  }
+
+  /// How many duplicate frames it dropped, over all links.
+  public duplicateCount(): int {
+    let n = 0
+    for (const l of links) {
+      n += l.duplicates
+    }
+    n
+  }
+
+  /// How many frames were dropped from the queue because nobody read them in time.
+  public droppedCount(): int {
+    dropped
+  }
+
+  /// How many frames wait to be read.
+  public queuedCount(): int {
+    queue.length - head
+  }
+
+  /// How many slots the read queue holds in memory (the frames waiting, plus dropped ones not yet compacted).
+  public queuedSlots(): int {
+    queue.length
+  }
+
+  /// How many writes were refused because a link had too many waiting behind a stalled write.
+  public skippedWrites(): int {
+    let n = 0
+    for (const l of links) {
+      n += l.skipped
+    }
+    n
+  }
+
+  /// How many writes were not sent because they waited too long for their turn on a link.
+  public expiredWrites(): int {
+    let n = 0
+    for (const l of links) {
+      n += l.expired
+    }
+    n
+  }
+
+  /// How many senders are remembered, over all links.
+  public routeCount(): int {
+    let n = 0
+    for (const l of links) {
+      n += l.heard.size
+    }
+    n
+  }
+
+  /// The next frame from any link, once; null when every link has ended (or after `close()`).
+  public read(): Promise<Uint8Array?, Error> {
+    if (head < queue.length) {
+      const f = queue[head]
+      // The slot lets go of the frame, so a consumer that does not catch up does not keep consumed frames.
+      queue[head] = EMPTY
+      head += 1
+      if (head == queue.length) {
+        queue = []
+        head = 0
+      }
+      return Promise.resolve<Uint8Array?>(f)
+    }
+    if (ended()) {
+      return Promise.resolve<Uint8Array?>(null)
+    }
+    new Promise<Uint8Array?, Error>((resolve: (value: Uint8Array?) => void, _reject: (error: Error) => void) => {
+      this.waiting = resolve
+    })
+  }
+
+  /// Sends a frame on the links that reach its target; on all of them when it is a broadcast or the target has
+  /// not been heard yet; and on the others when the ones that reach it fail. A link that fails to take a frame
+  /// is marked down and left alone until it next delivers a frame. A `NO_LINK` MavLinkError when no link took
+  /// the frame, or there is none.
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    const to = addressee(bytes)
+    const tried: int[] = []
+    let accepted = false
+    if (to.system != 0) {
+      for (const id of reaching(to.system, to.component, Date.now() as int, -1)) {
+        tried.push(id)
+      }
+      accepted = await sendToAny(tried, bytes)
+    }
+    if (!accepted) {
+      const rest: int[] = []
+      for (const l of links) {
+        if (l.usable() && !tried.includes(l.id)) {
+          rest.push(l.id)
+        }
+      }
+      accepted = await sendToAny(rest, bytes)
+    }
+    if (!accepted) {
+      throw new MavLinkError("NO_LINK", if (links.length == 0) "the router has no links" else "no link took the frame")
+    }
+  }
+
+  /// Closes every link; reads end.
+  public close(): void {
+    closed = true
+    for (const l of links) {
+      l.up = false
+      l.stream.close()
+    }
+    wake()
+  }
+
+  ended(): bool {
+    if (closed) {
+      return true
+    }
+    if (links.length == 0) {
+      return false
+    }
+    for (const l of links) {
+      if (l.up) {
+        return false
+      }
+    }
+    true
+  }
+
+  wake(): void {
+    const w = waiting
+    if (w != null && ended()) {
+      waiting = null
+      w!(null)
+    }
+  }
+
+  async pump(link: Link): Promise<void> {
+    const splitter = new MavLinkPacketSplitter({ magicNumbers: registry.magicNumbers() })
+    const parser = new MavLinkPacketParser()
+    try {
+      while (true) {
+        const chunk = await link.stream.read()
+        if (chunk == null) {
+          break
+        }
+        for (const raw of splitter.push(chunk!)) {
+          arrived(link, raw.buffer, parser)
+        }
+      }
+    } catch (e: Error) {
+      // A link that fails ends like one that closes.
+    }
+    link.up = false
+    wake()
+  }
+
+  arrived(link: Link, frame: Uint8Array, parser: MavLinkPacketParser): void {
+    const now = Date.now() as int
+    let packet: MavLinkPacket? = null
+    try {
+      packet = parser.parse(frame)
+    } catch (e: Error) {
+      // Not a frame it can read: skipped, and the link goes on.
+      return
+    }
+    const p = packet!
+    const h = p.header
+    link.frames += 1
+    // A link that delivers a frame is alive: one failed write (a transient error) does not keep it down.
+    link.failed = false
+    hear(link, h.sysid * 256 + h.compid, now)
+    forget(now)
+    const key = `${h.sysid}/${h.compid}/${h.seq}/${h.msgid}/${p.crc}`
+    const before = recent.get(key)
+    // A duplicate is the same bytes, delivered by another link. The same link repeating a frame is a new
+    // message: the sequence number is one byte and goes round in under a second on a busy link.
+    if (before != null && before!.link != link.id && sameBytes(before!.frame, frame)) {
+      link.duplicates += 1
+      return
+    }
+    recent.delete(key)
+    recent.set(key, new Seen(now, link.id, frame))
+    const w = waiting
+    if (w != null) {
+      waiting = null
+      w!(frame)
+    } else {
+      if (queue.length - head >= maxQueued) {
+        // The oldest goes: its slot is emptied so the frame can be freed, and the array is compacted once
+        // as many slots as the cap are dead, so memory stays under twice the cap.
+        queue[head] = EMPTY
+        head += 1
+        dropped += 1
+        if (head >= maxQueued) {
+          queue = queue.slice(head)
+          head = 0
+        }
+      }
+      queue.push(frame)
+    }
+    if (forward) {
+      const to = addressee(frame)
+      const targets = if (to.system == 0) others(link.id) else reaching(to.system, to.component, now, link.id)
+      for (const id of targets) {
+        forwarded += 1
+        sendTo(links[id], frame, now + writeTimeoutMs)
+      }
+    }
+  }
+
+  /// Notes that `source` was heard on `link` at `now`, and forgets the senders on that link that were heard
+  /// longest ago when they are stale or past the cap.
+  hear(link: Link, source: int, now: int): void {
+    const known = link.heard.has(source)
+    link.heard.delete(source)
+    link.heard.set(source, now)
+    if (!known) {
+      const on = index.get(source)
+      const list: int[] = if (on == null) [] else on!
+      if (!list.includes(link.id)) {
+        list.push(link.id)
+      }
+      index.set(source, list)
+    }
+    while (link.heard.size > 0) {
+      // The oldest is first: the map is kept in the order the senders were last heard.
+      let oldest = -1
+      let oldestAt = 0
+      for (const [s, at] of link.heard) {
+        oldest = s
+        oldestAt = at
+        break
+      }
+      if (link.heard.size > maxRoutesPerLink || now - oldestAt > routeTtlMs) {
+        forgetRoute(link, oldest)
+      } else {
+        break
+      }
+    }
+  }
+
+  forgetRoute(link: Link, source: int): void {
+    link.heard.delete(source)
+    const on = index.get(source)
+    if (on != null) {
+      const rest = on!.filter((id: int) => id != link.id)
+      if (rest.length == 0) {
+        index.delete(source)
+      }
+      if (rest.length > 0) {
+        index.set(source, rest)
+      }
+    }
+  }
+
+  /// Every other link that is in use (a broadcast goes to them all).
+  others(except: int): int[] {
+    const out: int[] = []
+    for (const l of links) {
+      if (l.usable() && l.id != except) {
+        out.push(l.id)
+      }
+    }
+    out
+  }
+
+  /// The links, other than `except`, that are in use and reach the system (and component, unless 0): looked
+  /// up by sender, 256 at the most for a system with no component given.
+  reaching(system: int, component: int, now: int, except: int): int[] {
+    const out: int[] = []
+    if (component != 0) {
+      collect(system * 256 + component, now, except, out)
+    } else {
+      for (let c = 0; c < 256; c++) {
+        collect(system * 256 + c, now, except, out)
+      }
+    }
+    out
+  }
+
+  collect(source: int, now: int, except: int, out: int[]): void {
+    const on = index.get(source)
+    if (on == null) {
+      return
+    }
+    for (const id of on!) {
+      const l = links[id]
+      const at = l.heard.get(source)
+      if (id != except && l.usable() && at != null && now - at! <= routeTtlMs && !out.includes(id)) {
+        out.push(id)
+      }
+    }
+  }
+
+  /// Forgets the frames older than `dedupeMs`, and the oldest beyond 4096.
+  forget(now: int): void {
+    const old: string[] = []
+    for (const [key, seen] of recent) {
+      if (now - seen.at >= dedupeMs) {
+        old.push(key)
+      } else {
+        break
+      }
+    }
+    for (const key of old) {
+      recent.delete(key)
+    }
+    while (recent.size > 4096) {
+      for (const [key, _] of recent) {
+        recent.delete(key)
+        break
+      }
+    }
+  }
+
+  /// The target system and component a frame is addressed to, from its message's target_system and
+  /// target_component fields; 0 and 0 for a broadcast, or a message without them.
+  addressee(frame: Uint8Array): Addressee {
+    const none: Addressee = { system: 0, component: 0 }
+    try {
+      const p = new MavLinkPacketParser().parse(frame)
+      const info = registry.get(p.header.msgid)
+      if (info == null) {
+        return none
+      }
+      let system = 0
+      let component = 0
+      for (const f of info!.fields) {
+        if (f.source == "target_system") {
+          system = byteAt(p.payload, f.offset)
+        } else if (f.source == "target_component") {
+          component = byteAt(p.payload, f.offset)
+        }
+      }
+      if (system == 0) {
+        return none
+      }
+      return { system: system, component: component }
+    } catch (e: Error) {
+      return none
+    }
+  }
+
+  /// Writes a frame to the links `ids` together. Resolves true as soon as one takes it (the others go on in the
+  /// background), and false when they have all settled without one, or `writeTimeoutMs` has passed: a link whose
+  /// write never settles does not hold the caller up, and cannot stop the caller from trying other links.
+  ///
+  /// The frame is good for `writeTimeoutMs`: a link that has not got to it by then, because it is still busy with
+  /// a write that has not finished, never writes it. So a frame the caller was told failed (or has sent another
+  /// way) is not sent late. A link still outstanding when the time is up is stuck and marked failed, so the next
+  /// writes don't wait on it; it is used again when it next delivers a frame.
+  sendToAny(ids: int[], frame: Uint8Array): Promise<bool, Error> {
+    new Promise<bool, Error>((resolve: (value: bool) => void, _reject: (error: Error) => void) => {
+      if (ids.length == 0) {
+        resolve(false)
+        return
+      }
+      const deadline = (Date.now() as int) + writeTimeoutMs
+      const settled: int[] = []
+      let outstanding = ids.length
+      let decided = false
+      const timer = setTimeout(() => {
+        if (!decided) {
+          decided = true
+          resolve(false)
+        }
+        for (const id of ids) {
+          if (!settled.includes(id)) {
+            links[id].failed = true
+          }
+        }
+      }, writeTimeoutMs)
+      for (const id of ids) {
+        this.attempt(links[id], frame, deadline, (linkId: int, taken: bool) => {
+          settled.push(linkId)
+          outstanding -= 1
+          if (outstanding == 0) {
+            clearTimeout(timer)
+          }
+          if (!decided && (taken || outstanding == 0)) {
+            decided = true
+            resolve(taken)
+          }
+        })
+      }
+    })
+  }
+
+  async attempt(link: Link, frame: Uint8Array, deadline: int, settled: (linkId: int, taken: bool) => void): Promise<void> {
+    const taken = await sendTo(link, frame, deadline)
+    settled(link.id, taken)
+  }
+
+  /// Takes the link's turn to write, waiting behind whoever holds it.
+  async acquire(link: Link): Promise<void> throws Error {
+    if (!link.busy) {
+      link.busy = true
+      return
+    }
+    await new Promise<bool, Error>((resolve: (value: bool) => void, _reject: (error: Error) => void) => {
+      link.waiters.push(resolve)
+    })
+  }
+
+  /// Hands the link's turn to the one that has waited longest, or frees it.
+  release(link: Link): void {
+    if (link.waiters.length == 0) {
+      link.busy = false
+      return
+    }
+    const next = link.waiters[0]
+    link.waiters = link.waiters.slice(1)
+    next(true)
+  }
+
+  /// Writes a frame to a link, after those before it; whether the link took it. A link that does not is
+  /// marked failed. The frame is not written at all if, when its turn comes, `deadline` (ms since 1970) has
+  /// passed, the link has failed or the router is closed: a write that waited behind a stuck one must not send an
+  /// old frame the moment the link frees up.
+  async sendTo(link: Link, frame: Uint8Array, deadline: int): Promise<bool> {
+    if (link.busy && link.waiters.length >= maxWaitingWrites) {
+      // A write on this link has stalled and others are queued behind it: not one more.
+      link.skipped += 1
+      return false
+    }
+    try {
+      await acquire(link)
+    } catch (e: Error) {
+      return false
+    }
+    if (closed || link.failed || (Date.now() as int) >= deadline) {
+      link.expired += 1
+      release(link)
+      return false
+    }
+    let taken = true
+    try {
+      await link.stream.write(frame)
+    } catch (e: Error) {
+      link.writeErrors += 1
+      link.failed = true
+      taken = false
+    }
+    release(link)
+    taken
+  }
+}

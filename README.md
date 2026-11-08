@@ -28,6 +28,12 @@ Status: **in development (MV1).**
 - **Done:** long STATUSTEXT messages: `StatusTextAssembler` joins the chunks (by system, component
   and `id`, in any order, interleaved), and delivers one whose chunks went missing after a timeout,
   marked truncated. `StatusTextReader` does it on a connection.
+- **Done:** `MavLinkRouter`: several links under one connection. It reads whole frames from each
+  link, delivers a frame that arrives on two links once, learns which link reaches which system
+  and component, sends a targeted message only down the links that reach its target (broadcasts
+  and unheard targets go to all), and can forward between links by the MAVLink routing rules.
+  Operations already match replies by target system and component, so more than one vehicle on a
+  connection works.
 - **Next:** ArduPilot SITL over UDP/TCP (MV2).
 
 ```pico
@@ -68,6 +74,28 @@ texts.onMessage((m: StatusMessage) => println(`${m.severity} ${m.text}${if (m.tr
 ```
 
 A message that lost a chunk is delivered with the text before the gap (`truncated`), not guessed at.
+
+Several vehicles, or several links to one (a radio and a cable), under one connection:
+
+```pico
+const router = new MavLinkRouter({ forward: false })   // forward: true passes traffic between the links
+router.addLink(new TcpStream(await connect(5760)))      // link 0
+router.addLink(new UdpStream(await bind(14551)))        // link 1
+const conn = new MavLinkConnection(router)
+conn.run()
+const first = await new ParamList(conn, { system: 1, component: 1 }, ParamEncoding.CCast).run()
+const second = await new ParamList(conn, { system: 2, component: 1 }, ParamEncoding.CCast).run()
+```
+
+A link that fails to take a frame is marked down (`router.linkInfo()`) until it next delivers a frame, and a
+targeted frame falls back to the other links; `write` fails with `NO_LINK` when no link takes a frame. Links are
+written to together and `write` is done as soon as one has taken the frame, so a slow or stuck one does not hold
+up the others; a write that no link has taken after `writeTimeoutMs` moves on to the other links, or fails. A
+frame is good for `writeTimeoutMs`: a write still waiting behind a stuck one when that is up is dropped, not sent
+late (a stale arm or mode change must not reach a vehicle), and a link still stuck then is marked down until it
+next delivers a frame. A link with `maxWaitingWrites` writes already waiting behind a stalled one refuses more. The router sits below the connection and
+does not check signatures: it learns routes from every well-formed frame, signed or not, and passes frames on
+byte for byte. Put a `SigningPolicy` on the connection to refuse what is not signed.
 
 Signing, as the sender and as the receiver:
 
