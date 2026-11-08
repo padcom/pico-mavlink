@@ -28,6 +28,12 @@ Status: **in development (MV1).**
 - **Done:** long STATUSTEXT messages: `StatusTextAssembler` joins the chunks (by system, component
   and `id`, in any order, interleaved), and delivers one whose chunks went missing after a timeout,
   marked truncated. `StatusTextReader` does it on a connection.
+- **Done:** `MavLinkRouter`: several links under one connection. It reads whole frames from each
+  link, delivers a frame that arrives on two links once, learns which link reaches which system
+  and component, sends a targeted message only down the links that reach its target (broadcasts
+  and unheard targets go to all), and can forward between links by the MAVLink routing rules.
+  Operations already match replies by target system and component, so more than one vehicle on a
+  connection works.
 - **Next:** ArduPilot SITL over UDP/TCP (MV2).
 
 ```pico
@@ -68,6 +74,18 @@ texts.onMessage((m: StatusMessage) => println(`${m.severity} ${m.text}${if (m.tr
 ```
 
 A message that lost a chunk is delivered with the text before the gap (`truncated`), not guessed at.
+
+Several vehicles, or several links to one (a radio and a cable), under one connection:
+
+```pico
+const router = new MavLinkRouter({ forward: false })   // forward: true passes traffic between the links
+router.addLink(new TcpStream(await connect(5760)))      // link 0
+router.addLink(new UdpStream(await bind(14551)))        // link 1
+const conn = new MavLinkConnection(router)
+conn.run()
+const first = await new ParamList(conn, { system: 1, component: 1 }, ParamEncoding.CCast).run()
+const second = await new ParamList(conn, { system: 2, component: 1 }, ParamEncoding.CCast).run()
+```
 
 Signing, as the sender and as the receiver:
 

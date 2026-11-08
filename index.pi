@@ -52,5 +52,6 @@ export {
   VehicleDiscovery,
 } from "./src/operations"
 export { StatusMessage, StatusTextAssembler, StatusTextReader, splitStatusText, statusTextFields } from "./src/statustext"
+export { LinkInfo, MavLinkRouter, RouterOptions } from "./src/router"
 export { SimParam, SimulatedAutopilot, defaultSimParams } from "./src/simulator"
 export * from "./src/dialects/all"

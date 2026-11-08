@@ -39,6 +39,10 @@ export function defaultSimParams(): SimParam[] {
 export class SimulatedAutopilot {
   public readonly conn: MavLinkConnection
   public readonly params: SimParam[]
+  /// Its system and component id (1 and 1 by default). Like an autopilot it ignores a request addressed
+  /// to another system or component (0 means everyone).
+  public readonly sysid: int
+  public readonly compid: int
   /// Telemetry ticks so far (the battery drains and the vehicle sways with them).
   public ticks: int = 0
   /// Parameter writes it rounds to whole numbers (an autopilot that changes what it's given).
@@ -47,10 +51,17 @@ export class SimulatedAutopilot {
   public answersVersion: bool = true
   timer: int = -1
 
-  constructor(stream: ByteStream, params: SimParam[] = defaultSimParams()) {
-    this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(1, 1) })
+  constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
+    this.sysid = sysid
+    this.compid = compid
+    this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(sysid, compid) })
     this.params = params
     conn.on((r: Received) => this.handle(r))
+  }
+
+  /// Whether a request with this target is for this vehicle.
+  forMe(system: int, component: int): bool {
+    (system == 0 || system == sysid) && (component == 0 || component == compid)
   }
 
   /// Starts answering and sending telemetry every `intervalMs`.
@@ -101,6 +112,9 @@ export class SimulatedAutopilot {
   handle(r: Received): void {
     const m = r.message
     if (m instanceof CommandLong) {
+      if (!forMe(m.targetSystem as int, m.targetComponent as int)) {
+        return
+      }
       const wants = (m.command as int == MavCmd.REQUEST_MESSAGE && m._param1 as int == AutopilotVersion.MSG_ID)
         || m.command as int == MavCmd.REQUEST_AUTOPILOT_CAPABILITIES
       if (m.command as int == MavCmd.SET_MESSAGE_INTERVAL) {
@@ -124,17 +138,19 @@ export class SimulatedAutopilot {
       }
       return
     } else if (m instanceof ParamRequestList) {
-      for (let i = 0; i < params.length; i++) {
-        send(i)
+      if (forMe(m.targetSystem as int, m.targetComponent as int)) {
+        for (let i = 0; i < params.length; i++) {
+          send(i)
+        }
       }
     } else if (m instanceof ParamRequestRead) {
       const i = if (m.paramIndex >= 0) m.paramIndex as int else indexOf(m.paramId)
-      if (i >= 0 && i < params.length) {
+      if (forMe(m.targetSystem as int, m.targetComponent as int) && i >= 0 && i < params.length) {
         send(i)
       }
     } else if (m instanceof ParamSet) {
       const i = indexOf(m.paramId)
-      if (i >= 0) {
+      if (forMe(m.targetSystem as int, m.targetComponent as int) && i >= 0) {
         const v = decodeParam(m.paramValue, m.paramType as int, ParamEncoding.CCast)
         params[i] = { id: params[i].id, value: rounded(params[i].id, v) }
         send(i)

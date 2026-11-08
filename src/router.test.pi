@@ -1,0 +1,366 @@
+// The router: two vehicles on one connection, one vehicle on two links with one dropped, duplicates
+// detected, frames kept whole, and forwarding by the routing rules.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { ByteStream, MemoryStream } from "./stream"
+import { MavLinkProtocolV2 } from "./protocol"
+import { ParamEncoding, TypedParamValue, showParam } from "./params"
+import { ParamList, ParamOptions, ParamRead, ParamWrite, VehicleDiscovery } from "./operations"
+import { MavLinkRouter } from "./router"
+import { SimParam, SimulatedAutopilot, defaultSimParams } from "./simulator"
+import { Heartbeat, MavType } from "./dialects/minimal"
+import { MavParamType, ParamRequestRead, SysStatus } from "./dialects/common"
+
+/// A stream that counts the frames written to it.
+class Tap implements ByteStream {
+  readonly inner: ByteStream
+  public writes: int = 0
+
+  constructor(inner: ByteStream) {
+    this.inner = inner
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    inner.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    writes += 1
+    await inner.write(bytes)
+  }
+
+  public close(): void {
+    inner.close()
+  }
+}
+
+/// A stream whose writes fail.
+class Broken implements ByteStream {
+  readonly inner: ByteStream
+
+  constructor(inner: ByteStream) {
+    this.inner = inner
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    inner.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    throw new Error("the link is down")
+  }
+
+  public close(): void {
+    inner.close()
+  }
+}
+
+/// Copies everything `from` reads to each stream in `to`, until it ends.
+async function pipe(from: ByteStream, to: ByteStream[]): Promise<void> throws Error {
+  while (true) {
+    const chunk = await from.read()
+    if (chunk == null) {
+      return
+    }
+    for (const t of to) {
+      await t.write(chunk!)
+    }
+  }
+}
+
+function paramsOfB(): SimParam[] {
+  [
+    { id: "FS_THR_ENABLE", value: TypedParamValue.Int(2, MavParamType.INT8) },
+    { id: "RTL_ALT", value: TypedParamValue.Int(3000, MavParamType.INT32) },
+    { id: "WPNAV_SPEED", value: TypedParamValue.Real(500.0, MavParamType.REAL32) },
+  ]
+}
+
+const FAST: ParamOptions = { quietMs: 40, timeoutMs: 100, retries: 2 }
+
+async function twoVehiclesOnOneConnection(): Promise<void> throws Error {
+  const a = MemoryStream.pair()
+  const b = MemoryStream.pair()
+  const tapA = new Tap(a[0])
+  const tapB = new Tap(b[0])
+  const router = new MavLinkRouter()
+  router.addLink(tapA)
+  router.addLink(tapB)
+  const simA = new SimulatedAutopilot(a[1], defaultSimParams(), 1, 1)
+  const simB = new SimulatedAutopilot(b[1], paramsOfB(), 2, 1)
+  const gcs = new MavLinkConnection(router)
+  const seen = new VehicleDiscovery(gcs)
+  gcs.run()
+  simA.start(10)
+  simB.start(10)
+  await delay(60)
+  expect(seen.vehicles().map((x) => `${x.sysid}/${x.compid} ${MavType.nameOf(x.type) ?? "?"}`).join(",")).toBe("1/1 QUADROTOR,2/1 QUADROTOR")
+  expect(`${router.linksTo(1, 1).join(",")} ${router.linksTo(2, 1).join(",")} ${router.linksTo(3, 0).length}`).toBe("0 1 0")
+
+  // A request for vehicle 2 goes down its link only, and only its parameters come back.
+  const toA = tapA.writes
+  const listB = await new ParamList(gcs, { system: 2, component: 1 }, ParamEncoding.CCast, FAST).run()
+  expect(`${listB.count} ${listB.complete} ${listB.params.map((p) => p.id).join(",")}`).toBe("3 true FS_THR_ENABLE,RTL_ALT,WPNAV_SPEED")
+  expect(tapA.writes).toBe(toA)
+
+  const listA = await new ParamList(gcs, { system: 1, component: 1 }, ParamEncoding.CCast, FAST).run()
+  expect(`${listA.count} ${listA.complete} ${listA.params[0].id}`).toBe("12 true ARMING_CHECK")
+
+  // A write to one vehicle changes that vehicle and no other.
+  const written = await new ParamWrite(gcs, { system: 2, component: 1 }, ParamEncoding.CCast, FAST).run("RTL_ALT", TypedParamValue.Int(3500, MavParamType.INT32))
+  expect(`${showParam(written.param.value)} ${written.verified}`).toBe("3500 true")
+  const rtlA = await new ParamRead(gcs, { system: 1, component: 1 }, ParamEncoding.CCast, FAST).run("RTL_ALT")
+  const rtlB = await new ParamRead(gcs, { system: 2, component: 1 }, ParamEncoding.CCast, FAST).run("RTL_ALT")
+  expect(`${showParam(rtlA.value)} ${showParam(rtlB.value)}`).toBe("1500 3500")
+  simA.stop()
+  simB.stop()
+  gcs.close()
+}
+
+async function oneVehicleOnTwoLinksWithOneDropped(): Promise<void> throws Error {
+  const vehicle = MemoryStream.pair()
+  const l1 = MemoryStream.pair()
+  const l2 = MemoryStream.pair()
+  const router = new MavLinkRouter()
+  router.addLink(l1[0])
+  router.addLink(l2[0])
+  // The vehicle is reached by both links: what it sends is on both, and what is sent to it goes down both.
+  pipe(vehicle[0], [l1[1], l2[1]])
+  pipe(l1[1], [vehicle[0]])
+  pipe(l2[1], [vehicle[0]])
+  const sim = new SimulatedAutopilot(vehicle[1])
+  const gcs = new MavLinkConnection(router)
+  const seqs: int[] = []
+  gcs.on((r: Received) => {
+    if (r.message instanceof Heartbeat) {
+      seqs.push(r.packet.header.seq)
+    }
+  })
+  gcs.run()
+  sim.start(10)
+  await delay(120)
+  const before = seqs.length
+  expect(before >= 5).toBe(true)
+  // Delivered once each: no sequence number twice in a row, though every frame came twice.
+  expect(unique(seqs)).toBe(true)
+  expect(router.duplicateCount() >= before).toBe(true)
+  const info = router.linkInfo()
+  expect(`${info[0].up} ${info[1].up} ${info[0].frames == info[1].frames}`).toBe("true true true")
+
+  // One link is dropped; the vehicle is still there, and nothing is missed or doubled.
+  l2[1].close()
+  await delay(60)
+  expect(`${router.linkInfo()[0].up} ${router.linkInfo()[1].up}`).toBe("true false")
+  expect(seqs.length > before).toBe(true)
+  expect(unique(seqs)).toBe(true)
+  const list = await new ParamList(gcs, { system: 1, component: 1 }, ParamEncoding.CCast, FAST).run()
+  expect(`${list.count} ${list.complete}`).toBe("12 true")
+  sim.stop()
+  gcs.close()
+}
+
+/// Whether every number differs from the one before it (a sequence number only repeats after 256).
+function unique(seqs: int[]): bool {
+  for (let i = 1; i < seqs.length; i++) {
+    if (seqs[i] == seqs[i - 1]) {
+      return false
+    }
+  }
+  true
+}
+
+function heartbeatFrame(system: int, seq: int): Uint8Array {
+  const h = new Heartbeat()
+  h.type = MavType.QUADROTOR as u8
+  new MavLinkProtocolV2(system, 1).serialize(h, seq)
+}
+
+async function dropsDuplicatesOnceAndOnlyWithinTheWindow(): Promise<void> throws Error {
+  const l1 = MemoryStream.pair()
+  const l2 = MemoryStream.pair()
+  const router = new MavLinkRouter({ dedupeMs: 60 })
+  router.addLink(l1[0])
+  router.addLink(l2[0])
+  const gcs = new MavLinkConnection(router)
+  let heard = 0
+  let status = 0
+  gcs.on((r: Received) => {
+    if (r.message instanceof Heartbeat) {
+      heard += 1
+    } else if (r.message instanceof SysStatus) {
+      status += 1
+    }
+  })
+  gcs.run()
+  const f = heartbeatFrame(7, 5)
+  await l1[1].write(f)
+  await l2[1].write(f)
+  await delay(15)
+  expect(heard).toBe(1)
+  // A different message with the same sender and sequence number is not a duplicate.
+  await l1[1].write(new MavLinkProtocolV2(7, 1).serialize(new SysStatus(), 5))
+  await delay(15)
+  expect(`${heard} ${status}`).toBe("1 1")
+  // The same frame after the window is a new message (the sequence number went round).
+  await delay(100)
+  await l2[1].write(f)
+  await delay(15)
+  expect(heard).toBe(2)
+  gcs.close()
+}
+
+async function keepsFramesWholeWhenLinksInterleave(): Promise<void> throws Error {
+  const l1 = MemoryStream.pair()
+  const l2 = MemoryStream.pair()
+  const router = new MavLinkRouter()
+  router.addLink(l1[0])
+  router.addLink(l2[0])
+  const gcs = new MavLinkConnection(router)
+  const names: string[] = []
+  gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof Heartbeat) {
+      names.push(`HEARTBEAT from ${r.packet.header.sysid}`)
+    } else if (m instanceof SysStatus) {
+      names.push(`SYS_STATUS from ${r.packet.header.sysid}`)
+    }
+  })
+  gcs.run()
+  const slow = heartbeatFrame(7, 1)
+  const quick = new MavLinkProtocolV2(8, 1).serialize(new SysStatus(), 1)
+  // Half a frame on one link, a whole one on the other, then the rest: the streams are not mixed.
+  await l1[1].write(slow.slice(0, 6))
+  await l2[1].write(quick)
+  await delay(10)
+  await l1[1].write(slow.slice(6, slow.length))
+  await delay(10)
+  expect(names.join(", ")).toBe("SYS_STATUS from 8, HEARTBEAT from 7")
+  gcs.close()
+}
+
+async function forwardsByTheRoutingRules(): Promise<void> throws Error {
+  const a = MemoryStream.pair()
+  const b = MemoryStream.pair()
+  const c = MemoryStream.pair()
+  const router = new MavLinkRouter({ forward: true })
+  router.addLink(a[0])
+  router.addLink(b[0])
+  router.addLink(c[0])
+  const onA = new MavLinkConnection(a[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  const onB = new MavLinkConnection(b[1], { protocol: new MavLinkProtocolV2(2, 1) })
+  const onC = new MavLinkConnection(c[1], { protocol: new MavLinkProtocolV2(3, 1) })
+  const heard: string[] = []
+  const listen = (name: string, conn: MavLinkConnection) => {
+    conn.on((r: Received) => {
+      const m = r.message
+      if (m instanceof Heartbeat) {
+        heard.push(`${name} heartbeat from ${r.packet.header.sysid}`)
+      } else if (m instanceof ParamRequestRead) {
+        heard.push(`${name} read for ${m.targetSystem}`)
+      }
+    })
+    conn.run()
+  }
+  listen("A", onA)
+  listen("B", onB)
+  listen("C", onC)
+  const gcs = new MavLinkConnection(router)
+  gcs.run()
+
+  // A broadcast goes to every other link, and not back to the one it came from.
+  await onA.send(new Heartbeat())
+  await delay(20)
+  expect(`${heard.length} ${heard.includes("B heartbeat from 1")} ${heard.includes("C heartbeat from 1")}`).toBe("2 true true")
+  // B and C speak, so the router now knows who is where.
+  await onB.send(new Heartbeat())
+  await onC.send(new Heartbeat())
+  await delay(20)
+  while (heard.length > 0) {
+    heard.pop()
+  }
+  // A message for system 2 goes to B's link only; one for an unheard system goes nowhere.
+  const read = new ParamRequestRead()
+  read.targetSystem = 2
+  read.targetComponent = 1
+  read.paramIndex = 0
+  await onC.send(read)
+  const nobody = new ParamRequestRead()
+  nobody.targetSystem = 9
+  nobody.targetComponent = 1
+  nobody.paramIndex = 0
+  await onC.send(nobody)
+  await delay(20)
+  expect(heard.join(", ")).toBe("B read for 2")
+  expect(router.forwardedCount() > 0).toBe(true)
+  gcs.close()
+}
+
+async function doesNotForwardUnlessAsked(): Promise<void> throws Error {
+  const a = MemoryStream.pair()
+  const b = MemoryStream.pair()
+  const router = new MavLinkRouter()
+  router.addLink(a[0])
+  router.addLink(b[0])
+  const onA = new MavLinkConnection(a[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  const onB = new MavLinkConnection(b[1], { protocol: new MavLinkProtocolV2(2, 1) })
+  let heard = 0
+  onB.on((_r: Received) => {
+    heard += 1
+  })
+  onB.run()
+  const gcs = new MavLinkConnection(router)
+  let atGcs = 0
+  gcs.on((_r: Received) => {
+    atGcs += 1
+  })
+  gcs.run()
+  await onA.send(new Heartbeat())
+  await delay(20)
+  expect(`${heard} ${atGcs} ${router.forwardedCount()}`).toBe("0 1 0")
+  gcs.close()
+}
+
+async function passesOverALinkThatFails(): Promise<void> throws Error {
+  const good = MemoryStream.pair()
+  const bad = MemoryStream.pair()
+  const router = new MavLinkRouter()
+  router.addLink(new Broken(bad[0]))
+  router.addLink(good[0])
+  const far = new MavLinkConnection(good[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  let heard = 0
+  far.on((_r: Received) => {
+    heard += 1
+  })
+  far.run()
+  const gcs = new MavLinkConnection(router)
+  await gcs.send(new Heartbeat())
+  await delay(20)
+  expect(heard).toBe(1)
+  gcs.close()
+}
+
+async function endsWhenEveryLinkEnds(): Promise<void> throws Error {
+  const l1 = MemoryStream.pair()
+  const l2 = MemoryStream.pair()
+  const router = new MavLinkRouter()
+  router.addLink(l1[0])
+  router.addLink(l2[0])
+  const waiting = router.read()
+  l1[1].close()
+  l2[1].close()
+  const end = await waiting
+  expect(end == null).toBe(true)
+  expect(`${router.linkInfo()[0].up} ${router.linkInfo()[1].up}`).toBe("false false")
+}
+
+describe("the router", () => {
+  it("serves two vehicles on one connection, each reached by its own link", twoVehiclesOnOneConnection)
+  it("serves one vehicle on two links, delivering once, and goes on when one is dropped", oneVehicleOnTwoLinksWithOneDropped)
+  it("drops duplicates, only within the window and only for the same message", dropsDuplicatesOnceAndOnlyWithinTheWindow)
+  it("keeps frames whole when links interleave", keepsFramesWholeWhenLinksInterleave)
+  it("forwards broadcasts to the other links and targeted messages to the link that reaches them", forwardsByTheRoutingRules)
+  it("forwards nothing unless asked", doesNotForwardUnlessAsked)
+  it("passes over a link that fails to take a frame", passesOverALinkThatFails)
+  it("ends when every link has ended", endsWhenEveryLinkEnds)
+})
