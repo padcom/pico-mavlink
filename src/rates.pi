@@ -262,6 +262,11 @@ export class TelemetryRates {
     const now = Date.now() as int
     const quiet = lastSeen > 0 && now - lastSeen >= silenceMs
     lastSeen = now
+    if (quiet) {
+      // The clock before a silence says nothing about the one after it: start comparing afresh. Otherwise the
+      // vehicle's first message with a boot time, if it comes after one without, would count the same return again.
+      lastBoot = -1
+    }
     const boot = bootTimeOf(r)
     let rebooted = false
     if (boot >= 0) {
