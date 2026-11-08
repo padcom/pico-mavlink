@@ -70,6 +70,8 @@ class Link {
   public writeErrors: int = 0
   /// Writes refused because too many were already waiting behind a stalled one.
   public skipped: int = 0
+  /// Writes that waited so long for their turn (or for the link to be usable again) that they were not sent.
+  public expired: int = 0
   /// The senders heard on it, by (system * 256 + component), in order of when they were last heard.
   public readonly heard: Map<int, int> = new Map<int, int>()
   /// Writes go one at a time: whoever holds the link writes, the others wait their turn.
@@ -214,6 +216,15 @@ export class MavLinkRouter implements ByteStream {
     let n = 0
     for (const l of links) {
       n += l.skipped
+    }
+    n
+  }
+
+  /// How many writes were not sent because they waited too long for their turn on a link.
+  public expiredWrites(): int {
+    let n = 0
+    for (const l of links) {
+      n += l.expired
     }
     n
   }
@@ -378,7 +389,7 @@ export class MavLinkRouter implements ByteStream {
       const targets = if (to.system == 0) others(link.id) else reaching(to.system, to.component, now, link.id)
       for (const id of targets) {
         forwarded += 1
-        sendTo(links[id], frame)
+        sendTo(links[id], frame, now + writeTimeoutMs)
       }
     }
   }
@@ -519,12 +530,19 @@ export class MavLinkRouter implements ByteStream {
   /// Writes a frame to the links `ids` together. Resolves true as soon as one takes it (the others go on in the
   /// background), and false when they have all settled without one, or `writeTimeoutMs` has passed: a link whose
   /// write never settles does not hold the caller up, and cannot stop the caller from trying other links.
+  ///
+  /// The frame is good for `writeTimeoutMs`: a link that has not got to it by then, because it is still busy with
+  /// a write that has not finished, never writes it. So a frame the caller was told failed (or has sent another
+  /// way) is not sent late. A link still outstanding when the time is up is stuck and marked failed, so the next
+  /// writes don't wait on it; it is used again when it next delivers a frame.
   sendToAny(ids: int[], frame: Uint8Array): Promise<bool, Error> {
     new Promise<bool, Error>((resolve: (value: bool) => void, _reject: (error: Error) => void) => {
       if (ids.length == 0) {
         resolve(false)
         return
       }
+      const deadline = (Date.now() as int) + writeTimeoutMs
+      const settled: int[] = []
       let outstanding = ids.length
       let decided = false
       const timer = setTimeout(() => {
@@ -532,13 +550,21 @@ export class MavLinkRouter implements ByteStream {
           decided = true
           resolve(false)
         }
+        for (const id of ids) {
+          if (!settled.includes(id)) {
+            links[id].failed = true
+          }
+        }
       }, writeTimeoutMs)
       for (const id of ids) {
-        this.attempt(links[id], frame, (taken: bool) => {
+        this.attempt(links[id], frame, deadline, (linkId: int, taken: bool) => {
+          settled.push(linkId)
           outstanding -= 1
+          if (outstanding == 0) {
+            clearTimeout(timer)
+          }
           if (!decided && (taken || outstanding == 0)) {
             decided = true
-            clearTimeout(timer)
             resolve(taken)
           }
         })
@@ -546,9 +572,9 @@ export class MavLinkRouter implements ByteStream {
     })
   }
 
-  async attempt(link: Link, frame: Uint8Array, settled: (taken: bool) => void): Promise<void> {
-    const taken = await sendTo(link, frame)
-    settled(taken)
+  async attempt(link: Link, frame: Uint8Array, deadline: int, settled: (linkId: int, taken: bool) => void): Promise<void> {
+    const taken = await sendTo(link, frame, deadline)
+    settled(link.id, taken)
   }
 
   /// Takes the link's turn to write, waiting behind whoever holds it.
@@ -574,8 +600,10 @@ export class MavLinkRouter implements ByteStream {
   }
 
   /// Writes a frame to a link, after those before it; whether the link took it. A link that does not is
-  /// marked failed.
-  async sendTo(link: Link, frame: Uint8Array): Promise<bool> {
+  /// marked failed. The frame is not written at all if, when its turn comes, `deadline` (ms since 1970) has
+  /// passed, the link has failed or the router is closed: a write that waited behind a stuck one must not send an
+  /// old frame the moment the link frees up.
+  async sendTo(link: Link, frame: Uint8Array, deadline: int): Promise<bool> {
     if (link.busy && link.waiters.length >= maxWaitingWrites) {
       // A write on this link has stalled and others are queued behind it: not one more.
       link.skipped += 1
@@ -584,6 +612,11 @@ export class MavLinkRouter implements ByteStream {
     try {
       await acquire(link)
     } catch (e: Error) {
+      return false
+    }
+    if (closed || link.failed || (Date.now() as int) >= deadline) {
+      link.expired += 1
+      release(link)
       return false
     }
     let taken = true
