@@ -116,7 +116,10 @@ rates.onReapplied((results) => println(`asked again for ${results.length} rates`
 did not, so the message's `REQUEST_DATA_STREAM` group was asked for instead; a group has one rate, the highest any
 message held in it needs, and that request is not acknowledged), or `none` (the message is in no stream). A reboot is
 seen when the vehicle's `time_boot_ms` goes back, a reconnect when it was silent for `silenceMs` (5 s) and speaks
-again; the rates are then asked for again after `settleMs`. When the link itself is replaced (a SITL restarted and
+again; the rates are then asked for again after `settleMs`, and once more if the vehicle restarts again meanwhile
+or a request fails (up to three passes). Requests go to the vehicle one at a time, because an acknowledgement names
+its command and not the request. `stop()` cancels asking again, scheduled or begun, so a stopped manager cannot undo
+the rates of one that replaced it. When the link itself is replaced (a SITL restarted and
 connected to again), put the connection on a `MavLinkRouter` with `keepOpen: true` and add the new link to it: the
 connection and the manager go on, and the manager sees the vehicle come back. Against ArduCopter SITL, rates of 10, 2
 and 4 Hz for ATTITUDE, SYS_STATUS and VFR_HUD were measured at 10, 2 and 4 Hz, and again after the SITL was

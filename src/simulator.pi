@@ -64,6 +64,8 @@ export class SimulatedAutopilot {
   /// How many times it has rebooted.
   public reboots: int = 0
   timer: int = -1
+  /// The timer that ends a reboot's quiet time.
+  downTimer: int = -1
   /// One timer per message that has an interval of its own.
   readonly timers: Map<int, int> = new Map<int, int>()
   bootedAt: int = 0
@@ -103,6 +105,7 @@ export class SimulatedAutopilot {
 
   public stop(): void {
     clearInterval(timer)
+    clearTimeout(downTimer)
     stopTimers()
     conn.close()
   }
@@ -118,9 +121,10 @@ export class SimulatedAutopilot {
     ticks = 0
     bootedAt = Date.now() as int
     reboots += 1
+    clearTimeout(downTimer)
     if (downMs > 0) {
       down = true
-      setTimeout(() => {
+      downTimer = setTimeout(() => {
         this.down = false
       }, downMs)
     }

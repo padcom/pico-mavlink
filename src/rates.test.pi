@@ -3,7 +3,7 @@
 import { describe, it, expect } from "std/test"
 import { delay } from "std/timers"
 import { MavLinkConnection, Received } from "./connection"
-import { MemoryStream } from "./stream"
+import { ByteStream, MemoryStream } from "./stream"
 import { MavLinkError, MavLinkProtocolV2 } from "./protocol"
 import { MavLinkRouter } from "./router"
 import { RateResult, RatesOptions, TelemetryRates } from "./rates"
@@ -271,6 +271,145 @@ async function countsAReturnOnceWhicheverMessageComesFirst(): Promise<void> thro
   gcs.close()
 }
 
+async function takesOneRequestAtATime(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  // Both at once. A COMMAND_ACK names the command and not the request, so side by side the first acknowledgement
+  // (ATTITUDE, accepted) would settle both. VFR_HUD is not something the vehicle can do: it must be told so.
+  const attitude = rig.rates.set(Attitude.MSG_ID, 20.0)
+  const hud = rig.rates.set(74, 5.0)
+  const a = await attitude
+  const b = await hud
+  expect(`${show(a)} | ${show(b)}`).toBe("interval true 0 | stream true 3")
+  expect(rig.rates.held().map((h) => `${h.messageId} ${h.method}`).join(",")).toBe("30 interval,74 stream")
+  rig.close()
+}
+
+/// A stream whose first writes fail (a connection that hiccups), as many as `failures`.
+class Flaky implements ByteStream {
+  readonly inner: ByteStream
+  public failures: int = 0
+
+  constructor(inner: ByteStream) {
+    this.inner = inner
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    inner.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    if (failures > 0) {
+      failures -= 1
+      throw new Error("a hiccup")
+    }
+    await inner.write(bytes)
+  }
+
+  public close(): void {
+    inner.close()
+  }
+}
+
+async function asksOnceMoreWhenTheVehicleRestartsDuringAPass(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  // A vehicle that never answers a command, so each pass takes its timeout (100 ms): time for it to restart again.
+  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 100, retries: 0, settleMs: 10, silenceMs: 5000 })
+  let passes = 0
+  rates.onReapplied((_results: RateResult[]) => {
+    passes += 1
+  })
+  gcs.run()
+  vehicle.run()
+  await rates.set(Attitude.MSG_ID, 20.0)
+  await say(vehicle, 5000, true)
+  await delay(20)
+  await say(vehicle, 10, true)
+  // The first pass has begun (10 ms for the vehicle to settle) and is waiting for an answer that never comes.
+  await delay(50)
+  await say(vehicle, 6000, true)
+  await delay(10)
+  await say(vehicle, 20, true)
+  await delay(700)
+  expect(`${rates.rebootCount()} ${passes}`).toBe("2 2")
+  rates.stop()
+  gcs.close()
+}
+
+async function asksAgainWhenARequestFailsAfterAReboot(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const flaky = new Flaky(ends[0])
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(flaky)
+  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 5000 })
+  const passes: string[] = []
+  rates.onReapplied((results: RateResult[]) => {
+    passes.push(results.map((r) => `${r.method} ${r.ok}`).join(";"))
+  })
+  gcs.run()
+  sim.start(250)
+  await rates.set(Attitude.MSG_ID, 20.0)
+  await rates.set(SysStatus.MSG_ID, 2.0)
+  await delay(300)
+  // The connection fails on the first request after the reboot: that one is reported, the other is still asked
+  // for, and the pass is run again.
+  flaky.failures = 1
+  sim.reboot()
+  await delay(1500)
+  expect(passes.join(" | ")).toBe("none false;interval true | interval true;interval true")
+  expect(`${sim.intervals.get(Attitude.MSG_ID) ?? -2} ${sim.intervals.get(SysStatus.MSG_ID) ?? -2}`).toBe("50 500")
+  sim.stop()
+  rates.stop()
+  gcs.close()
+}
+
+async function stopCancelsAskingAgain(): Promise<void> throws Error {
+  const rig = new Rig(250, { timeoutMs: 100, retries: 1, settleMs: 600, silenceMs: 5000 })
+  await rig.rates.set(Attitude.MSG_ID, 20.0)
+  await delay(300)
+  rig.sim.reboot()
+  await delay(450)
+  // The reboot has been seen and the rates are due again in a while; the manager is stopped before that.
+  expect(rig.rates.rebootCount()).toBe(1)
+  rig.rates.stop()
+  // A new manager takes over and asks for something else. The old one must not come back and undo it.
+  const successor = new TelemetryRates(rig.gcs, { system: 1, component: 1 }, FAST)
+  await successor.set(Attitude.MSG_ID, 5.0)
+  await delay(900)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${(await rig.rates.reapply()).length}`).toBe("200 0")
+  successor.stop()
+  rig.close()
+}
+
+/// An ATTITUDE from `component` of system 1 that says it has been up for `upMs`, written straight to the stream.
+async function attitudeFrom(stream: MemoryStream, component: int, upMs: int): Promise<void> throws Error {
+  const a = new Attitude()
+  a.timeBootMs = upMs as u32
+  await stream.write(new MavLinkProtocolV2(1, component).serialize(a, 0))
+}
+
+async function keepsAClockPerComponent(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  // The whole system is looked after (component 0): its autopilot and a companion computer have clocks that
+  // started at different times, and neither has rebooted.
+  const rates = new TelemetryRates(gcs, { system: 1, component: 0 }, FAST)
+  gcs.run()
+  for (let i = 0; i < 4; i++) {
+    await attitudeFrom(ends[1], 1, 50_000 + i * 20)
+    await attitudeFrom(ends[1], 100, 10_000 + i * 20)
+    await delay(20)
+  }
+  expect(rates.rebootCount()).toBe(0)
+  // One of them does restart.
+  await attitudeFrom(ends[1], 100, 5)
+  await delay(20)
+  expect(rates.rebootCount()).toBe(1)
+  rates.stop()
+  gcs.close()
+}
+
 async function stopsWatching(): Promise<void> throws Error {
   const rig = new Rig(100, FAST)
   await rig.rates.set(Attitude.MSG_ID, 50.0)
@@ -354,6 +493,11 @@ describe("telemetry rates", () => {
   it("counts a reboot that goes quiet once", asksAgainAfterARebootThatWentQuiet)
   it("asks again of a restarted vehicle that came back on a new link", asksAgainOfAVehicleThatCameBackOnANewLink)
   it("counts a return once, whichever message comes first", countsAReturnOnceWhicheverMessageComesFirst)
+  it("takes one request at a time, so one refused beside one accepted is not taken for accepted", takesOneRequestAtATime)
+  it("goes through the rates once more when the vehicle restarts during a pass", asksOnceMoreWhenTheVehicleRestartsDuringAPass)
+  it("asks the other rates, and again, when one request fails after a reboot", asksAgainWhenARequestFailsAfterAReboot)
+  it("does not ask again after being stopped, and does not undo a successor", stopCancelsAskingAgain)
+  it("keeps a clock per component", keepsAClockPerComponent)
   it("stops watching when stopped", stopsWatching)
   it("refuses rates that make no sense", refusesRatesThatMakeNoSense)
   it("looks after each vehicle on a router", managesEachVehicleOnARouter)

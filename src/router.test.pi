@@ -553,7 +553,7 @@ async function deliversARepeatOnTheSameLink(): Promise<void> throws Error {
 
 async function boundsAndExpiresWhatItRemembersOfSenders(): Promise<void> throws Error {
   const l = MemoryStream.pair()
-  const router = new MavLinkRouter({ maxRoutesPerLink: 50, routeTtlMs: 60 })
+  const router = new MavLinkRouter({ maxRoutesPerLink: 50 })
   router.addLink(l[0])
   for (let s = 1; s <= 200; s++) {
     await l[1].write(heartbeatFrame(s, 0))
@@ -561,11 +561,19 @@ async function boundsAndExpiresWhatItRemembersOfSenders(): Promise<void> throws 
   await delay(30)
   // 200 senders were heard; the 50 most recent (151 to 200) are kept.
   expect(`${router.routeCount()} ${router.linksTo(200, 1).join(",")} ${router.linksTo(1, 1).length} ${router.linksTo(151, 1).length} ${router.linksTo(150, 1).length}`).toBe("50 0 0 1 0")
-  await delay(100)
-  // Stale ones go when the link next hears anything.
-  await l[1].write(heartbeatFrame(7, 1))
-  await delay(15)
-  expect(`${router.routeCount()} ${router.linksTo(200, 1).length} ${router.linksTo(7, 1).join(",")}`).toBe("1 0 0")
+
+  // A sender not heard for longer than routeTtlMs goes when the link next hears anything. (The gap is twice the
+  // lifetime, so a slow machine cannot make this fail; the lifetime is not timed against the writes above.)
+  const m = MemoryStream.pair()
+  const quick = new MavLinkRouter({ routeTtlMs: 100 })
+  quick.addLink(m[0])
+  await m[1].write(heartbeatFrame(7, 0))
+  await delay(30)
+  expect(quick.linksTo(7, 1).join(",")).toBe("0")
+  await delay(220)
+  await m[1].write(heartbeatFrame(8, 0))
+  await delay(30)
+  expect(`${quick.routeCount()} ${quick.linksTo(7, 1).length} ${quick.linksTo(8, 1).join(",")}`).toBe("1 0 0")
 }
 
 async function dropsTheOldestFramesWhenNobodyReads(): Promise<void> throws Error {

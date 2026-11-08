@@ -8,6 +8,10 @@
 // A vehicle that reboots forgets what it was asked. The manager notices a reboot (the vehicle's
 // time_boot_ms goes back) or a reconnect (it was silent, then speaks again), and asks again for everything
 // it holds. It works on any `MavLinkConnection`, so over a `MavLinkRouter` too, one manager per vehicle.
+//
+// Requests go one at a time. A COMMAND_ACK says which command it answers but not which request, so two
+// SET_MESSAGE_INTERVAL commands in flight at once would take each other's acknowledgement.
+import { delay } from "std/timers"
 import { MavLinkConnection, Received } from "./connection"
 import { MavLinkError } from "./protocol"
 import { CommandCall, Target } from "./operations"
@@ -31,7 +35,8 @@ export struct RatesOptions {
 export struct RateResult {
   messageId: int
   /// `interval` (SET_MESSAGE_INTERVAL was acknowledged as accepted), `stream` (REQUEST_DATA_STREAM, which is not
-  /// acknowledged: it is sent, not confirmed) or `none` (neither works for this message).
+  /// acknowledged: it is sent, not confirmed) or `none` (neither works for this message, or the request itself
+  /// failed, as when asking again after a reboot and the connection is broken).
   method: string
   /// Whether the request was accepted or sent.
   ok: bool
@@ -78,6 +83,10 @@ function streamOf(messageId: int): int {
   -1
 }
 
+/// How many times in a row the rates are asked for again after a reboot, when the connection fails or the
+/// vehicle reboots again meanwhile.
+const MAX_PASSES: int = 3
+
 export class TelemetryRates {
   readonly conn: MavLinkConnection
   readonly target: Target
@@ -94,10 +103,21 @@ export class TelemetryRates {
   readonly handlers: ((results: RateResult[]) => void)[] = []
   readonly listener: int
   lastSeen: int = 0
-  /// The vehicle's time_boot_ms at the last message that had one, and when (ms since 1970) that arrived.
-  lastBoot: int = -1
-  lastBootAt: int = 0
-  reapplying: bool = false
+  /// The time_boot_ms of the last message that had one, per component (each has its own clock when the target is
+  /// the whole system), and when (ms since 1970) that arrived.
+  lastBoot: Map<int, int> = new Map<int, int>()
+  lastBootAt: Map<int, int> = new Map<int, int>()
+  /// One request at a time: whoever holds the turn is on the vehicle, the others wait.
+  busy: bool = false
+  waiters: ((value: bool) => void)[] = []
+  /// Asking again after a reboot: waiting for the vehicle to settle, or going through the rates.
+  scheduled: bool = false
+  running: bool = false
+  timer: int = -1
+  /// A reboot or silence was noticed while the rates were being asked again: go through them once more after.
+  again: bool = false
+  /// A request failed with an error (not a refusal) in the pass that is running.
+  hadError: bool = false
   reboots: int = 0
   stopped: bool = false
 
@@ -118,12 +138,14 @@ export class TelemetryRates {
       throw new MavLinkError("INVALID_RATE", `a rate is 0.001 to 1000 Hz, not ${hz}`)
     }
     const intervalUs = Math.round(1_000_000.0 / hz) as int
-    await ask(messageId, if (intervalUs < 1) 1 else intervalUs)
+    wanted.set(messageId, if (intervalUs < 1) 1 else intervalUs)
+    await request(messageId, null)
   }
 
   /// Switches `messageId` off, and holds that.
   public async off(messageId: int): Promise<RateResult> throws Error {
-    await ask(messageId, -1)
+    wanted.set(messageId, -1)
+    await request(messageId, null)
   }
 
   /// Gives `messageId` back to the vehicle's own rate, and stops holding anything for it. Only
@@ -132,6 +154,7 @@ export class TelemetryRates {
     wanted.delete(messageId)
     methods.delete(messageId)
     const r = await request(messageId, 0)
+    methods.delete(messageId)
     r
   }
 
@@ -155,7 +178,8 @@ export class TelemetryRates {
   }
 
   /// Asks for everything held again, one after the other (after a reconnect that the manager could not see,
-  /// say, such as a new connection). Never throws for a rate that fails: that is in its result.
+  /// say, such as a new connection). A rate that fails is in its result, and the others are still asked for.
+  /// Nothing is asked once the manager has been stopped.
   public async reapply(): Promise<RateResult[]> throws Error {
     const results: RateResult[] = []
     const ids: int[] = []
@@ -163,27 +187,80 @@ export class TelemetryRates {
       ids.push(id)
     }
     for (const id of ids) {
-      const interval = wanted.get(id)
-      if (interval != null) {
-        results.push(await request(id, interval!))
+      if (stopped) {
+        break
+      }
+      if (!wanted.has(id)) {
+        continue
+      }
+      try {
+        results.push(await request(id, null))
+      } catch (e: Error) {
+        hadError = true
+        const failed: RateResult = { messageId: id, method: "none", ok: false, result: -1 }
+        results.push(failed)
       }
     }
     results
   }
 
-  /// Stops watching the connection. What was asked for stays asked for, on the vehicle.
+  /// Stops watching the connection, and cancels asking again after a reboot, scheduled or begun (the request
+  /// that is on the vehicle at that moment finishes). What was asked for stays asked for, on the vehicle.
   public stop(): void {
     stopped = true
     conn.off(listener)
+    if (scheduled) {
+      clearTimeout(timer)
+      scheduled = false
+    }
   }
 
-  async ask(messageId: int, intervalUs: int): Promise<RateResult> throws Error {
-    wanted.set(messageId, intervalUs)
-    await request(messageId, intervalUs)
+  /// Takes the turn to talk to the vehicle, waiting behind whoever has it.
+  async acquire(): Promise<void> throws Error {
+    if (!busy) {
+      busy = true
+      return
+    }
+    await new Promise<bool, Error>((resolve: (value: bool) => void, _reject: (error: Error) => void) => {
+      waiters.push(resolve)
+    })
+  }
+
+  /// Hands the turn to the one that has waited longest, or frees it.
+  release(): void {
+    if (waiters.length == 0) {
+      busy = false
+      return
+    }
+    const next = waiters[0]
+    waiters = waiters.slice(1)
+    next(true)
+  }
+
+  /// One request, after those before it. `explicit` is the interval to ask for (0 to give the message back); null
+  /// asks for what is held for it now, which is the latest, however long the request waited for its turn.
+  async request(messageId: int, explicit: int?): Promise<RateResult> throws Error {
+    await acquire()
+    let out: RateResult? = null
+    try {
+      out = await requestNow(messageId, explicit)
+    } catch (e: Error) {
+      release()
+      throw e
+    }
+    release()
+    out!
   }
 
   /// SET_MESSAGE_INTERVAL; or, if the vehicle does not accept it (or does not answer), REQUEST_DATA_STREAM.
-  async request(messageId: int, intervalUs: int): Promise<RateResult> throws Error {
+  async requestNow(messageId: int, explicit: int?): Promise<RateResult> throws Error {
+    const held = explicit ?? wanted.get(messageId)
+    if (held == null) {
+      // Nothing is held for it any more (it was reset while this waited).
+      const nothing: RateResult = { messageId: messageId, method: "none", ok: false, result: -1 }
+      return nothing
+    }
+    const intervalUs = held!
     let result = -1
     try {
       const calls = new CommandCall(conn, target, { timeoutMs: timeoutMs, retries: retries })
@@ -193,18 +270,27 @@ export class TelemetryRates {
       result = -1
     }
     if (result == MavResult.ACCEPTED) {
-      methods.set(messageId, "interval")
-      return { messageId: messageId, method: "interval", ok: true, result: result }
+      remember(messageId, "interval")
+      const accepted: RateResult = { messageId: messageId, method: "interval", ok: true, result: result }
+      return accepted
     }
     const stream = streamOf(messageId)
     if (stream < 0 || intervalUs == 0) {
-      methods.set(messageId, "none")
-      return { messageId: messageId, method: "none", ok: false, result: result }
+      remember(messageId, "none")
+      const none: RateResult = { messageId: messageId, method: "none", ok: false, result: result }
+      return none
     }
     await requestStream(stream)
-    methods.set(messageId, "stream")
+    remember(messageId, "stream")
     const sent: RateResult = { messageId: messageId, method: "stream", ok: true, result: result }
     sent
+  }
+
+  /// How `messageId` was last asked for, kept only while a rate is held for it.
+  remember(messageId: int, method: string): void {
+    if (wanted.has(messageId)) {
+      methods.set(messageId, method)
+    }
   }
 
   /// REQUEST_DATA_STREAM for `stream`, at the highest rate any message held in it needs (off if they are all off).
@@ -260,51 +346,89 @@ export class TelemetryRates {
       return
     }
     const now = Date.now() as int
+    const component = r.packet.header.compid
     const quiet = lastSeen > 0 && now - lastSeen >= silenceMs
     lastSeen = now
     if (quiet) {
       // The clock before a silence says nothing about the one after it: start comparing afresh. Otherwise the
       // vehicle's first message with a boot time, if it comes after one without, would count the same return again.
-      lastBoot = -1
+      lastBoot = new Map<int, int>()
+      lastBootAt = new Map<int, int>()
     }
     const boot = bootTimeOf(r)
     let rebooted = false
     if (boot >= 0) {
-      // Where its clock should be by now if it had not rebooted.
-      if (lastBoot >= 0 && boot + toleranceMs < lastBoot + (now - lastBootAt)) {
+      // Where this component's clock should be by now if it had not rebooted. Each component has a clock of its
+      // own, so one is only compared with itself.
+      const before = lastBoot.get(component)
+      const beforeAt = lastBootAt.get(component)
+      if (before != null && beforeAt != null && boot + toleranceMs < before! + (now - beforeAt!)) {
         rebooted = true
       }
-      lastBoot = boot
-      lastBootAt = now
+      lastBoot.set(component, boot)
+      lastBootAt.set(component, now)
     }
-    if ((quiet || rebooted) && wanted.size > 0) {
+    if (quiet || rebooted) {
       reboots += 1
-      reapplyLater()
-    } else if (quiet || rebooted) {
-      reboots += 1
+      if (wanted.size > 0) {
+        reapplyLater()
+      }
     }
   }
 
-  /// Asks again once the vehicle has had `settleMs` to get ready, unless that is already going to happen.
+  /// Asks again once the vehicle has had `settleMs` to get ready. If that is already waiting, it will cover this
+  /// too; if the rates are being asked for right now, they are gone through once more when that is done.
   reapplyLater(): void {
-    if (reapplying) {
+    if (stopped || scheduled) {
       return
     }
-    reapplying = true
-    setTimeout(() => {
+    if (running) {
+      again = true
+      return
+    }
+    scheduled = true
+    timer = setTimeout(() => {
       this.runReapply()
     }, settleMs)
   }
 
   async runReapply(): Promise<void> {
-    try {
-      const results = await reapply()
+    scheduled = false
+    if (stopped) {
+      return
+    }
+    running = true
+    let passes = 0
+    while (true) {
+      again = false
+      hadError = false
+      let results: RateResult[] = []
+      try {
+        results = await reapply()
+      } catch (e: Error) {
+        hadError = true
+      }
+      if (stopped) {
+        break
+      }
       for (const h of handlers) {
         h(results)
       }
-    } catch (e: Error) {
-      // The connection is gone or the vehicle is not answering: the next reboot or reconnect tries again.
+      passes += 1
+      // Once more if the vehicle restarted again meanwhile, or a request failed (the connection may be coming
+      // back); a few times at most, then the next reboot or reconnect tries again.
+      if (!(again || hadError) || passes >= MAX_PASSES) {
+        break
+      }
+      try {
+        await delay(settleMs)
+      } catch (e: Error) {
+        break
+      }
+      if (stopped) {
+        break
+      }
     }
-    reapplying = false
+    running = false
   }
 }
