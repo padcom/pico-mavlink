@@ -76,14 +76,18 @@ jobs:
         if: ${{ matrix.full }}
         with:
           node-version: 26.9.0
-      # The generated dialects are compared with the committed ones, so this is the version they
-      # were generated from (and that oracle/ pins), not a moving branch.
-      - uses: actions/checkout@v4
+      # The generator's input: the MAVLink XML that mavlink-mappings 1.0.22-20260311 was published
+      # from (the version oracle/ pins). mavlink-mappings doesn't keep it in git: it downloads
+      # mavlink/mavlink's master when it's published. This is the commit that was then, and the
+      # generator refuses a file whose SHA-256 differs.
+      - name: The MAVLink XML the dialects were generated from
         if: ${{ matrix.full }}
-        with:
-          repository: ArduPilot/node-mavlink-mappings
-          ref: 1.0.22-20260311
-          path: mavlink-mappings
+        working-directory: .
+        run: |
+          mkdir -p mavlink-mappings
+          for f in minimal standard common ardupilotmega; do
+            curl -fsSL -o "mavlink-mappings/$f.xml" "https://raw.githubusercontent.com/mavlink/mavlink/79aecd923c8e3bcb97770b8d6f875269fd125021/message_definitions/v1.0/$f.xml"
+          done
       - name: Everything a commit must pass (scripts/check.sh)
         if: ${{ matrix.full }}
         run: |
