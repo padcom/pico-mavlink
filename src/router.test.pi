@@ -35,6 +35,27 @@ class Tap implements ByteStream {
   }
 }
 
+/// A stream whose writes never settle (a TCP peer that vanished with its send buffer full).
+class Stuck implements ByteStream {
+  readonly inner: ByteStream
+
+  constructor(inner: ByteStream) {
+    this.inner = inner
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    inner.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    await new Promise<bool, Error>((_resolve: (value: bool) => void, _reject: (error: Error) => void) => {})
+  }
+
+  public close(): void {
+    inner.close()
+  }
+}
+
 /// A stream whose first write fails, as a transient error would, and whose later ones work.
 class Flaky implements ByteStream {
   readonly inner: ByteStream
@@ -582,13 +603,12 @@ async function aStalledLinkDoesNotHoldUpTheOthers(): Promise<void> throws Error 
     heard += 1
   })
   farQuick.run()
-  // A write goes to every link together: the quick one has the frame while the slow one is still busy.
-  const first = router.write(heartbeatFrame(254, 0))
-  await delay(40)
+  // A write goes to every link together and is done when one has it: the quick one has the frame while the
+  // slow one is still busy with it.
+  await router.write(heartbeatFrame(254, 0))
   expect(heard).toBe(1)
-  await first
-  // Six more, a millisecond apart: the slow link takes one and queues two, the rest are refused; the quick
-  // link, which finishes each at once, takes all.
+  // Six more, a millisecond apart, while the slow link is still on the first: it queues two and refuses the
+  // other four; the quick link, which finishes each at once, takes all.
   const more: Promise<void, Error>[] = []
   for (let i = 1; i <= 6; i++) {
     more.push(router.write(heartbeatFrame(254, i)))
@@ -598,13 +618,77 @@ async function aStalledLinkDoesNotHoldUpTheOthers(): Promise<void> throws Error 
     await m
   }
   await delay(20)
-  expect(`${heard} ${router.skippedWrites()}`).toBe("7 3")
+  expect(`${heard} ${router.skippedWrites()}`).toBe("7 4")
   router.close()
 }
 
 function clampsOptionsThatCouldNotWork(): void throws Error {
-  const router = new MavLinkRouter({ maxRoutesPerLink: 0, maxQueued: -5, maxWaitingWrites: 0 })
-  expect(`${router.maxRoutesPerLink} ${router.maxQueued} ${router.maxWaitingWrites}`).toBe("1 1 1")
+  const router = new MavLinkRouter({ maxRoutesPerLink: 0, maxQueued: -5, maxWaitingWrites: 0, writeTimeoutMs: 0 })
+  expect(`${router.maxRoutesPerLink} ${router.maxQueued} ${router.maxWaitingWrites} ${router.writeTimeoutMs}`).toBe("1 1 1 1")
+}
+
+async function returnsOnceOneLinkTookTheFrame(): Promise<void> throws Error {
+  const stuck = MemoryStream.pair()
+  const good = MemoryStream.pair()
+  const router = new MavLinkRouter({ writeTimeoutMs: 5000 })
+  router.addLink(new Stuck(stuck[0]))
+  router.addLink(good[0])
+  const far = new MavLinkConnection(good[1], { protocol: new MavLinkProtocolV2(2, 1) })
+  let heard = 0
+  far.on((_r: Received) => {
+    heard += 1
+  })
+  far.run()
+  // One link never takes the frame; the other does. The write is done as soon as the healthy link has it,
+  // not after the five seconds the stuck one is given.
+  const started = Date.now() as int
+  await router.write(heartbeatFrame(254, 0))
+  const took = (Date.now() as int) - started
+  await delay(10)
+  expect(`${took < 1000} ${heard}`).toBe("true 1")
+  router.close()
+}
+
+async function fallsBackWhenTheOnlyRouteNeverSettles(): Promise<void> throws Error {
+  const stuck = MemoryStream.pair()
+  const good = MemoryStream.pair()
+  const router = new MavLinkRouter({ writeTimeoutMs: 80 })
+  router.addLink(new Stuck(stuck[0]))
+  router.addLink(good[0])
+  const farStuck = new MavLinkConnection(stuck[1], { protocol: new MavLinkProtocolV2(2, 1) })
+  const farGood = new MavLinkConnection(good[1], { protocol: new MavLinkProtocolV2(5, 1) })
+  const atGood: string[] = []
+  farGood.on((r: Received) => {
+    const m = r.message
+    if (m instanceof ParamRequestRead) {
+      atGood.push(`read for ${m.targetSystem}`)
+    }
+  })
+  farGood.run()
+  // System 2 speaks on the stuck link, so that is its route; a frame for it must not wait there forever.
+  await farStuck.send(new Heartbeat())
+  await delay(20)
+  expect(router.linksTo(2, 1).join(",")).toBe("0")
+  const read = new ParamRequestRead()
+  read.targetSystem = 2
+  read.targetComponent = 1
+  read.paramIndex = 0
+  const started = Date.now() as int
+  await router.write(new MavLinkProtocolV2(254, 1).serialize(read, 0))
+  const took = (Date.now() as int) - started
+  await delay(20)
+  expect(`${took >= 60 && took < 1000} ${atGood.join(",")}`).toBe("true read for 2")
+  // And when nothing takes the frame, the write fails once the time is up instead of hanging.
+  const only = new MavLinkRouter({ writeTimeoutMs: 50 })
+  only.addLink(new Stuck(MemoryStream.pair()[0]))
+  let code = "wrote"
+  try {
+    await only.write(heartbeatFrame(254, 1))
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  expect(code).toBe("NO_LINK")
+  router.close()
 }
 
 async function routesMavlink1AndForwardsSignedFramesUntouched(): Promise<void> throws Error {
@@ -713,6 +797,8 @@ describe("the router", () => {
   it("brings a failed link back when it delivers again", bringsAFailedLinkBackWhenItDeliversAgain)
   it("does not let a stalled link hold up the others, or pile up writes", aStalledLinkDoesNotHoldUpTheOthers)
   it("raises options that could not work to 1", clampsOptionsThatCouldNotWork)
+  it("returns as soon as one link took the frame, though another never settles", returnsOnceOneLinkTookTheFrame)
+  it("falls back to the other links when the only route never settles", fallsBackWhenTheOnlyRouteNeverSettles)
   it("routes MAVLink 1 and forwards signed frames untouched", routesMavlink1AndForwardsSignedFramesUntouched)
   it("writes to a link one frame at a time, in order", writesToALinkOneAtATime)
   it("ends when every link has ended", endsWhenEveryLinkEnds)

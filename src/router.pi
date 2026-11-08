@@ -40,6 +40,9 @@ export struct RouterOptions {
   /// How many writes may wait behind one that has not finished on a link; past that, writes to that link are
   /// refused rather than piled up (default 256; at least 1).
   maxWaitingWrites?: int
+  /// How long `write` waits for a link to take a frame before it tries the others, or gives up (default
+  /// 3000 ms; at least 1). A write that has not settled by then goes on in the background.
+  writeTimeoutMs?: int
   /// The messages whose target fields are looked up (default: `defaultRegistry()`).
   registry?: Registry
 }
@@ -125,6 +128,7 @@ export class MavLinkRouter implements ByteStream {
   public readonly maxRoutesPerLink: int
   public readonly maxQueued: int
   public readonly maxWaitingWrites: int
+  public readonly writeTimeoutMs: int
   readonly registry: Registry
   readonly links: Link[] = []
   /// For each sender (system * 256 + component) heard on some link, the links it was heard on. Which links
@@ -150,6 +154,8 @@ export class MavLinkRouter implements ByteStream {
     this.maxQueued = if (queued < 1) 1 else queued
     const waiting = options.maxWaitingWrites ?? 256
     this.maxWaitingWrites = if (waiting < 1) 1 else waiting
+    const timeout = options.writeTimeoutMs ?? 3000
+    this.writeTimeoutMs = if (timeout < 1) 1 else timeout
     this.registry = options.registry ?? defaultRegistry()
   }
 
@@ -225,6 +231,8 @@ export class MavLinkRouter implements ByteStream {
   public read(): Promise<Uint8Array?, Error> {
     if (head < queue.length) {
       const f = queue[head]
+      // The slot lets go of the frame, so a consumer that does not catch up does not keep consumed frames.
+      queue[head] = EMPTY
       head += 1
       if (head == queue.length) {
         queue = []
@@ -248,31 +256,20 @@ export class MavLinkRouter implements ByteStream {
     const to = addressee(bytes)
     const tried: int[] = []
     let accepted = false
-    // The links are written to together, so a link that is slow does not hold the others up.
     if (to.system != 0) {
-      const sending: Promise<bool>[] = []
       for (const id of reaching(to.system, to.component, Date.now() as int, -1)) {
         tried.push(id)
-        sending.push(sendTo(links[id], bytes))
       }
-      for (const s of sending) {
-        if (await s) {
-          accepted = true
-        }
-      }
+      accepted = await sendToAny(tried, bytes)
     }
     if (!accepted) {
-      const sending: Promise<bool>[] = []
+      const rest: int[] = []
       for (const l of links) {
         if (l.usable() && !tried.includes(l.id)) {
-          sending.push(sendTo(l, bytes))
+          rest.push(l.id)
         }
       }
-      for (const s of sending) {
-        if (await s) {
-          accepted = true
-        }
-      }
+      accepted = await sendToAny(rest, bytes)
     }
     if (!accepted) {
       throw new MavLinkError("NO_LINK", if (links.length == 0) "the router has no links" else "no link took the frame")
@@ -517,6 +514,41 @@ export class MavLinkRouter implements ByteStream {
     } catch (e: Error) {
       return none
     }
+  }
+
+  /// Writes a frame to the links `ids` together. Resolves true as soon as one takes it (the others go on in the
+  /// background), and false when they have all settled without one, or `writeTimeoutMs` has passed: a link whose
+  /// write never settles does not hold the caller up, and cannot stop the caller from trying other links.
+  sendToAny(ids: int[], frame: Uint8Array): Promise<bool, Error> {
+    new Promise<bool, Error>((resolve: (value: bool) => void, _reject: (error: Error) => void) => {
+      if (ids.length == 0) {
+        resolve(false)
+        return
+      }
+      let outstanding = ids.length
+      let decided = false
+      const timer = setTimeout(() => {
+        if (!decided) {
+          decided = true
+          resolve(false)
+        }
+      }, writeTimeoutMs)
+      for (const id of ids) {
+        this.attempt(links[id], frame, (taken: bool) => {
+          outstanding -= 1
+          if (!decided && (taken || outstanding == 0)) {
+            decided = true
+            clearTimeout(timer)
+            resolve(taken)
+          }
+        })
+      }
+    })
+  }
+
+  async attempt(link: Link, frame: Uint8Array, settled: (taken: bool) => void): Promise<void> {
+    const taken = await sendTo(link, frame)
+    settled(taken)
   }
 
   /// Takes the link's turn to write, waiting behind whoever holds it.
