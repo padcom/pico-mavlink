@@ -87,8 +87,10 @@ const first = await new ParamList(conn, { system: 1, component: 1 }, ParamEncodi
 const second = await new ParamList(conn, { system: 2, component: 1 }, ParamEncoding.CCast).run()
 ```
 
-A link that fails to take a frame is marked down (`router.linkInfo()`), and a targeted frame falls back to the
-other links; `write` fails with `NO_LINK` when no link takes a frame. The router sits below the connection and
+A link that fails to take a frame is marked down (`router.linkInfo()`) until it next delivers a frame, and a
+targeted frame falls back to the other links; `write` fails with `NO_LINK` when no link takes a frame. Links are
+written to together, so a slow one does not hold up the others, and a link with `maxWaitingWrites` writes already
+waiting behind a stalled one refuses more. The router sits below the connection and
 does not check signatures: it learns routes from every well-formed frame, signed or not, and passes frames on
 byte for byte. Put a `SigningPolicy` on the connection to refuse what is not signed.
 

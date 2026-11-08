@@ -35,6 +35,32 @@ class Tap implements ByteStream {
   }
 }
 
+/// A stream whose first write fails, as a transient error would, and whose later ones work.
+class Flaky implements ByteStream {
+  readonly inner: ByteStream
+  public failures: int = 1
+
+  constructor(inner: ByteStream) {
+    this.inner = inner
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    inner.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    if (failures > 0) {
+      failures -= 1
+      throw new Error("a hiccup")
+    }
+    await inner.write(bytes)
+  }
+
+  public close(): void {
+    inner.close()
+  }
+}
+
 /// A stream whose writes fail.
 class Broken implements ByteStream {
   readonly inner: ByteStream
@@ -59,12 +85,14 @@ class Broken implements ByteStream {
 /// A stream that writes slowly and notes how many writes were going on at once.
 class Slow implements ByteStream {
   readonly inner: ByteStream
+  readonly ms: int
   public inflight: int = 0
   public peak: int = 0
   public writes: int = 0
 
-  constructor(inner: ByteStream) {
+  constructor(inner: ByteStream, ms: int = 5) {
     this.inner = inner
+    this.ms = ms
   }
 
   public read(): Promise<Uint8Array?, Error> {
@@ -76,7 +104,7 @@ class Slow implements ByteStream {
     if (inflight > peak) {
       peak = inflight
     }
-    await delay(5)
+    await delay(ms)
     await inner.write(bytes)
     writes += 1
     inflight -= 1
@@ -494,6 +522,91 @@ async function dropsTheOldestFramesWhenNobodyReads(): Promise<void> throws Error
   router.close()
 }
 
+async function keepsTheQueueSmallWhenNobodyReads(): Promise<void> throws Error {
+  const l = MemoryStream.pair()
+  const router = new MavLinkRouter({ maxQueued: 3 })
+  router.addLink(l[0])
+  // A hundred times the cap, and nobody reads: what is held stays within twice the cap, not the whole lot.
+  for (let i = 0; i < 300; i++) {
+    await l[1].write(heartbeatFrame(7, i % 256))
+  }
+  await delay(30)
+  expect(`${router.queuedCount()} ${router.queuedSlots() <= 6} ${router.droppedCount()}`).toBe("3 true 297")
+  // And what is left are the newest frames (299 is sequence number 43).
+  const a = await router.read()
+  const b = await router.read()
+  const c = await router.read()
+  expect(`${a![4]} ${b![4]} ${c![4]} ${router.queuedSlots()}`).toBe("41 42 43 0")
+  router.close()
+}
+
+async function bringsAFailedLinkBackWhenItDeliversAgain(): Promise<void> throws Error {
+  const l = MemoryStream.pair()
+  const router = new MavLinkRouter()
+  router.addLink(new Flaky(l[0]))
+  const far = new MavLinkConnection(l[1], { protocol: new MavLinkProtocolV2(2, 1) })
+  let heard = 0
+  far.on((_r: Received) => {
+    heard += 1
+  })
+  far.run()
+  const gcs = new MavLinkConnection(router)
+  gcs.run()
+  // The first write hits a hiccup: the link is down, and with no other link the write fails.
+  let code = "wrote"
+  try {
+    await gcs.send(new Heartbeat())
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  expect(`${code} ${router.linkInfo()[0].up}`).toBe("NO_LINK false")
+  // The link speaks, so it is alive: it is used again, and the frame goes through.
+  await far.send(new Heartbeat())
+  await delay(20)
+  expect(router.linkInfo()[0].up).toBe(true)
+  await gcs.send(new Heartbeat())
+  await delay(20)
+  expect(heard).toBe(1)
+  gcs.close()
+}
+
+async function aStalledLinkDoesNotHoldUpTheOthers(): Promise<void> throws Error {
+  const slow = MemoryStream.pair()
+  const quick = MemoryStream.pair()
+  const router = new MavLinkRouter({ maxWaitingWrites: 2 })
+  router.addLink(new Slow(slow[0], 120))
+  router.addLink(quick[0])
+  const farQuick = new MavLinkConnection(quick[1], { protocol: new MavLinkProtocolV2(2, 1) })
+  let heard = 0
+  farQuick.on((_r: Received) => {
+    heard += 1
+  })
+  farQuick.run()
+  // A write goes to every link together: the quick one has the frame while the slow one is still busy.
+  const first = router.write(heartbeatFrame(254, 0))
+  await delay(40)
+  expect(heard).toBe(1)
+  await first
+  // Six more, a millisecond apart: the slow link takes one and queues two, the rest are refused; the quick
+  // link, which finishes each at once, takes all.
+  const more: Promise<void, Error>[] = []
+  for (let i = 1; i <= 6; i++) {
+    more.push(router.write(heartbeatFrame(254, i)))
+    await delay(1)
+  }
+  for (const m of more) {
+    await m
+  }
+  await delay(20)
+  expect(`${heard} ${router.skippedWrites()}`).toBe("7 3")
+  router.close()
+}
+
+function clampsOptionsThatCouldNotWork(): void throws Error {
+  const router = new MavLinkRouter({ maxRoutesPerLink: 0, maxQueued: -5, maxWaitingWrites: 0 })
+  expect(`${router.maxRoutesPerLink} ${router.maxQueued} ${router.maxWaitingWrites}`).toBe("1 1 1")
+}
+
 async function routesMavlink1AndForwardsSignedFramesUntouched(): Promise<void> throws Error {
   const a = MemoryStream.pair()
   const b = MemoryStream.pair()
@@ -596,6 +709,10 @@ describe("the router", () => {
   it("delivers a repeat of a frame on the same link, a duplicate only on another", deliversARepeatOnTheSameLink)
   it("bounds and expires the senders it remembers", boundsAndExpiresWhatItRemembersOfSenders)
   it("drops the oldest frames when nobody reads", dropsTheOldestFramesWhenNobodyReads)
+  it("keeps the queue small when nobody reads", keepsTheQueueSmallWhenNobodyReads)
+  it("brings a failed link back when it delivers again", bringsAFailedLinkBackWhenItDeliversAgain)
+  it("does not let a stalled link hold up the others, or pile up writes", aStalledLinkDoesNotHoldUpTheOthers)
+  it("raises options that could not work to 1", clampsOptionsThatCouldNotWork)
   it("routes MAVLink 1 and forwards signed frames untouched", routesMavlink1AndForwardsSignedFramesUntouched)
   it("writes to a link one frame at a time, in order", writesToALinkOneAtATime)
   it("ends when every link has ended", endsWhenEveryLinkEnds)

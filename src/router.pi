@@ -33,10 +33,13 @@ export struct RouterOptions {
   /// How long a system stays reachable through a link after it was last heard on it (default 10 s).
   routeTtlMs?: int
   /// How many senders (system and component) the router remembers per link, the least recently heard
-  /// going first (default 256).
+  /// going first (default 256; at least 1).
   maxRoutesPerLink?: int
-  /// How many frames may wait to be read; past that the oldest are dropped (default 4096).
+  /// How many frames may wait to be read; past that the oldest are dropped (default 4096; at least 1).
   maxQueued?: int
+  /// How many writes may wait behind one that has not finished on a link; past that, writes to that link are
+  /// refused rather than piled up (default 256; at least 1).
+  maxWaitingWrites?: int
   /// The messages whose target fields are looked up (default: `defaultRegistry()`).
   registry?: Registry
 }
@@ -62,6 +65,8 @@ class Link {
   public frames: int = 0
   public duplicates: int = 0
   public writeErrors: int = 0
+  /// Writes refused because too many were already waiting behind a stalled one.
+  public skipped: int = 0
   /// The senders heard on it, by (system * 256 + component), in order of when they were last heard.
   public readonly heard: Map<int, int> = new Map<int, int>()
   /// Writes go one at a time: whoever holds the link writes, the others wait their turn.
@@ -104,6 +109,9 @@ function sameBytes(a: Uint8Array, b: Uint8Array): bool {
   true
 }
 
+/// What a dropped slot of the read queue holds.
+const EMPTY: Uint8Array = new Uint8Array(0)
+
 /// Where a frame is addressed (0: everyone).
 struct Addressee {
   system: int
@@ -116,6 +124,7 @@ export class MavLinkRouter implements ByteStream {
   public readonly routeTtlMs: int
   public readonly maxRoutesPerLink: int
   public readonly maxQueued: int
+  public readonly maxWaitingWrites: int
   readonly registry: Registry
   readonly links: Link[] = []
   /// For each sender (system * 256 + component) heard on some link, the links it was heard on. Which links
@@ -135,8 +144,12 @@ export class MavLinkRouter implements ByteStream {
     this.forward = options.forward ?? false
     this.dedupeMs = options.dedupeMs ?? 1000
     this.routeTtlMs = options.routeTtlMs ?? 10_000
-    this.maxRoutesPerLink = options.maxRoutesPerLink ?? 256
-    this.maxQueued = options.maxQueued ?? 4096
+    const routes = options.maxRoutesPerLink ?? 256
+    this.maxRoutesPerLink = if (routes < 1) 1 else routes
+    const queued = options.maxQueued ?? 4096
+    this.maxQueued = if (queued < 1) 1 else queued
+    const waiting = options.maxWaitingWrites ?? 256
+    this.maxWaitingWrites = if (waiting < 1) 1 else waiting
     this.registry = options.registry ?? defaultRegistry()
   }
 
@@ -180,6 +193,25 @@ export class MavLinkRouter implements ByteStream {
     dropped
   }
 
+  /// How many frames wait to be read.
+  public queuedCount(): int {
+    queue.length - head
+  }
+
+  /// How many slots the read queue holds in memory (the frames waiting, plus dropped ones not yet compacted).
+  public queuedSlots(): int {
+    queue.length
+  }
+
+  /// How many writes were refused because a link had too many waiting behind a stalled write.
+  public skippedWrites(): int {
+    let n = 0
+    for (const l of links) {
+      n += l.skipped
+    }
+    n
+  }
+
   /// How many senders are remembered, over all links.
   public routeCount(): int {
     let n = 0
@@ -210,26 +242,35 @@ export class MavLinkRouter implements ByteStream {
 
   /// Sends a frame on the links that reach its target; on all of them when it is a broadcast or the target has
   /// not been heard yet; and on the others when the ones that reach it fail. A link that fails to take a frame
-  /// is marked down and left alone from then on. A `NO_LINK` MavLinkError when no link took the frame, or there
-  /// is none.
+  /// is marked down and left alone until it next delivers a frame. A `NO_LINK` MavLinkError when no link took
+  /// the frame, or there is none.
   public async write(bytes: Uint8Array): Promise<void> throws Error {
     const to = addressee(bytes)
     const tried: int[] = []
     let accepted = false
+    // The links are written to together, so a link that is slow does not hold the others up.
     if (to.system != 0) {
+      const sending: Promise<bool>[] = []
       for (const id of reaching(to.system, to.component, Date.now() as int, -1)) {
         tried.push(id)
-        if (await sendTo(links[id], bytes)) {
+        sending.push(sendTo(links[id], bytes))
+      }
+      for (const s of sending) {
+        if (await s) {
           accepted = true
         }
       }
     }
     if (!accepted) {
+      const sending: Promise<bool>[] = []
       for (const l of links) {
         if (l.usable() && !tried.includes(l.id)) {
-          if (await sendTo(l, bytes)) {
-            accepted = true
-          }
+          sending.push(sendTo(l, bytes))
+        }
+      }
+      for (const s of sending) {
+        if (await s) {
+          accepted = true
         }
       }
     }
@@ -303,6 +344,8 @@ export class MavLinkRouter implements ByteStream {
     const p = packet!
     const h = p.header
     link.frames += 1
+    // A link that delivers a frame is alive: one failed write (a transient error) does not keep it down.
+    link.failed = false
     hear(link, h.sysid * 256 + h.compid, now)
     forget(now)
     const key = `${h.sysid}/${h.compid}/${h.seq}/${h.msgid}/${p.crc}`
@@ -321,8 +364,15 @@ export class MavLinkRouter implements ByteStream {
       w!(frame)
     } else {
       if (queue.length - head >= maxQueued) {
+        // The oldest goes: its slot is emptied so the frame can be freed, and the array is compacted once
+        // as many slots as the cap are dead, so memory stays under twice the cap.
+        queue[head] = EMPTY
         head += 1
         dropped += 1
+        if (head >= maxQueued) {
+          queue = queue.slice(head)
+          head = 0
+        }
       }
       queue.push(frame)
     }
@@ -494,6 +544,11 @@ export class MavLinkRouter implements ByteStream {
   /// Writes a frame to a link, after those before it; whether the link took it. A link that does not is
   /// marked failed.
   async sendTo(link: Link, frame: Uint8Array): Promise<bool> {
+    if (link.busy && link.waiters.length >= maxWaitingWrites) {
+      // A write on this link has stalled and others are queued behind it: not one more.
+      link.skipped += 1
+      return false
+    }
     try {
       await acquire(link)
     } catch (e: Error) {
