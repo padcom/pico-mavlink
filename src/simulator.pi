@@ -12,7 +12,7 @@ import { MavLinkProtocolV2 } from "./protocol"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam } from "./params"
 import { ByteStream } from "./stream"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, CommandAck, CommandLong, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus } from "./dialects/common"
+import { Attitude, CommandAck, CommandLong, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
 
 /// One parameter of the simulated vehicle.
@@ -56,6 +56,12 @@ export class SimulatedAutopilot {
   public answersVersion: bool = true
   /// Whether it answers SET_MESSAGE_INTERVAL with UNSUPPORTED (a vehicle that only has data streams).
   public rejectIntervals: bool = false
+  /// Whether SYS_STATUS and ATTITUDE come at each tick when nothing was asked for them (the default). Set it to
+  /// false for an ArduPilot on a new link, which sends only heartbeats until it is asked, and forgets what it was
+  /// asked when it reboots.
+  public streaming: bool = true
+  /// How many times SYSTEM_TIME was asked for with MAV_CMD_REQUEST_MESSAGE.
+  public systemTimeRequests: int = 0
   /// The intervals it was asked for, by message id: milliseconds between messages, -1 for off. A message
   /// with none comes at each tick.
   public readonly intervals: Map<int, int> = new Map<int, int>()
@@ -198,13 +204,20 @@ export class SimulatedAutopilot {
     h.systemStatus = (if (armed) MavState.ACTIVE else MavState.STANDBY) as u8
     h.mavlinkVersion = 3
     conn.send(h)
-    if (!intervals.has(SysStatus.MSG_ID)) {
+    if (streaming && !intervals.has(SysStatus.MSG_ID)) {
       sendStatus()
     }
-    if (!intervals.has(Attitude.MSG_ID)) {
+    if (streaming && !intervals.has(Attitude.MSG_ID)) {
       sendAttitude()
     }
     ticks += 1
+  }
+
+  sendSystemTime(): void {
+    const t = new SystemTime()
+    t.timeUnixUsec = (Date.now() as int * 1000) as u64
+    t.timeBootMs = ((Date.now() as int) - bootedAt) as u32
+    conn.send(t)
   }
 
   handle(r: Received): void {
@@ -218,6 +231,15 @@ export class SimulatedAutopilot {
       }
       const wants = (m.command as int == MavCmd.REQUEST_MESSAGE && m._param1 as int == AutopilotVersion.MSG_ID)
         || m.command as int == MavCmd.REQUEST_AUTOPILOT_CAPABILITIES
+      if (m.command as int == MavCmd.REQUEST_MESSAGE && m._param1 as int == SystemTime.MSG_ID) {
+        systemTimeRequests += 1
+        const ack = new CommandAck()
+        ack.command = m.command
+        ack.result = MavResult.ACCEPTED as u8
+        conn.send(ack)
+        sendSystemTime()
+        return
+      }
       if (m.command as int == MavCmd.SET_MESSAGE_INTERVAL) {
         // Honoured for the two messages it sends on its own, unless it is set to refuse.
         const id = m._param1 as int

@@ -116,7 +116,9 @@ rates.onReapplied((results) => println(`asked again for ${results.length} rates`
 did not, so the message's `REQUEST_DATA_STREAM` group was asked for instead; a group has one rate, the highest any
 message held in it needs, and that request is not acknowledged), or `none` (the message is in no stream). A reboot is
 seen when the vehicle's `time_boot_ms` goes back, a reconnect when it was silent for `silenceMs` (5 s) and speaks
-again; the rates are then asked for again after `settleMs`, and once more if the vehicle restarts again meanwhile
+again. A vehicle that restarts without its link going down only goes on sending heartbeats, which say nothing of how
+long it has been up, and forgets the very messages that would (ATTITUDE, say); so while the manager holds a rate it
+asks for `SYSTEM_TIME` every `watchMs` (2 s; 0 turns this off), and its `time_boot_ms` gives the restart away; the rates are then asked for again after `settleMs`, and once more if the vehicle restarts again meanwhile
 or a request fails (up to three passes). Requests go to the vehicle one at a time, because an acknowledgement names
 its command and not the request. `stop()` cancels asking again, scheduled or begun, so a stopped manager cannot undo
 the rates of one that replaced it. When the link itself is replaced (a SITL restarted and

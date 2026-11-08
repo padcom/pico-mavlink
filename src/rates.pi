@@ -16,7 +16,7 @@ import { MavLinkConnection, Received } from "./connection"
 import { MavLinkError } from "./protocol"
 import { CommandCall, Target } from "./operations"
 import { readU32 } from "./bytes"
-import { MavResult, RequestDataStream } from "./dialects/common"
+import { CommandLong, MavCmd, MavResult, RequestDataStream, SystemTime } from "./dialects/common"
 
 export struct RatesOptions {
   /// How long a vehicle may say nothing before its next message counts as a reconnect (default 5000 ms).
@@ -29,6 +29,11 @@ export struct RatesOptions {
   retries?: int
   /// How far behind its own clock a vehicle's time_boot_ms may be before that is taken as a reboot (default 250 ms).
   toleranceMs?: int
+  /// How often, while the manager holds a rate, to ask the vehicle for SYSTEM_TIME (default 2000 ms; 0 never). A
+  /// vehicle that restarts without its link going down goes on sending heartbeats, which say nothing of how long it
+  /// has been up, and the messages that do (ATTITUDE, say) are the ones it forgot to send; SYSTEM_TIME asked for once
+  /// is not forgotten, and its time_boot_ms gives the restart away.
+  watchMs?: int
 }
 
 /// How one rate was asked for.
@@ -95,6 +100,7 @@ export class TelemetryRates {
   readonly timeoutMs: int
   readonly retries: int
   readonly toleranceMs: int
+  readonly watchMs: int
   /// message id -> interval in microseconds (-1: off), in the order they were asked for.
   readonly wanted: Map<int, int> = new Map<int, int>()
   readonly methods: Map<int, string> = new Map<int, string>()
@@ -114,6 +120,8 @@ export class TelemetryRates {
   scheduled: bool = false
   running: bool = false
   timer: int = -1
+  /// The timer that asks for SYSTEM_TIME while something is held, or -1.
+  watcher: int = -1
   /// A reboot or silence was noticed while the rates were being asked again: go through them once more after.
   again: bool = false
   /// A request failed with an error (not a refusal) in the pass that is running.
@@ -129,6 +137,7 @@ export class TelemetryRates {
     this.timeoutMs = options.timeoutMs ?? 500
     this.retries = options.retries ?? 2
     this.toleranceMs = options.toleranceMs ?? 250
+    this.watchMs = options.watchMs ?? 2000
     this.listener = conn.on((r: Received) => this.seen(r))
   }
 
@@ -139,12 +148,14 @@ export class TelemetryRates {
     }
     const intervalUs = Math.round(1_000_000.0 / hz) as int
     wanted.set(messageId, if (intervalUs < 1) 1 else intervalUs)
+    startWatching()
     await request(messageId, null)
   }
 
   /// Switches `messageId` off, and holds that.
   public async off(messageId: int): Promise<RateResult> throws Error {
     wanted.set(messageId, -1)
+    startWatching()
     await request(messageId, null)
   }
 
@@ -153,6 +164,9 @@ export class TelemetryRates {
   public async reset(messageId: int): Promise<RateResult> throws Error {
     wanted.delete(messageId)
     methods.delete(messageId)
+    if (wanted.size == 0) {
+      stopWatching()
+    }
     const r = await request(messageId, 0)
     methods.delete(messageId)
     r
@@ -209,9 +223,44 @@ export class TelemetryRates {
   public stop(): void {
     stopped = true
     conn.off(listener)
+    stopWatching()
     if (scheduled) {
       clearTimeout(timer)
       scheduled = false
+    }
+  }
+
+  /// While something is held, asks for SYSTEM_TIME every `watchMs`, so a restart that leaves the link up is seen.
+  startWatching(): void {
+    if (watchMs > 0 && watcher < 0 && !stopped) {
+      watcher = setInterval(() => {
+        this.poll()
+      }, watchMs)
+    }
+  }
+
+  stopWatching(): void {
+    if (watcher >= 0) {
+      clearInterval(watcher)
+      watcher = -1
+    }
+  }
+
+  /// MAV_CMD_REQUEST_MESSAGE for SYSTEM_TIME, sent without waiting for the answer: the SYSTEM_TIME that comes back
+  /// goes through `seen` like any message, and its time_boot_ms is compared with the vehicle's clock.
+  async poll(): Promise<void> {
+    if (stopped || wanted.size == 0) {
+      return
+    }
+    const c = new CommandLong()
+    c.targetSystem = target.system as u8
+    c.targetComponent = target.component as u8
+    c.command = MavCmd.REQUEST_MESSAGE as u16
+    c._param1 = SystemTime.MSG_ID as f32
+    try {
+      await conn.send(c)
+    } catch (e: Error) {
+      // The link is down; the silence will be noticed when it comes back.
     }
   }
 

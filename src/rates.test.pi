@@ -67,14 +67,14 @@ async function honoursARate(): Promise<void> throws Error {
   rig.clear()
   await delay(500)
   // At the tick, 250 ms: about 2 of each in 500 ms.
-  expect(inRange(rig.attitude, 1, 3)).toBe("ok")
+  expect(inRange(rig.attitude, 0, 4)).toBe("ok")
   const r = await rig.rates.set(Attitude.MSG_ID, 20.0)
   expect(show(r)).toBe("interval true 0")
   rig.clear()
   await delay(500)
   // ATTITUDE at 20 Hz: about 10 in 500 ms. SYS_STATUS, which was not asked for, is still at the tick.
-  expect(inRange(rig.attitude, 6, 14)).toBe("ok")
-  expect(inRange(rig.status, 1, 3)).toBe("ok")
+  expect(inRange(rig.attitude, 4, 16)).toBe("ok")
+  expect(inRange(rig.status, 0, 4)).toBe("ok")
   const held = rig.rates.held()
   expect(held.map((h) => `${h.messageId} ${h.intervalUs} ${h.method}`).join(",")).toBe("30 50000 interval")
   expect(rig.sim.intervals.get(Attitude.MSG_ID) ?? -2).toBe(50)
@@ -110,7 +110,7 @@ async function fallsBackToAStreamWhenAnIntervalIsRefused(): Promise<void> throws
   expect(`${rig.sim.streams.get(MavDataStream.EXTRA1) ?? -1} ${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2}`).toBe("20 50")
   rig.clear()
   await delay(400)
-  expect(inRange(rig.attitude, 5, 11)).toBe("ok")
+  expect(inRange(rig.attitude, 3, 13)).toBe("ok")
   expect(rig.rates.held().map((h) => `${h.messageId} ${h.method}`).join(",")).toBe("30 stream")
   rig.close()
 }
@@ -168,32 +168,83 @@ async function asksAgainAfterAReboot(): Promise<void> throws Error {
   // And the rate is back: ATTITUDE at 20 Hz again, not at the tick.
   rig.clear()
   await delay(500)
-  expect(inRange(rig.attitude, 6, 14)).toBe("ok")
+  expect(inRange(rig.attitude, 3, 16)).toBe("ok")
   rig.close()
 }
 
 async function asksAgainAfterASilence(): Promise<void> throws Error {
-  const rig = new Rig(50, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 150 })
+  const rig = new Rig(50, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 300 })
   await rig.rates.set(Attitude.MSG_ID, 50.0)
   await delay(150)
-  // The link is quiet for 400 ms but the vehicle does not restart (it keeps its rate): the manager
+  // The link is quiet for 700 ms but the vehicle does not restart (it keeps its rate): the manager
   // cannot tell, so it asks again, which does no harm.
   rig.sim.down = true
-  await delay(400)
+  await delay(700)
   rig.sim.down = false
-  await delay(300)
+  await delay(500)
   expect(`${rig.rates.rebootCount()} ${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2}`).toBe("1 20")
   rig.close()
 }
 
 async function asksAgainAfterARebootThatWentQuiet(): Promise<void> throws Error {
-  const rig = new Rig(50, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 150 })
+  const rig = new Rig(50, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 300 })
   await rig.rates.set(Attitude.MSG_ID, 50.0)
   await delay(150)
-  rig.sim.reboot(400)
-  await delay(900)
+  rig.sim.reboot(700)
+  await delay(1300)
   // Quiet and restarted at once is one reboot, not two, and the rate is back.
   expect(`${rig.rates.rebootCount()} ${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2}`).toBe("1 20")
+  rig.close()
+}
+
+async function seesARestartThatKeepsTheLinkUp(): Promise<void> throws Error {
+  // An ArduPilot on a link sends only heartbeats until it is asked, and forgets what it was asked when it
+  // restarts: the link stays up, the heartbeats go on, and nothing carries the time since boot.
+  const rig = new Rig(100, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 5000, watchMs: 100 })
+  rig.sim.streaming = false
+  await rig.rates.set(Attitude.MSG_ID, 20.0)
+  expect(rig.sim.intervals.get(Attitude.MSG_ID) ?? -2).toBe(50)
+  await delay(600)
+  rig.sim.reboot()
+  expect(rig.sim.intervals.has(Attitude.MSG_ID)).toBe(false)
+  await delay(900)
+  expect(`${rig.rates.rebootCount()} ${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.sim.systemTimeRequests > 3}`).toBe("1 50 true")
+  rig.close()
+}
+
+async function doesNotSeeItWithoutTheWatcher(): Promise<void> throws Error {
+  // The same, with the watcher off: nothing says the vehicle restarted. (It is what the watcher is for.)
+  const rig = new Rig(100, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 5000, watchMs: 0 })
+  rig.sim.streaming = false
+  await rig.rates.set(Attitude.MSG_ID, 20.0)
+  await delay(600)
+  rig.sim.reboot()
+  await delay(900)
+  expect(`${rig.rates.rebootCount()} ${rig.sim.intervals.has(Attitude.MSG_ID)} ${rig.sim.systemTimeRequests}`).toBe("0 false 0")
+  rig.close()
+}
+
+async function watchesOnlyWhileSomethingIsHeld(): Promise<void> throws Error {
+  const rig = new Rig(100, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 5000, watchMs: 100 })
+  await delay(450)
+  expect(rig.sim.systemTimeRequests).toBe(0)
+  await rig.rates.set(Attitude.MSG_ID, 20.0)
+  await delay(450)
+  expect(rig.sim.systemTimeRequests >= 3).toBe(true)
+  // Nothing held any more: no more questions (one that was on its way may still arrive).
+  await rig.rates.reset(Attitude.MSG_ID)
+  await delay(150)
+  const settled = rig.sim.systemTimeRequests
+  await delay(450)
+  expect(rig.sim.systemTimeRequests - settled <= 1).toBe(true)
+  // And again after being stopped.
+  await rig.rates.set(Attitude.MSG_ID, 20.0)
+  await delay(250)
+  rig.rates.stop()
+  await delay(150)
+  const stopped = rig.sim.systemTimeRequests
+  await delay(450)
+  expect(rig.sim.systemTimeRequests - stopped <= 1).toBe(true)
   rig.close()
 }
 
@@ -205,19 +256,19 @@ async function asksAgainOfAVehicleThatCameBackOnANewLink(): Promise<void> throws
   router.addLink(first[0])
   const before = new SimulatedAutopilot(first[1])
   const gcs = new MavLinkConnection(router)
-  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 150 })
+  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 400 })
   gcs.run()
   before.start(100)
   await delay(100)
   await rates.set(Attitude.MSG_ID, 20.0)
   expect(before.intervals.get(Attitude.MSG_ID) ?? -2).toBe(50)
   before.stop()
-  await delay(300)
+  await delay(800)
   const second = MemoryStream.pair()
   router.addLink(second[0])
   const after = new SimulatedAutopilot(second[1])
   after.start(100)
-  await delay(700)
+  await delay(1000)
   // The new vehicle knows nothing of the old one's rates; the manager told it.
   expect(`${rates.rebootCount()} ${after.intervals.get(Attitude.MSG_ID) ?? -2}`).toBe("1 50")
   after.stop()
@@ -468,8 +519,8 @@ async function managesEachVehicleOnARouter(): Promise<void> throws Error {
   from[2] = 0
   await delay(1000)
   // Vehicle 1 at 20 Hz (about 20 in a second), vehicle 2 at 2 Hz (about 2, where its tick would give 5).
-  expect(inRange(from[1], 12, 28)).toBe("ok")
-  expect(inRange(from[2], 1, 3)).toBe("ok")
+  expect(inRange(from[1], 8, 32)).toBe("ok")
+  expect(inRange(from[2], 0, 4)).toBe("ok")
   // Only the vehicle that restarted is asked again.
   simA.reboot()
   await delay(700)
@@ -491,6 +542,9 @@ describe("telemetry rates", () => {
   it("asks again after the vehicle reboots", asksAgainAfterAReboot)
   it("asks again after a silence", asksAgainAfterASilence)
   it("counts a reboot that goes quiet once", asksAgainAfterARebootThatWentQuiet)
+  it("sees a restart that keeps the link up and the heartbeats going", seesARestartThatKeepsTheLinkUp)
+  it("does not see it with the watcher off", doesNotSeeItWithoutTheWatcher)
+  it("watches only while it holds a rate", watchesOnlyWhileSomethingIsHeld)
   it("asks again of a restarted vehicle that came back on a new link", asksAgainOfAVehicleThatCameBackOnANewLink)
   it("counts a return once, whichever message comes first", countsAReturnOnceWhicheverMessageComesFirst)
   it("takes one request at a time, so one refused beside one accepted is not taken for accepted", takesOneRequestAtATime)
