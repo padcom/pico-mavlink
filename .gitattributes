@@ -1,0 +1,2 @@
+# LF everywhere: `pico fmt --check` sees CRLF as unformatted, and Windows checkouts would convert.
+* text=auto eol=lf

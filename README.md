@@ -69,10 +69,6 @@ Two dialects share some class names: ardupilotmega's `SIMSTATE` and its `MAV_CMD
 clash with common's. The package exports the later ones with the dialect's name as a prefix
 (`ArdupilotmegaSimState`, `ArdupilotmegaMavCmd`).
 
-The tests narrow decoded messages with `instanceof`, which needs pico-lang PR
-[#103](https://github.com/padcom/pico-lang/pull/103) (#102). Until it's released, use a pico
-built with it; pico 0.4.2 has everything else.
-
 The design is in [docs/design.md](docs/design.md).
 
 ## Development
