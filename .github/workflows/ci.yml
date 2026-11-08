@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PICO_VERSION: 0.4.3
+
+jobs:
+  ci:
+    name: ${{ matrix.target }}${{ matrix.full && ' (all of check.sh)' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, runner: ubuntu-24.04 }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm, full: true }
+          - { target: macos-arm64, runner: macos-15 }
+          - { target: windows-x64, runner: windows-2025 }
+          - { target: windows-arm64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Explicitly bash, which GitHub runs with -eo pipefail: a failing test isn't hidden by tee.
+        shell: bash
+        working-directory: pico/pico-mavlink
+    steps:
+      # The layout the tests and check.sh expect: node-mavlink and mavlink-mappings two levels up.
+      - uses: actions/checkout@v4
+        with:
+          path: pico/pico-mavlink
+      # The tests read node-mavlink's sample captures. 2.3.0 is the version oracle/ pins.
+      - uses: actions/checkout@v4
+        with:
+          repository: ArduPilot/node-mavlink
+          ref: 2.3.0
+          path: node-mavlink
+
+      - name: Install the pinned Pico
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Fails the job if the release is missing: nothing below is optional.
+        run: |
+          v=$PICO_VERSION
+          case "${{ matrix.target }}" in windows-*) archive=zip ;; *) archive=tar.gz ;; esac
+          gh release download "v$v" -R padcom/pico-lang -p "pico-$v-${{ matrix.target }}.$archive" -D "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/pico"
+          if [ "$archive" = zip ]; then
+            unzip -q "$RUNNER_TEMP/pico-$v-${{ matrix.target }}.zip" -d "$RUNNER_TEMP/pico"
+            cygpath -w "$(dirname "$(find "$RUNNER_TEMP/pico" -type f -name pico.exe | head -1)")" >> "$GITHUB_PATH"
+          else
+            tar -xzf "$RUNNER_TEMP/pico-$v-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP/pico"
+            dirname "$(find "$RUNNER_TEMP/pico" -type f -name pico -perm -u+x | head -1)" >> "$GITHUB_PATH"
+          fi
+
+      - name: Format and lint (the hand-written code; the dialects keep mavlink-mappings' names)
+        if: ${{ !matrix.full }}
+        run: |
+          pico --version
+          pico fmt --check index.pi src/*.pi spike
+          pico lint index.pi src/*.pi spike
+      - name: Tests
+        if: ${{ !matrix.full }}
+        run: |
+          pico test . | tee "$RUNNER_TEMP/test.log"
+          bash .github/tests-ran.sh "$RUNNER_TEMP/test.log"
+
+      # check.sh does format, lint and tests too, so they aren't repeated on this job.
+      - uses: actions/setup-node@v4
+        if: ${{ matrix.full }}
+        with:
+          node-version: 26.9.0
+      # The generated dialects are compared with the committed ones, so this is the version they
+      # were generated from (and that oracle/ pins), not a moving branch.
+      - uses: actions/checkout@v4
+        if: ${{ matrix.full }}
+        with:
+          repository: ArduPilot/node-mavlink-mappings
+          ref: 1.0.22-20260311
+          path: mavlink-mappings
+      - name: Everything a commit must pass (scripts/check.sh)
+        if: ${{ matrix.full }}
+        run: |
+          (cd generator && npm ci)
+          (cd oracle && npm ci)
+          scripts/check.sh | tee "$RUNNER_TEMP/test.log"
+          bash .github/tests-ran.sh "$RUNNER_TEMP/test.log"
