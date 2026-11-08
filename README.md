@@ -34,6 +34,9 @@ Status: **in development (MV1).**
   and unheard targets go to all), and can forward between links by the MAVLink routing rules.
   Operations already match replies by target system and component, so more than one vehicle on a
   connection works.
+- **Done:** `TelemetryRates`: the rate of each message, asked for in one place and held. It uses
+  `MAV_CMD_SET_MESSAGE_INTERVAL`, falls back to `REQUEST_DATA_STREAM` where the vehicle refuses or does not
+  answer, and asks again for everything after the vehicle reboots or comes back after a silence.
 - **Next:** ArduPilot SITL over UDP/TCP (MV2).
 
 ```pico
@@ -96,6 +99,33 @@ late (a stale arm or mode change must not reach a vehicle), and a link still stu
 next delivers a frame. A link with `maxWaitingWrites` writes already waiting behind a stalled one refuses more. The router sits below the connection and
 does not check signatures: it learns routes from every well-formed frame, signed or not, and passes frames on
 byte for byte. Put a `SigningPolicy` on the connection to refuse what is not signed.
+
+Telemetry rates. ArduPilot sends almost nothing on a new link until it is asked, so ask, and let the manager keep
+asking after the vehicle restarts:
+
+```pico
+conn.run()
+const rates = new TelemetryRates(conn, { system: 1, component: 1 })
+await rates.set(30, 10.0)   // ATTITUDE, 10 Hz
+await rates.set(1, 2.0)     // SYS_STATUS, 2 Hz
+await rates.off(74)         // VFR_HUD, off
+rates.onReapplied((results) => println(`asked again for ${results.length} rates`))
+```
+
+`set` returns how the rate was asked for: `interval` (the vehicle accepted `SET_MESSAGE_INTERVAL`), `stream` (it
+did not, so the message's `REQUEST_DATA_STREAM` group was asked for instead; a group has one rate, the highest any
+message held in it needs, and that request is not acknowledged), or `none` (the message is in no stream). A reboot is
+seen when the vehicle's `time_boot_ms` goes back, a reconnect when it was silent for `silenceMs` (5 s) and speaks
+again. A vehicle that restarts without its link going down only goes on sending heartbeats, which say nothing of how
+long it has been up, and forgets the very messages that would (ATTITUDE, say); so while the manager holds a rate it
+asks for `SYSTEM_TIME` every `watchMs` (2 s; 0 turns this off), and its `time_boot_ms` gives the restart away; the rates are then asked for again after `settleMs`, and once more if the vehicle restarts again meanwhile
+or a request fails (up to three passes). Requests go to the vehicle one at a time, because an acknowledgement names
+its command and not the request. `stop()` cancels asking again, scheduled or begun, so a stopped manager cannot undo
+the rates of one that replaced it. When the link itself is replaced (a SITL restarted and
+connected to again), put the connection on a `MavLinkRouter` with `keepOpen: true` and add the new link to it: the
+connection and the manager go on, and the manager sees the vehicle come back. Against ArduCopter SITL, rates of 10, 2
+and 4 Hz for ATTITUDE, SYS_STATUS and VFR_HUD were measured at 10, 2 and 4 Hz, and again after the SITL was
+restarted. `SimulatedAutopilot` honours intervals too, but its timers do not go faster than about 25 Hz.
 
 Signing, as the sender and as the receiver:
 

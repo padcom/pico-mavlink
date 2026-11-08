@@ -28,6 +28,10 @@ import { byteAt } from "./bytes"
 export struct RouterOptions {
   /// Pass what one link delivers on to the others (default false).
   forward?: bool
+  /// Go on reading when every link has ended, until `close()` (default false: reads end then). For an application
+  /// that adds a new link when one drops (a vehicle that restarted, a cable put back): the connection on the router
+  /// keeps running, and so do the operations on it.
+  keepOpen?: bool
   /// How long a delivered frame is remembered, to drop its duplicate from another link (default 1000 ms).
   dedupeMs?: int
   /// How long a system stays reachable through a link after it was last heard on it (default 10 s).
@@ -125,6 +129,7 @@ struct Addressee {
 
 export class MavLinkRouter implements ByteStream {
   public readonly forward: bool
+  public readonly keepOpen: bool
   public readonly dedupeMs: int
   public readonly routeTtlMs: int
   public readonly maxRoutesPerLink: int
@@ -148,6 +153,7 @@ export class MavLinkRouter implements ByteStream {
 
   constructor(options: RouterOptions = {}) {
     this.forward = options.forward ?? false
+    this.keepOpen = options.keepOpen ?? false
     this.dedupeMs = options.dedupeMs ?? 1000
     this.routeTtlMs = options.routeTtlMs ?? 10_000
     const routes = options.maxRoutesPerLink ?? 256
@@ -301,7 +307,7 @@ export class MavLinkRouter implements ByteStream {
     if (closed) {
       return true
     }
-    if (links.length == 0) {
+    if (links.length == 0 || keepOpen) {
       return false
     }
     for (const l of links) {

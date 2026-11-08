@@ -1,13 +1,18 @@
 // A simulated autopilot: a vehicle on the far end of a byte stream, for trying an application (or
 // testing it) without hardware or SITL. It's ArduPilot Copter-like: system 1, component 1,
 // C-cast parameters, HEARTBEAT, SYS_STATUS and ATTITUDE once a second (or as fast as asked), and it
-// answers PARAM_REQUEST_LIST, PARAM_REQUEST_READ and PARAM_SET. Its data is deterministic.
+// answers PARAM_REQUEST_LIST, PARAM_REQUEST_READ and PARAM_SET. Its data is deterministic, except the time
+// since boot in ATTITUDE, which is real time.
+//
+// SYS_STATUS and ATTITUDE come at each tick unless MAV_CMD_SET_MESSAGE_INTERVAL (or REQUEST_DATA_STREAM for
+// their streams, EXTENDED_STATUS and EXTRA1) gave them a rate of their own, which it then keeps until it
+// reboots (`reboot()` forgets every rate, restarts the clock and can go quiet for a while).
 import { MavLinkConnection, Received } from "./connection"
 import { MavLinkProtocolV2 } from "./protocol"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam } from "./params"
 import { ByteStream } from "./stream"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, CommandAck, CommandLong, MavCmd, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, SysStatus } from "./dialects/common"
+import { Attitude, CommandAck, CommandLong, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
 
 /// One parameter of the simulated vehicle.
@@ -49,11 +54,34 @@ export class SimulatedAutopilot {
   public rounding: string[] = []
   /// Whether it answers requests for AUTOPILOT_VERSION (an old autopilot may not).
   public answersVersion: bool = true
+  /// Whether it answers SET_MESSAGE_INTERVAL with UNSUPPORTED (a vehicle that only has data streams).
+  public rejectIntervals: bool = false
+  /// Whether SYS_STATUS and ATTITUDE come at each tick when nothing was asked for them (the default). Set it to
+  /// false for an ArduPilot on a new link, which sends only heartbeats until it is asked, and forgets what it was
+  /// asked when it reboots.
+  public streaming: bool = true
+  /// How many times SYSTEM_TIME was asked for with MAV_CMD_REQUEST_MESSAGE.
+  public systemTimeRequests: int = 0
+  /// The intervals it was asked for, by message id: milliseconds between messages, -1 for off. A message
+  /// with none comes at each tick.
+  public readonly intervals: Map<int, int> = new Map<int, int>()
+  /// The stream rates it was asked for (Hz), by MAV_DATA_STREAM id; 0 for a stream that was stopped.
+  public readonly streams: Map<int, int> = new Map<int, int>()
+  /// How many times it has rebooted.
+  public reboots: int = 0
   timer: int = -1
+  /// The timer that ends a reboot's quiet time.
+  downTimer: int = -1
+  /// One timer per message that has an interval of its own.
+  readonly timers: Map<int, int> = new Map<int, int>()
+  bootedAt: int = 0
+  /// Whether it is quiet (after a reboot, or set by hand): it sends nothing and hears nothing.
+  public down: bool = false
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
     this.compid = compid
+    this.bootedAt = Date.now() as int
     this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(sysid, compid) })
     this.params = params
     conn.on((r: Received) => this.handle(r))
@@ -83,10 +111,90 @@ export class SimulatedAutopilot {
 
   public stop(): void {
     clearInterval(timer)
+    clearTimeout(downTimer)
+    stopTimers()
     conn.close()
   }
 
+  /// Reboots: every rate it was asked for is forgotten, the clock starts again and, for `downMs`, it says and
+  /// hears nothing (a link that is down while the autopilot starts).
+  public reboot(downMs: int = 0): void {
+    stopTimers()
+    intervals.delete(SysStatus.MSG_ID)
+    intervals.delete(Attitude.MSG_ID)
+    streams.delete(MavDataStream.EXTENDED_STATUS)
+    streams.delete(MavDataStream.EXTRA1)
+    ticks = 0
+    bootedAt = Date.now() as int
+    reboots += 1
+    clearTimeout(downTimer)
+    if (downMs > 0) {
+      down = true
+      downTimer = setTimeout(() => {
+        this.down = false
+      }, downMs)
+    }
+  }
+
+  stopTimers(): void {
+    const ids: int[] = []
+    for (const [id, _] of timers) {
+      ids.push(id)
+    }
+    for (const id of ids) {
+      clearInterval(timers.get(id)!)
+      timers.delete(id)
+    }
+  }
+
+  /// Gives a message its own interval: `ms` between messages, -1 for off, 0 for the tick again.
+  applyInterval(id: int, ms: int): void {
+    const old = timers.get(id)
+    if (old != null) {
+      clearInterval(old!)
+      timers.delete(id)
+    }
+    if (ms == 0) {
+      intervals.delete(id)
+      return
+    }
+    intervals.set(id, ms)
+    if (ms > 0) {
+      timers.set(id, setInterval(() => this.sendOwn(id), ms))
+    }
+  }
+
+  sendOwn(id: int): void {
+    if (down) {
+      return
+    }
+    if (id == SysStatus.MSG_ID) {
+      sendStatus()
+    } else if (id == Attitude.MSG_ID) {
+      sendAttitude()
+    }
+  }
+
+  sendStatus(): void {
+    const s = new SysStatus()
+    s.voltageBattery = (12600 - ticks * 10) as u16
+    s.batteryRemaining = (if (ticks > 100) 0 else 100 - ticks) as i8
+    conn.send(s)
+  }
+
+  sendAttitude(): void {
+    const a = new Attitude()
+    a.timeBootMs = ((Date.now() as int) - bootedAt) as u32
+    a.roll = (Math.sin(ticks as f64 / 5.0) * 0.0524) as f32
+    a.pitch = (Math.cos(ticks as f64 / 7.0) * 0.0349) as f32
+    a.yaw = (((ticks * 3) % 360) as f64 * Math.PI / 180.0) as f32
+    conn.send(a)
+  }
+
   tick(): void {
+    if (down) {
+      return
+    }
     const armed = ticks >= 3
     const h = new Heartbeat()
     h.type = MavType.QUADROTOR as u8
@@ -96,20 +204,26 @@ export class SimulatedAutopilot {
     h.systemStatus = (if (armed) MavState.ACTIVE else MavState.STANDBY) as u8
     h.mavlinkVersion = 3
     conn.send(h)
-    const s = new SysStatus()
-    s.voltageBattery = (12600 - ticks * 10) as u16
-    s.batteryRemaining = (if (ticks > 100) 0 else 100 - ticks) as i8
-    conn.send(s)
-    const a = new Attitude()
-    a.timeBootMs = (ticks * 1000) as u32
-    a.roll = (Math.sin(ticks as f64 / 5.0) * 0.0524) as f32
-    a.pitch = (Math.cos(ticks as f64 / 7.0) * 0.0349) as f32
-    a.yaw = (((ticks * 3) % 360) as f64 * Math.PI / 180.0) as f32
-    conn.send(a)
+    if (streaming && !intervals.has(SysStatus.MSG_ID)) {
+      sendStatus()
+    }
+    if (streaming && !intervals.has(Attitude.MSG_ID)) {
+      sendAttitude()
+    }
     ticks += 1
   }
 
+  sendSystemTime(): void {
+    const t = new SystemTime()
+    t.timeUnixUsec = (Date.now() as int * 1000) as u64
+    t.timeBootMs = ((Date.now() as int) - bootedAt) as u32
+    conn.send(t)
+  }
+
   handle(r: Received): void {
+    if (down) {
+      return
+    }
     const m = r.message
     if (m instanceof CommandLong) {
       if (!forMe(m.targetSystem as int, m.targetComponent as int)) {
@@ -117,11 +231,27 @@ export class SimulatedAutopilot {
       }
       const wants = (m.command as int == MavCmd.REQUEST_MESSAGE && m._param1 as int == AutopilotVersion.MSG_ID)
         || m.command as int == MavCmd.REQUEST_AUTOPILOT_CAPABILITIES
-      if (m.command as int == MavCmd.SET_MESSAGE_INTERVAL) {
-        // Accepted (its telemetry runs at its own pace anyway).
+      if (m.command as int == MavCmd.REQUEST_MESSAGE && m._param1 as int == SystemTime.MSG_ID) {
+        systemTimeRequests += 1
         const ack = new CommandAck()
         ack.command = m.command
         ack.result = MavResult.ACCEPTED as u8
+        conn.send(ack)
+        sendSystemTime()
+        return
+      }
+      if (m.command as int == MavCmd.SET_MESSAGE_INTERVAL) {
+        // Honoured for the two messages it sends on its own, unless it is set to refuse.
+        const id = m._param1 as int
+        const microseconds = m._param2 as int
+        const accepted = !rejectIntervals && (id == SysStatus.MSG_ID || id == Attitude.MSG_ID)
+        if (accepted) {
+          const ms = if (microseconds < 0) -1 else if (microseconds == 0) 0 else if (microseconds < 1000) 1 else microseconds / 1000
+          applyInterval(id, ms)
+        }
+        const ack = new CommandAck()
+        ack.command = m.command
+        ack.result = (if (accepted) MavResult.ACCEPTED else MavResult.UNSUPPORTED) as u8
         conn.send(ack)
         return
       }
@@ -137,6 +267,22 @@ export class SimulatedAutopilot {
         conn.send(v)
       }
       return
+    } else if (m instanceof RequestDataStream) {
+      if (forMe(m.targetSystem as int, m.targetComponent as int)) {
+        // No acknowledgement, as in the protocol. A stream's rate goes to the messages it holds here.
+        const stream = m.reqStreamId as int
+        const hz = m.reqMessageRate as int
+        const start = m.startStop as int != 0
+        const ms = if (!start) -1 else if (hz <= 0) 0 else if (hz >= 1000) 1 else 1000 / hz
+        if (stream == MavDataStream.EXTENDED_STATUS || stream == MavDataStream.ALL) {
+          streams.set(MavDataStream.EXTENDED_STATUS, if (start) hz else 0)
+          applyInterval(SysStatus.MSG_ID, ms)
+        }
+        if (stream == MavDataStream.EXTRA1 || stream == MavDataStream.ALL) {
+          streams.set(MavDataStream.EXTRA1, if (start) hz else 0)
+          applyInterval(Attitude.MSG_ID, ms)
+        }
+      }
     } else if (m instanceof ParamRequestList) {
       if (forMe(m.targetSystem as int, m.targetComponent as int)) {
         for (let i = 0; i < params.length; i++) {
