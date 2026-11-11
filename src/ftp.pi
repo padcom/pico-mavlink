@@ -229,6 +229,10 @@ function answers(r: Received, target: Target, seq: int, opcode: int): bool {
   }
 }
 
+function clamp(v: int, lo: int, hi: int): int {
+  if (v < lo) lo else if (v > hi) hi else v
+}
+
 /// A client for the FTP of one vehicle: one request at a time. `conn.run()` must be running.
 export class FtpClient {
   readonly conn: MavLinkConnection
@@ -243,10 +247,13 @@ export class FtpClient {
   constructor(conn: MavLinkConnection, target: Target, options: FtpOptions = {}) {
     this.conn = conn
     this.target = target
-    this.timeoutMs = options.timeoutMs ?? 1000
-    this.retries = options.retries ?? 3
-    this.readSize = options.readSize ?? FTP_MAX_DATA
-    this.session = options.session ?? (1 + (Date.now() as int) % 255)
+    // Values that cannot work are brought into range, not passed on: a read size over 239 would ask for more than a packet
+    // carries (and over 255 wrap in the size byte), 0 reads nothing; a session outside 1 to 255 wraps in its byte; fewer than
+    // 0 tries would not even send.
+    this.timeoutMs = clamp(options.timeoutMs ?? 1000, 1, 3_600_000)
+    this.retries = clamp(options.retries ?? 3, 0, 100)
+    this.readSize = clamp(options.readSize ?? FTP_MAX_DATA, 1, FTP_MAX_DATA)
+    this.session = clamp(options.session ?? (1 + (Date.now() as int) % 255), 1, 255)
     this.signal = options.signal
   }
 
@@ -318,6 +325,10 @@ export class FtpClient {
     if (r.opcode == FtpOpcode.NACK) {
       throw errorOfNack(`opening ${path}`, r)
     }
+    // The Ack carries the file's size in 4 bytes: one that does not is not an answer to this request.
+    if (r.data.length < 4) {
+      throw new FtpError("FTP_PROTOCOL", `opening ${path}: the reply has ${r.data.length} bytes, the size needs 4`)
+    }
     readUint(r.data, 0, 4)
   }
 
@@ -333,6 +344,10 @@ export class FtpClient {
     }
     if (r.offset != offset) {
       throw new FtpError("FTP_PROTOCOL", `asked for the bytes at ${offset}, got the ones at ${r.offset}`)
+    }
+    // The end of a file is a Nack, never an empty Ack: an empty one would leave a loop over the offsets where it is, for good.
+    if (r.data.length == 0) {
+      throw new FtpError("FTP_PROTOCOL", `asked for the bytes at ${offset}, got none and no end of file`)
     }
     r.data
   }
