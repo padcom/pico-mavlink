@@ -3,6 +3,7 @@ import { describe, it, expect } from "std/test"
 import { delay } from "std/timers"
 import { MavLinkConnection, Received } from "./connection"
 import { MemoryStream } from "./stream"
+import { MavLinkProtocolV2 } from "./protocol"
 import { Target, AutopilotVersionRead } from "./operations"
 import { SimParam, SimulatedAutopilot, defaultSimParams } from "./simulator"
 import { FTP_MAX_DATA, FtpClient, FtpError, FtpNack, FtpOpcode, FtpOptions, FtpPacket, ftpMessage, ftpPacketOf } from "./ftp"
@@ -157,19 +158,120 @@ async function refusesAChangedReadSize(): Promise<void> throws Error {
 async function refusesAnUnknownSessionAndFile(): Promise<void> throws Error {
   const r = rig()
   const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  // A read on a session that is not open is FileNotFound, as on the vehicle.
   try {
     await client.read(0)
     expect("read").toBe("refused")
   } catch (e: FtpError) {
-    expect(e.code).toBe("FTP_INVALID_SESSION")
+    expect(e.code).toBe("FTP_NOT_FOUND")
   }
+  // A path that is not there is FailErrno with ENOENT (2), not FileNotFound.
   try {
     await client.open("@PARAM/other")
     expect("opened").toBe("refused")
   } catch (e: FtpError) {
-    expect(e.code).toBe("FTP_NOT_FOUND")
+    expect(`${e.code} ${e.errno}`).toBe("FTP_ERRNO 2")
   }
   r.gcs.close()
+}
+
+/// One request, sent as is, and the reply to it: what the client would hide.
+async function ask(r: Rig, opcode: int, session: int, offset: int, size: int, data: Uint8Array = new Uint8Array(0)): Promise<FtpPacket?> throws Error {
+  const request = new FtpPacket()
+  request.seq = 40
+  request.session = session
+  request.opcode = opcode
+  request.offset = offset
+  request.size = size
+  request.data = data
+  const reply = r.gcs.waitFor((m: Received) => isFtpReplyTo(m, opcode), 200)
+  r.gcs.send(ftpMessage(VEHICLE, request))
+  const got = await reply
+  if (got == null) {
+    return null
+  }
+  const msg = got!.message
+  if (msg instanceof FileTransferProtocol) {
+    return ftpPacketOf(msg)
+  }
+  null
+}
+
+function isFtpReplyTo(m: Received, opcode: int): bool {
+  const msg = m.message
+  if (msg instanceof FileTransferProtocol) {
+    try {
+      const p = ftpPacketOf(msg)
+      return p.reqOpcode == opcode && p.seq == 41
+    } catch (e: FtpError) {
+      return false
+    }
+  }
+  false
+}
+
+function errorOf(p: FtpPacket?): string {
+  if (p == null) {
+    return "no reply"
+  }
+  if (p!.opcode == FtpOpcode.ACK) {
+    return "ack"
+  }
+  `nack ${p!.data[0]}`
+}
+
+async function answersAsTheVehicleDoes(): Promise<void> throws Error {
+  const r = rig()
+  const name = new TextEncoder().encode(PATH)
+  // Terminate of a session that is not open: an Ack.
+  expect(errorOf(await ask(r, FtpOpcode.TERMINATE_SESSION, 3, 0, 0))).toBe("ack")
+  // A read, and a burst, on a session that is not open: FileNotFound (10).
+  expect(errorOf(await ask(r, FtpOpcode.READ_FILE, 3, 0, 239))).toBe("nack 10")
+  expect(errorOf(await ask(r, FtpOpcode.BURST_READ_FILE, 3, 0, 239))).toBe("nack 10")
+  // One file per session: opening again, with the session in use, is Fail (1).
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name))).toBe("ack")
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name))).toBe("nack 1")
+  // After a reset it opens again.
+  expect(errorOf(await ask(r, FtpOpcode.RESET_SESSIONS, 0, 0, 0))).toBe("ack")
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name))).toBe("ack")
+  r.gcs.close()
+}
+
+async function readOfNothingIsTheEnd(): Promise<void> throws Error {
+  const r = rig()
+  const name = new TextEncoder().encode(PATH)
+  await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name)
+  // A read of 0 bytes is a Nack EndOfFile (6), not an empty Ack, and it does not fix the read size of the file.
+  expect(errorOf(await ask(r, FtpOpcode.READ_FILE, 3, 0, 0))).toBe("nack 6")
+  expect(errorOf(await ask(r, FtpOpcode.READ_FILE, 3, 0, 100))).toBe("ack")
+  expect(errorOf(await ask(r, FtpOpcode.READ_FILE, 3, 0, 239))).toBe("nack 2")
+  r.gcs.close()
+}
+
+async function answersTheOneWhoAsked(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0], { protocol: new MavLinkProtocolV2(77, 33) })
+  const sim = new SimulatedAutopilot(ends[1], defaultSimParams())
+  gcs.run()
+  sim.conn.run()
+  const seen: string[] = []
+  gcs.on((m: Received) => {
+    const msg = m.message
+    if (msg instanceof FileTransferProtocol) {
+      seen.push(`${msg.targetNetwork}/${msg.targetSystem}/${msg.targetComponent}`)
+    }
+  })
+  const client = new FtpClient(gcs, VEHICLE, FAST)
+  await client.reset()
+  await client.open(PATH)
+  await client.read(0)
+  await client.terminate()
+  gcs.close()
+  // Every reply is addressed to the requester (system 77, component 33), not to a fixed address.
+  expect(seen.length >= 4).toBe(true)
+  for (const target of seen) {
+    expect(target).toBe("0/77/33")
+  }
 }
 
 async function hasFiveSessions(): Promise<void> throws Error {
@@ -193,7 +295,7 @@ async function terminatesSessions(): Promise<void> throws Error {
   expect(r.sim.openFtpSessions()).toBe(1)
   await client.terminate()
   expect(r.sim.openFtpSessions()).toBe(0)
-  // Terminating what is not open is answered with a Nack and does not throw.
+  // Terminating what is not open is answered with an Ack too, and does not throw.
   await client.terminate()
   r.gcs.close()
 }
@@ -353,7 +455,10 @@ describe("the simulated autopilot's MAVLink FTP", () => {
   it("answers EINVAL to a read size other than the one the file was first read with", refusesAChangedReadSize)
   it("refuses a read on a session that is not open and a file that is not there", refusesAnUnknownSessionAndFile)
   it("has five sessions; a sixth is refused, and the client's reset makes room", hasFiveSessions)
-  it("ends a session on terminate, and answers a Nack for one that is not open", terminatesSessions)
+  it("ends a session on terminate, and answers an Ack for one that is not open", terminatesSessions)
+  it("answers as the vehicle does: Ack for a terminate of nothing, FileNotFound for reads of nothing, Fail for a second open", answersAsTheVehicleDoes)
+  it("answers a read of 0 bytes with EndOfFile and does not fix the read size with it", readOfNothingIsTheEnd)
+  it("addresses every reply to the one who asked", answersTheOneWhoAsked)
   it("fails every open with ENOENT in the unsupported mode", unsupportedMode)
   it("never answers in the silent mode, and not at all without FTP", silentAndOffModes)
   it("serves a file with a wrong magic (corrupt) and one that says there are more parameters (incomplete)", corruptAndIncompleteModes)

@@ -19,6 +19,17 @@ import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./diale
 import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
 
+/// An FTP request and who sent it.
+class FtpAsk {
+  public readonly req: FtpPacket
+  public readonly to: Target
+
+  constructor(req: FtpPacket, to: Target) {
+    this.req = req
+    this.to = to
+  }
+}
+
 /// The `n` bytes of `file` from `at` (fewer at its end).
 function slice(file: Uint8Array, at: int, n: int): Uint8Array {
   const have = if (at + n > file.length) file.length - at else n
@@ -364,7 +375,9 @@ export class SimulatedAutopilot {
       }
     } else if (m instanceof FileTransferProtocol) {
       if (ftp && forMe(m.targetSystem as int, m.targetComponent as int)) {
-        ftpHandle(m)
+        // Answers go to whoever asked: its system and component are in the header of the request.
+        const from: Target = { system: r.packet.header.sysid, component: r.packet.header.compid }
+        ftpHandle(m, from)
       }
     } else if (m instanceof ParamSet) {
       const i = indexOf(m.paramId)
@@ -394,79 +407,84 @@ export class SimulatedAutopilot {
     ftpLoss > 0 && ftpRandom(100) < ftpLoss
   }
 
-  /// Sends a reply to FTP request `req`: Ack or Nack, with `data`.
-  ftpReply(req: FtpPacket, opcode: int, data: Uint8Array, seq: int, offset: int, burstComplete: bool): void {
+  /// Sends a reply to the FTP request `ask`: Ack or Nack, with `data`, to whoever asked (its system and component).
+  ftpReply(ask: FtpAsk, opcode: int, data: Uint8Array, seq: int, offset: int, burstComplete: bool): void {
     if (ftpLost()) {
       return
     }
     const p = new FtpPacket()
     p.seq = seq & 0xFFFF
-    p.session = req.session
+    p.session = ask.req.session
     p.opcode = opcode
-    p.reqOpcode = req.opcode
+    p.reqOpcode = ask.req.opcode
     p.size = data.length
     p.data = data
     p.offset = offset
     p.burstComplete = burstComplete
     try {
-      const to: Target = { system: 255, component: 0 }
-      const message = ftpMessage(to, p)
+      const message = ftpMessage(ask.to, p)
       conn.send(message)
       return
     } catch (e: FtpError) {
     }
   }
 
-  ftpNack(req: FtpPacket, error: int, errno: int = 0): void {
+  ftpNack(ask: FtpAsk, error: int, errno: int = 0): void {
     const data = if (error == FtpNack.FAIL_ERRNO) new Uint8Array(2) else new Uint8Array(1)
     data.set(0, error)
     if (error == FtpNack.FAIL_ERRNO) {
       data.set(1, errno)
     }
-    ftpReply(req, FtpOpcode.NACK, data, req.seq + 1, req.offset, false)
+    ftpReply(ask, FtpOpcode.NACK, data, ask.req.seq + 1, ask.req.offset, false)
   }
 
-  ftpHandle(m: FileTransferProtocol): void {
-    let req: FtpPacket
+  ftpHandle(m: FileTransferProtocol, from: Target): void {
+    let packet: FtpPacket
     try {
-      req = ftpPacketOf(m)
+      packet = ftpPacketOf(m)
     } catch (e: FtpError) {
       return
     }
+    const ask = new FtpAsk(packet, from)
+    const req = packet
     ftpLog.push(`${req.opcode} s${req.session} o${req.offset} n${req.size}`)
     if (ftpMode == "silent") {
       return
     }
     if (req.opcode == FtpOpcode.RESET_SESSIONS) {
       ftpSessions.clear()
-      ftpReply(req, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, 0, false)
+      ftpReply(ask, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, 0, false)
     } else if (req.opcode == FtpOpcode.OPEN_FILE_RO) {
-      ftpOpen(req)
+      ftpOpen(ask)
     } else if (req.opcode == FtpOpcode.READ_FILE) {
-      ftpRead(req)
+      ftpRead(ask)
     } else if (req.opcode == FtpOpcode.BURST_READ_FILE) {
-      ftpBurst(req)
+      ftpBurst(ask)
     } else if (req.opcode == FtpOpcode.TERMINATE_SESSION) {
-      if (ftpSessions.has(req.session)) {
-        ftpSessions.delete(req.session)
-        ftpReply(req, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, 0, false)
-      } else {
-        ftpNack(req, FtpNack.INVALID_SESSION)
-      }
+      // Always an Ack, whether or not the session was open (as the vehicle's is).
+      ftpSessions.delete(req.session)
+      ftpReply(ask, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, 0, false)
     } else {
-      ftpNack(req, FtpNack.UNKNOWN_COMMAND)
+      ftpNack(ask, FtpNack.UNKNOWN_COMMAND)
     }
   }
 
   /// OpenFileRO of "@PARAM/param.pck" (with the query `?start=N&count=C&withdefaults=1`, all optional): the Ack carries the
-  /// file's size, which is an estimate (12 bytes a parameter), as the vehicle's is.
-  ftpOpen(req: FtpPacket): void {
+  /// file's size, which is an estimate (12 bytes a parameter), as the vehicle's is. A path that is not that file is ENOENT
+  /// (FailErrno), a session that has a file open and was used in the last 3 s is `Fail` (one file per session).
+  ftpOpen(ask: FtpAsk): void {
+    const req = ask.req
     if (ftpMode == "unsupported") {
-      ftpNack(req, FtpNack.FAIL_ERRNO, 2)
+      ftpNack(ask, FtpNack.FAIL_ERRNO, 2)
+      return
+    }
+    const now = Date.now() as int
+    const mine = ftpSessions.get(req.session)
+    if (mine != null && now - mine!.lastAt <= 3000) {
+      ftpNack(ask, FtpNack.FAIL)
       return
     }
     // A session nobody has used for 3 s may be taken over; a full vehicle has no session free.
-    const now = Date.now() as int
     if (ftpSessions.size >= 5 && !ftpSessions.has(req.session)) {
       const idle: int[] = []
       for (const [id, s] of ftpSessions) {
@@ -475,7 +493,7 @@ export class SimulatedAutopilot {
         }
       }
       if (idle.length == 0) {
-        ftpNack(req, FtpNack.NO_SESSIONS_AVAILABLE)
+        ftpNack(ask, FtpNack.NO_SESSIONS_AVAILABLE)
         return
       }
       ftpSessions.delete(idle[0])
@@ -487,14 +505,15 @@ export class SimulatedAutopilot {
     }
     const parts = name.split("?")
     if (parts[0] != "@PARAM/param.pck") {
-      ftpNack(req, FtpNack.FILE_NOT_FOUND)
+      // ENOENT, as the vehicle's filesystem says it.
+      ftpNack(ask, FtpNack.FAIL_ERRNO, 2)
       return
     }
     let file: Uint8Array
     try {
       file = packedFile(if (parts.length > 1) parts[1] else "")
     } catch (e: ParamPackError) {
-      ftpNack(req, FtpNack.FAIL_ERRNO, 5)
+      ftpNack(ask, FtpNack.FAIL_ERRNO, 5)
       return
     }
     ftpSessions.set(req.session, new FtpSession(req.session, file))
@@ -504,55 +523,61 @@ export class SimulatedAutopilot {
     size.set(1, (estimate >> 8) & 0xFF)
     size.set(2, (estimate >> 16) & 0xFF)
     size.set(3, (estimate >> 24) & 0xFF)
-    ftpReply(req, FtpOpcode.ACK, size, req.seq + 1, 0, false)
+    ftpReply(ask, FtpOpcode.ACK, size, req.seq + 1, 0, false)
   }
 
-  /// The session of a read, or null after a Nack (no such session, a size that is not the one the file was first read with).
-  ftpSessionForRead(req: FtpPacket, size: int): FtpSession? {
-    const s = ftpSessions.get(req.session)
+  /// The session of a read, or null after a Nack: a session that is not open is `FileNotFound` (as on the vehicle), and a size
+  /// that is not the one the file was first read with is EINVAL. A size of 0 reads nothing and fixes nothing.
+  ftpSessionForRead(ask: FtpAsk, size: int): FtpSession? {
+    const s = ftpSessions.get(ask.req.session)
     if (s == null) {
-      ftpNack(req, FtpNack.INVALID_SESSION)
+      ftpNack(ask, FtpNack.FILE_NOT_FOUND)
       return null
     }
     s!.lastAt = Date.now() as int
     // The file's padding is computed from the first read's size: any other size is refused (EINVAL), so that a client that
-    // changes it shows at once.
+    // changes it shows at once. (A read of 0 bytes does not count as the first.)
+    if (size == 0) {
+      return s
+    }
     if (s!.readSize == 0) {
       s!.readSize = size
     } else if (s!.readSize != size) {
-      ftpNack(req, FtpNack.FAIL_ERRNO, 22)
+      ftpNack(ask, FtpNack.FAIL_ERRNO, 22)
       return null
     }
     s
   }
 
-  /// ReadFile: `size` bytes at `offset`. A size of 0 reads nothing (an Ack with no data), as a vehicle's does.
-  ftpRead(req: FtpPacket): void {
-    const s = ftpSessionForRead(req, req.size)
+  /// ReadFile: `size` bytes at `offset`. A size of 0 is a Nack EndOfFile (the vehicle reads nothing and says the file ended).
+  ftpRead(ask: FtpAsk): void {
+    const req = ask.req
+    const s = ftpSessionForRead(ask, req.size)
     if (s == null) {
       return
     }
     const file = s!.file
-    if (req.offset >= file.length) {
-      ftpNack(req, FtpNack.EOF)
+    if (req.size == 0 || req.offset >= file.length) {
+      ftpNack(ask, FtpNack.EOF)
       return
     }
-    ftpReply(req, FtpOpcode.ACK, slice(file, req.offset, req.size), req.seq + 1, req.offset, false)
+    ftpReply(ask, FtpOpcode.ACK, slice(file, req.offset, req.size), req.seq + 1, req.offset, false)
   }
 
   /// BurstReadFile: Acks of `size` bytes (0: 239) from `offset`, up to 2000 packets, the last with burst_complete, and a Nack
   /// EndOfFile where the file ends. A stalled burst (`ftpStallAfter`) stops with no end.
-  ftpBurst(req: FtpPacket): void {
-    const size = if (req.size == 0) FTP_MAX_DATA else req.size
-    const s = ftpSessionForRead(req, size)
+  ftpBurst(ask: FtpAsk): void {
+    const size = if (ask.req.size == 0) FTP_MAX_DATA else ask.req.size
+    const s = ftpSessionForRead(ask, size)
     if (s == null) {
       return
     }
     ftpBursts += 1
-    this.burst(req, s!, size)
+    this.burst(ask, s!, size)
   }
 
-  async burst(req: FtpPacket, s: FtpSession, size: int): Promise<void> throws AbortError {
+  async burst(ask: FtpAsk, s: FtpSession, size: int): Promise<void> throws AbortError {
+    const req = ask.req
     const file = s.file
     let offset = req.offset
     let seq = req.seq + 1
@@ -567,13 +592,13 @@ export class SimulatedAutopilot {
       if (offset >= file.length) {
         const eof = new Uint8Array(1)
         eof.set(0, FtpNack.EOF)
-        ftpReply(req, FtpOpcode.NACK, eof, seq, offset, true)
+        ftpReply(ask, FtpOpcode.NACK, eof, seq, offset, true)
         return
       }
       const chunk = slice(file, offset, size)
       sent += 1
       const last = sent == 2000
-      ftpReply(req, FtpOpcode.ACK, chunk, seq, offset, last)
+      ftpReply(ask, FtpOpcode.ACK, chunk, seq, offset, last)
       offset += chunk.length
       seq += 1
       // Let the rest of the link breathe: a long burst is not one tick of the event loop.
