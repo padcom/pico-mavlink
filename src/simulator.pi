@@ -30,6 +30,19 @@ class FtpAsk {
   }
 }
 
+/// The last reply sent to one sender on one session, and the sequence number of the request it answered. A repeated request (the
+/// same sender, session and sequence number: the reply was lost) is answered with this packet again, without being handled again,
+/// as the vehicle does.
+class FtpCached {
+  public readonly seq: int
+  public readonly message: FileTransferProtocol
+
+  constructor(seq: int, message: FileTransferProtocol) {
+    this.seq = seq
+    this.message = message
+  }
+}
+
 /// The `n` bytes of `file` from `at` (fewer at its end).
 function slice(file: Uint8Array, at: int, n: int): Uint8Array {
   const have = if (at + n > file.length) file.length - at else n
@@ -155,6 +168,7 @@ export class SimulatedAutopilot {
   public ftpBursts: int = 0
   readonly ftpSessions: Map<int, FtpSession> = new Map<int, FtpSession>()
   ftpSeed: int = 4242
+  readonly ftpCache: Map<string, FtpCached> = new Map<string, FtpCached>()
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -407,11 +421,13 @@ export class SimulatedAutopilot {
     ftpLoss > 0 && ftpRandom(100) < ftpLoss
   }
 
-  /// Sends a reply to the FTP request `ask`: Ack or Nack, with `data`, to whoever asked (its system and component).
-  ftpReply(ask: FtpAsk, opcode: int, data: Uint8Array, seq: int, offset: int, burstComplete: bool): void {
-    if (ftpLost()) {
-      return
-    }
+  ftpCacheKey(to: Target, session: int): string {
+    `${to.system}:${to.component}:${session}`
+  }
+
+  /// Sends a reply to the FTP request `ask`: Ack or Nack, with `data`, to whoever asked (its system and component). The reply
+  /// is kept to answer a repeat of the request with (`remember`), also when it is lost on its way out.
+  ftpReply(ask: FtpAsk, opcode: int, data: Uint8Array, seq: int, offset: int, burstComplete: bool, remember: bool = true): void {
     const p = new FtpPacket()
     p.seq = seq & 0xFFFF
     p.session = ask.req.session
@@ -423,7 +439,12 @@ export class SimulatedAutopilot {
     p.burstComplete = burstComplete
     try {
       const message = ftpMessage(ask.to, p)
-      conn.send(message)
+      if (remember) {
+        ftpCache.set(ftpCacheKey(ask.to, ask.req.session), new FtpCached(ask.req.seq, message))
+      }
+      if (!ftpLost()) {
+        conn.send(message)
+      }
       return
     } catch (e: FtpError) {
     }
@@ -435,7 +456,8 @@ export class SimulatedAutopilot {
     if (error == FtpNack.FAIL_ERRNO) {
       data.set(1, errno)
     }
-    ftpReply(ask, FtpOpcode.NACK, data, ask.req.seq + 1, ask.req.offset, false)
+    // "No session free" is not kept: the same request asked again may well find one.
+    ftpReply(ask, FtpOpcode.NACK, data, ask.req.seq + 1, ask.req.offset, false, error != FtpNack.NO_SESSIONS_AVAILABLE)
   }
 
   ftpHandle(m: FileTransferProtocol, from: Target): void {
@@ -449,6 +471,17 @@ export class SimulatedAutopilot {
     const req = packet
     ftpLog.push(`${req.opcode} s${req.session} o${req.offset} n${req.size}`)
     if (ftpMode == "silent") {
+      return
+    }
+    const key = ftpCacheKey(from, req.session)
+    const cached = ftpCache.get(key)
+    if (req.opcode == FtpOpcode.BURST_READ_FILE) {
+      // A burst starts a new one every time, and is never resent from the cache.
+      const gone = ftpCache.delete(key)
+    } else if (cached != null && cached!.seq == req.seq) {
+      if (!ftpLost()) {
+        conn.send(cached!.message)
+      }
       return
     }
     if (req.opcode == FtpOpcode.RESET_SESSIONS) {
@@ -592,13 +625,13 @@ export class SimulatedAutopilot {
       if (offset >= file.length) {
         const eof = new Uint8Array(1)
         eof.set(0, FtpNack.EOF)
-        ftpReply(ask, FtpOpcode.NACK, eof, seq, offset, true)
+        ftpReply(ask, FtpOpcode.NACK, eof, seq, offset, true, false)
         return
       }
       const chunk = slice(file, offset, size)
       sent += 1
       const last = sent == 2000
-      ftpReply(ask, FtpOpcode.ACK, chunk, seq, offset, last)
+      ftpReply(ask, FtpOpcode.ACK, chunk, seq, offset, last, false)
       offset += chunk.length
       seq += 1
       // Let the rest of the link breathe: a long burst is not one tick of the event loop.

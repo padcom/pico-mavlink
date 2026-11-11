@@ -19,6 +19,8 @@ const PATH = "@PARAM/param.pck"
 class Rig {
   public readonly gcs: MavLinkConnection
   public readonly sim: SimulatedAutopilot
+  /// The sequence number of the last request `ask` sent.
+  public seq: int = 40
 
   constructor(gcs: MavLinkConnection, sim: SimulatedAutopilot) {
     this.gcs = gcs
@@ -176,15 +178,20 @@ async function refusesAnUnknownSessionAndFile(): Promise<void> throws Error {
 }
 
 /// One request, sent as is, and the reply to it: what the client would hide.
-async function ask(r: Rig, opcode: int, session: int, offset: int, size: int, data: Uint8Array = new Uint8Array(0)): Promise<FtpPacket?> throws Error {
+/// Every call has a sequence number of its own, unless `seq` says which (to repeat a request).
+async function ask(r: Rig, opcode: int, session: int, offset: int, size: int, data: Uint8Array = new Uint8Array(0), seq: int = -1): Promise<FtpPacket?> throws Error {
   const request = new FtpPacket()
-  request.seq = 40
+  if (seq < 0) {
+    r.seq += 1
+  }
+  request.seq = if (seq < 0) r.seq else seq
   request.session = session
   request.opcode = opcode
   request.offset = offset
   request.size = size
   request.data = data
-  const reply = r.gcs.waitFor((m: Received) => isFtpReplyTo(m, opcode), 200)
+  const answered = request.seq + 1
+  const reply = r.gcs.waitFor((m: Received) => isFtpReplyTo(m, opcode, answered), 200)
   r.gcs.send(ftpMessage(VEHICLE, request))
   const got = await reply
   if (got == null) {
@@ -197,12 +204,12 @@ async function ask(r: Rig, opcode: int, session: int, offset: int, size: int, da
   null
 }
 
-function isFtpReplyTo(m: Received, opcode: int): bool {
+function isFtpReplyTo(m: Received, opcode: int, seq: int): bool {
   const msg = m.message
   if (msg instanceof FileTransferProtocol) {
     try {
       const p = ftpPacketOf(msg)
-      return p.reqOpcode == opcode && p.seq == 41
+      return p.reqOpcode == opcode && p.seq == seq
     } catch (e: FtpError) {
       return false
     }
@@ -235,6 +242,36 @@ async function answersAsTheVehicleDoes(): Promise<void> throws Error {
   expect(errorOf(await ask(r, FtpOpcode.RESET_SESSIONS, 0, 0, 0))).toBe("ack")
   expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name))).toBe("ack")
   r.gcs.close()
+}
+
+async function repeatedRequestGetsTheSameReply(): Promise<void> throws Error {
+  const r = rig()
+  const name = new TextEncoder().encode(PATH)
+  // The open's Ack is lost; the same request asked again (the same sequence number) is answered with the Ack again, not Fail.
+  r.sim.ftpLoss = 100
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name, 90))).toBe("no reply")
+  r.sim.ftpLoss = 0
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name, 90))).toBe("ack")
+  expect(r.sim.openFtpSessions()).toBe(1)
+  // A new request (another sequence number) is handled as one: the session is in use, so Fail.
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name, 92))).toBe("nack 1")
+  // The reply stays the same for a repeat of that one too.
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name, 92))).toBe("nack 1")
+  // Another sender's session is not answered from this one's cache (the same session and sequence number on another session).
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 4, 0, name.length, name, 90))).toBe("ack")
+  r.gcs.close()
+}
+
+async function repeatedBurstStartsANewBurst(): Promise<void> throws Error {
+  const r = rig(many(300))
+  const name = new TextEncoder().encode(PATH)
+  expect(errorOf(await ask(r, FtpOpcode.OPEN_FILE_RO, 3, 0, name.length, name, 10))).toBe("ack")
+  const first = await burst(r, 3, 0, 239, 150)
+  const second = await burst(r, 3, 0, 239, 150)
+  r.gcs.close()
+  expect(first.length > 1).toBe(true)
+  expect(second.length).toBe(first.length)
+  expect(r.sim.ftpBursts).toBe(2)
 }
 
 async function readOfNothingIsTheEnd(): Promise<void> throws Error {
@@ -457,6 +494,8 @@ describe("the simulated autopilot's MAVLink FTP", () => {
   it("has five sessions; a sixth is refused, and the client's reset makes room", hasFiveSessions)
   it("ends a session on terminate, and answers an Ack for one that is not open", terminatesSessions)
   it("answers as the vehicle does: Ack for a terminate of nothing, FileNotFound for reads of nothing, Fail for a second open", answersAsTheVehicleDoes)
+  it("answers an open whose reply was lost, asked again with the same sequence number, with the same Ack (not Fail)", repeatedRequestGetsTheSameReply)
+  it("starts a new burst for a repeated burst request, and never answers one from the cache", repeatedBurstStartsANewBurst)
   it("answers a read of 0 bytes with EndOfFile and does not fix the read size with it", readOfNothingIsTheEnd)
   it("addresses every reply to the one who asked", answersTheOneWhoAsked)
   it("fails every open with ENOENT in the unsupported mode", unsupportedMode)
