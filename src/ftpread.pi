@@ -1,0 +1,338 @@
+// Reading a whole file over MAVLink FTP with burst reads, filling the gaps a lossy link leaves.
+//
+// One BurstReadFile makes the vehicle send the file as a stream of Acks, with no request for each: that is what makes a
+// 1 MB-class file (the packed parameter file of a big vehicle) take seconds. Packets of a burst get lost, and the stream has no
+// retransmission, so every chunk is kept under its offset and what is missing is asked for after the burst:
+//   - the burst ends with `burst_complete` (its last packet, or the end of the file), or with silence (`silenceMs`);
+//   - up to 4 missing chunks are read one by one (ReadFile, which is asked again after a timeout); more than that, or a file
+//     whose end has not arrived, start a new burst at the first missing chunk;
+//   - the end of the file is a Nack EndOfFile (or a chunk shorter than a read) and counts only when no chunk is missing before it.
+// Every request asks for the same read size (the client's), as a file that is made up as it is read (the packed parameter file)
+// answers one other size with an error. The session is terminated on every exit, a cancel included.
+import { delay } from "std/timers"
+import { Received } from "./connection"
+import { FileTransferProtocol } from "./dialects/common"
+import { Target } from "./operations"
+import { FtpClient, FtpError, FtpNack, FtpOpcode, FtpPacket, errorOfNack, ftpMessage, ftpPacketOf } from "./ftp"
+
+/// The most a file may hold (16 MB: the packed parameter file of the biggest vehicle is under 1 MB), and the most data packets
+/// one burst may bring (a burst has 2000).
+export const MAX_FILE_BYTES: int = 16_777_216
+const MAX_BURST_PACKETS: int = 4000
+
+/// A file as read, and how it went.
+export class FtpFileResult {
+  public readonly data: Uint8Array
+  /// The size the vehicle gave when the file was opened (an estimate for a file it makes up as it goes).
+  public readonly estimate: int
+  /// How many bursts were requested, and how many single reads filled gaps.
+  public readonly bursts: int
+  public readonly reads: int
+  /// How many data packets arrived, duplicates included.
+  public readonly packets: int
+  public readonly elapsedMs: int
+
+  constructor(data: Uint8Array, estimate: int, bursts: int, reads: int, packets: int, elapsedMs: int) {
+    this.data = data
+    this.estimate = estimate
+    this.bursts = bursts
+    this.reads = reads
+    this.packets = packets
+    this.elapsedMs = elapsedMs
+  }
+}
+
+/// What has arrived of the file: its chunks by offset, where it ends, and what went wrong.
+export class ReadState {
+  public readonly size: int
+  public readonly session: int
+  public readonly target: Target
+  public readonly chunks: Map<int, Uint8Array> = new Map<int, Uint8Array>()
+  /// Where the file ends (from a Nack EndOfFile or a short chunk); -1 until known.
+  public end: int = -1
+  /// The offset of the first chunk that has not arrived.
+  public front: int = 0
+  /// The end of the farthest chunk that arrived.
+  public top: int = 0
+  public bytes: int = 0
+  public packets: int = 0
+  /// When a packet last brought something new (a chunk not held yet, or where the file ends): a burst is silent when nothing has
+  /// for a while, however many packets repeat what is known. And how many data packets this burst has had.
+  public lastNew: int = 0
+  public burstPackets: int = 0
+  public burstDone: bool = false
+  public failure: FtpError? = null
+  /// The most a file may hold (bytes): a vehicle that goes on past it is refused, not stored.
+  public readonly max: int
+
+  constructor(size: int, session: int, target: Target, max: int = MAX_FILE_BYTES) {
+    this.size = size
+    this.session = session
+    this.target = target
+    this.max = max
+  }
+
+  public complete(): bool {
+    end >= 0 && front >= end
+  }
+
+  public fail(code: string, message: string): void {
+    if (failure == null) {
+      failure = new FtpError(code, message)
+    }
+  }
+
+  /// Notes where the file ends. Two different ends, or data beyond the end, are a vehicle that contradicts itself.
+  public setEnd(at: int): void {
+    if (end >= 0 && end != at) {
+      fail("FTP_PROTOCOL", `the file ends at ${end} and at ${at}`)
+      return
+    }
+    if (top > at) {
+      fail("FTP_PROTOCOL", `the file ends at ${at}, and there is data up to ${top}`)
+      return
+    }
+    if (at > max) {
+      fail("FTP_PROTOCOL", `the file ends at ${at}: more than the ${max} bytes a file may hold`)
+      return
+    }
+    if (end < 0) {
+      lastNew = Date.now() as int
+    }
+    end = at
+  }
+
+  /// Keeps the chunk at `offset`. Chunks are all at multiples of the read size, and only the last is shorter.
+  public accept(offset: int, data: Uint8Array): void {
+    packets += 1
+    if (data.length == 0 || chunks.has(offset)) {
+      return
+    }
+    if (offset % size != 0) {
+      fail("FTP_PROTOCOL", `data at ${offset}: not at a multiple of the read size ${size}`)
+      return
+    }
+    if (end >= 0 && offset + data.length > end) {
+      fail("FTP_PROTOCOL", `data up to ${offset + data.length}, past the end of the file at ${end}`)
+      return
+    }
+    if (offset + data.length > max) {
+      fail("FTP_PROTOCOL", `data up to ${offset + data.length}: more than the ${max} bytes a file may hold`)
+      return
+    }
+    chunks.set(offset, data)
+    lastNew = Date.now() as int
+    bytes += data.length
+    if (offset + data.length > top) {
+      top = offset + data.length
+    }
+    if (data.length < size) {
+      setEnd(offset + data.length)
+    }
+    while (chunks.has(front)) {
+      front += size
+    }
+  }
+
+  /// The offsets of the chunks missing below where the file is known to reach, the first `limit + 1` of them.
+  public holes(limit: int): int[] {
+    const found: int[] = []
+    const high = if (end >= 0) end else top
+    let at = front
+    while (at < high && found.length <= limit) {
+      if (!chunks.has(at)) {
+        found.push(at)
+      }
+      at += size
+    }
+    found
+  }
+
+  /// A packet of a burst (a reply to BurstReadFile on this session, from the vehicle).
+  public take(r: Received): void {
+    const m = r.message
+    if (!(m instanceof FileTransferProtocol)) {
+      return
+    }
+    const h = r.packet.header
+    if (h.sysid != target.system || (target.component != 0 && h.compid != target.component)) {
+      return
+    }
+    let p: FtpPacket
+    try {
+      p = ftpPacketOf(m)
+    } catch (e: FtpError) {
+      return
+    }
+    if (p.session != session || p.reqOpcode != FtpOpcode.BURST_READ_FILE) {
+      return
+    }
+    if (p.opcode == FtpOpcode.ACK) {
+      burstPackets += 1
+      accept(p.offset, p.data)
+    } else if (p.opcode == FtpOpcode.NACK) {
+      if (p.data.length > 0 && p.data[0] == FtpNack.EOF) {
+        setEnd(p.offset)
+      } else {
+        failure = errorOfNack("reading a burst", p)
+      }
+    }
+    if (p.burstComplete) {
+      burstDone = true
+    }
+  }
+
+  /// The file, from its chunks (all there: `complete()`).
+  public assemble(): Uint8Array {
+    const out = new Uint8Array(end)
+    let at = 0
+    while (at < end) {
+      const chunk = chunks.get(at)!
+      for (let i = 0; i < chunk.length; i++) {
+        out.set(at + i, chunk[i])
+      }
+      at += size
+    }
+    out
+  }
+}
+
+function cancelled(): FtpError {
+  new FtpError("FTP_ABORTED", "reading the file: cancelled")
+}
+
+/// Asks for a burst at `from` and waits for it to end: `burst_complete`, the whole file there, silence of `silenceMs`, a
+/// failure or a cancel.
+async function burst(client: FtpClient, s: ReadState, from: int, silenceMs: int, progress: (bytes: int, estimate: int) => void throws Error, estimate: int): Promise<void> throws FtpError {
+  const p = new FtpPacket()
+  p.seq = client.nextSeq()
+  p.session = s.session
+  p.opcode = FtpOpcode.BURST_READ_FILE
+  p.size = s.size
+  p.offset = from
+  s.burstDone = false
+  s.burstPackets = 0
+  s.lastNew = Date.now() as int
+  const id = client.conn.on((r: Received) => s.take(r))
+  try {
+    await client.conn.send(ftpMessage(client.target, p))
+    let reported = s.bytes
+    // Over when the vehicle says so, when nothing NEW has come for `silenceMs` (a vehicle that repeats what it sent is as silent
+    // as one that says nothing), or after more packets than a burst can have (2000, twice over).
+    while (!client.aborted() && s.failure == null && !s.burstDone && !s.complete() && s.burstPackets <= MAX_BURST_PACKETS) {
+      if ((Date.now() as int) - s.lastNew >= silenceMs) {
+        break
+      }
+      await delay(2)
+      if (s.bytes != reported) {
+        reported = s.bytes
+        report(s, progress, estimate)
+      }
+    }
+  } catch (e: Error) {
+    client.conn.off(id)
+    if (e instanceof FtpError) {
+      throw e
+    }
+    throw new FtpError("FTP_PROTOCOL", `a burst read: could not send (${e.message})`)
+  }
+  client.conn.off(id)
+  report(s, progress, estimate)
+}
+
+/// Reports the progress. What the caller's callback throws is no reason to leave the file open: it ends the read as an error.
+function report(s: ReadState, progress: (bytes: int, estimate: int) => void throws Error, estimate: int): void {
+  try {
+    progress(s.bytes, estimate)
+  } catch (e: Error) {
+    s.fail("FTP_CALLBACK", `the progress callback failed: ${e.message}`)
+  }
+}
+
+/// Reads the chunk at `at` with a ReadFile. A vehicle that does not answer is no failure here: the caller counts it as a round
+/// that brought nothing.
+async function fill(client: FtpClient, s: ReadState, at: int): Promise<void> throws FtpError {
+  try {
+    const r = await client.call(FtpOpcode.READ_FILE, s.session, at, new Uint8Array(0), s.size)
+    if (r.opcode == FtpOpcode.NACK) {
+      const e = errorOfNack(`reading at ${at}`, r)
+      if (e.code == "FTP_EOF") {
+        // The end of the file where a chunk is still missing: the file is shorter than the burst said.
+        s.fail("FTP_PROTOCOL", `end of file at ${at}, where data had arrived beyond`)
+        return
+      }
+      throw e
+    }
+    if (r.offset == at) {
+      s.accept(at, r.data)
+    }
+  } catch (e: FtpError) {
+    if (e.code != "FTP_TIMEOUT") {
+      throw e
+    }
+  }
+}
+
+async function readRounds(client: FtpClient, s: ReadState, estimate: int, silenceMs: int, progress: (bytes: int, estimate: int) => void throws Error, counts: int[]): Promise<void> throws FtpError {
+  let stalls = 0
+  while (!s.complete()) {
+    if (client.aborted()) {
+      throw cancelled()
+    }
+    const before = s.bytes
+    counts[0] += 1
+    await burst(client, s, s.front, silenceMs, progress, estimate)
+    if (s.failure != null) {
+      throw s.failure!
+    }
+    if (client.aborted()) {
+      throw cancelled()
+    }
+    const holes = s.holes(4)
+    if (!s.complete() && holes.length > 0 && holes.length <= 4) {
+      for (const at of holes) {
+        counts[1] += 1
+        await fill(client, s, at)
+      }
+      if (s.failure != null) {
+        throw s.failure!
+      }
+    }
+    stalls = if (s.bytes == before) stalls + 1 else 0
+    if (stalls > client.retries) {
+      throw new FtpError("FTP_TIMEOUT", `no progress reading the file at ${s.front} after ${stalls} bursts`)
+    }
+  }
+}
+
+/// Reads the whole of `path`: resets the sessions, opens the file, bursts it and fills the gaps, terminates the session (also
+/// after an error or a cancel). `progress(bytes, estimate)` is called as data arrives, `estimate` being the size the vehicle
+/// gave on opening. `silenceMs` is how long a burst may be silent before it counts as over. Failures: `FTP_ABORTED` (the
+/// client's signal), `FTP_TIMEOUT` (no new data for `retries + 1` bursts), `FTP_PROTOCOL` (a vehicle that contradicts itself, or
+/// goes on past `maxBytes`), `FTP_CALLBACK` (the progress callback threw), and whatever a Nack of the vehicle says
+/// (`FTP_NOT_FOUND`, `FTP_ERRNO` ...). The session is terminated whatever ends the read.
+export async function readFile(
+  client: FtpClient,
+  path: string,
+  progress: (bytes: int, estimate: int) => void throws Error = (_bytes: int, _estimate: int) => {},
+  silenceMs: int = 250,
+  maxBytes: int = MAX_FILE_BYTES,
+): Promise<FtpFileResult> throws FtpError {
+  const started = Date.now() as int
+  const s = new ReadState(client.readSize, client.session, client.target, maxBytes)
+  const counts: int[] = [0, 0]
+  let estimate = 0
+  try {
+    await client.reset()
+    estimate = await client.open(path)
+    await readRounds(client, s, estimate, silenceMs, progress, counts)
+  } catch (e: Error) {
+    await client.terminate()
+    if (e instanceof FtpError) {
+      throw e
+    }
+    throw new FtpError("FTP_PROTOCOL", `reading ${path}: ${e.message}`)
+  }
+  await client.terminate()
+  new FtpFileResult(s.assemble(), estimate, counts[0], counts[1], s.packets, (Date.now() as int) - started)
+}

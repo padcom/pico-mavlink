@@ -1,0 +1,465 @@
+// Reading a whole file with burst reads, against the simulated vehicle (with the losses and stalls it can be asked for).
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { Target } from "./operations"
+import { SimParam, SimulatedAutopilot } from "./simulator"
+import { FtpClient, FtpError, FtpOptions } from "./ftp"
+import { FtpFileResult, ReadState, readFile } from "./ftpread"
+import { decodeParamPack } from "./parampack"
+import { MavParamType } from "./dialects/common"
+import { TypedParamValue } from "./params"
+
+const VEHICLE: Target = { system: 1, component: 1 }
+const PATH = "@PARAM/param.pck"
+
+class Rig {
+  public readonly gcs: MavLinkConnection
+  public readonly sim: SimulatedAutopilot
+
+  constructor(gcs: MavLinkConnection, sim: SimulatedAutopilot) {
+    this.gcs = gcs
+    this.sim = sim
+  }
+}
+
+function rig(params: SimParam[]): Rig {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const sim = new SimulatedAutopilot(ends[1], params)
+  gcs.run()
+  sim.conn.run()
+  new Rig(gcs, sim)
+}
+
+function many(count: int): SimParam[] {
+  const list: SimParam[] = []
+  for (let i = 0; i < count; i++) {
+    const p: SimParam = { id: `P${i % 90}_V${i}`, value: TypedParamValue.Int(i - 500, MavParamType.INT32) }
+    list.push(p)
+  }
+  list
+}
+
+/// `n` bytes that look like nothing in particular but are the same every time.
+function bytesOf(n: int): Uint8Array {
+  const out = new Uint8Array(n)
+  let x = 12345
+  for (let i = 0; i < n; i++) {
+    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+    out.set(i, (x >> 16) & 0xFF)
+  }
+  out
+}
+
+function same(a: Uint8Array, b: Uint8Array): bool {
+  if (a.length != b.length) {
+    return false
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false
+    }
+  }
+  true
+}
+
+function clientOf(r: Rig, signal: AbortSignal? = null): FtpClient {
+  const options: FtpOptions = { timeoutMs: 100, retries: 4, session: 7, signal: signal }
+  new FtpClient(r.gcs, VEHICLE, options)
+}
+
+function throughput(label: string, got: FtpFileResult): void {
+  const kbps = if (got.elapsedMs > 0) (got.data.length * 1000 / got.elapsedMs) / 1024 else 0
+  println(`${label}: ${got.data.length} bytes in ${got.elapsedMs} ms (${kbps} KiB/s), ${got.bursts} bursts, ${got.reads} reads, ${got.packets} packets`)
+}
+
+async function readsTheParameterFile(): Promise<void> throws Error {
+  const r = rig(many(1500))
+  const got = await readFile(clientOf(r), PATH, (_b: int, _e: int) => {}, 2000)
+  r.gcs.close()
+  const pack = decodeParamPack(got.data)
+  expect(pack.params.length).toBe(1500)
+  // (A silence window long enough for a slow runner: the file comes in one burst.)
+  expect(got.bursts <= 2).toBe(true)
+  // Reset, open, one burst, terminate: the session is closed again, and every read used the one size.
+  expect(r.sim.openFtpSessions()).toBe(0)
+  for (const line of r.sim.ftpLog) {
+    if (line.startsWith("15 ") || line.startsWith("5 ")) {
+      expect(line.endsWith("n239")).toBe(true)
+    }
+  }
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 ")).toBe(true)
+}
+
+/// A file of about 1 MB, as one read with `loss` percent of the packets dropped: the bytes are those of the file, whatever the loss.
+async function readsABigFileWithLoss(loss: int): Promise<void> throws Error {
+  const r = rig(many(1))
+  const file = bytesOf(1_000_000)
+  r.sim.ftpFile = file
+  r.sim.ftpLoss = loss
+  // With loss, a burst whose last packet is lost ends by silence: a shorter window keeps the test quick.
+  const got = await readFile(clientOf(r), PATH, (_b: int, _e: int) => {}, if (loss == 0) 2000 else 300)
+  r.gcs.close()
+  throughput(`1 MB at ${loss}% loss`, got)
+  expect(same(got.data, file)).toBe(true)
+  // More than 2000 packets of 239 bytes: the first burst ends at its 2000th packet, the file does not.
+  expect(got.bursts >= 3 || loss > 0).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function readsABigFileWithoutLoss(): Promise<void> throws Error {
+  await readsABigFileWithLoss(0)
+}
+
+async function readsABigFileWith5PercentLoss(): Promise<void> throws Error {
+  await readsABigFileWithLoss(5)
+}
+
+async function readsABigFileWith20PercentLoss(): Promise<void> throws Error {
+  await readsABigFileWithLoss(20)
+}
+
+/// Files that end where a burst ends: 2000 packets exactly, one more byte, one packet more.
+async function readsFilesAroundTheBurstLimit(): Promise<void> throws Error {
+  for (const length of [239 * 2000 - 1, 239 * 2000, 239 * 2000 + 1, 239 * 2001, 239 * 4000]) {
+    const r = rig(many(1))
+    const file = bytesOf(length)
+    r.sim.ftpFile = file
+    // A long silence window: a slow runner that pauses between packets must not end a burst early (that would add a burst).
+    const got = await readFile(clientOf(r), PATH, (_b: int, _e: int) => {}, 2000)
+    r.gcs.close()
+    expect(same(got.data, file)).toBe(true)
+    // A file of exactly 2000 chunks has no end in its first burst (burst_complete on the 2000th packet): a second finds it.
+    // (Two full bursts of 2000 and the one that finds the end for 239 * 4000.) At least that many; a few more are allowed.
+    const least = if (length == 239 * 4000) 3 else if (length >= 239 * 2000) 2 else 1
+    expect(got.bursts >= least && got.bursts <= least + 2).toBe(true)
+  }
+}
+
+async function readsAnEmptyFile(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = new Uint8Array(0)
+  const got = await readFile(clientOf(r), PATH, (_b: int, _e: int) => {}, 2000)
+  r.gcs.close()
+  expect(got.data.length).toBe(0)
+}
+
+async function asksAgainFromWhereAStalledBurstStopped(): Promise<void> throws Error {
+  const r = rig(many(1))
+  const file = bytesOf(239 * 20 + 100)
+  r.sim.ftpFile = file
+  // Every burst stops after 3 packets with no end: the next is asked from the first chunk that is missing.
+  r.sim.ftpStallAfter = 3
+  const got = await readFile(clientOf(r), PATH, (_b: int, _e: int) => {}, 150)
+  r.gcs.close()
+  expect(same(got.data, file)).toBe(true)
+  // 3 chunks of 239 a burst, 21 chunks: at least 7 bursts (a pause on a slow runner may add some).
+  expect(got.bursts >= 7).toBe(true)
+  // Every burst is asked from the first missing chunk: a multiple of 3 chunks, never going back.
+  const offsets = r.sim.ftpLog.filter((line) => line.startsWith("15 ")).map((line) => parseInt(line.split(" ")[2].slice(1)))
+  expect(offsets[0]).toBe(0)
+  for (let i = 0; i < offsets.length; i++) {
+    expect(offsets[i] % 717).toBe(0)
+    expect(i == 0 || offsets[i] >= offsets[i - 1]).toBe(true)
+  }
+  expect(offsets[offsets.length - 1]).toBe(4302)
+}
+
+async function fillsFewGapsWithSingleReads(): Promise<void> throws Error {
+  const r = rig(many(1))
+  const file = bytesOf(239 * 40)
+  r.sim.ftpFile = file
+  r.sim.ftpLoss = 5
+  const got = await readFile(clientOf(r), PATH, (_b: int, _e: int) => {}, 300)
+  r.gcs.close()
+  expect(same(got.data, file)).toBe(true)
+  // 40 chunks and a few losses: what is missing is read one by one, or asked in a new burst (more than 4 gaps), and all arrives.
+  expect(got.bursts >= 1).toBe(true)
+}
+
+async function reportsProgress(): Promise<void> throws Error {
+  const r = rig(many(3000))
+  const seen: int[] = []
+  const estimates: int[] = []
+  const got = await readFile(clientOf(r), PATH, (b: int, e: int) => {
+    seen.push(b)
+    estimates.push(e)
+  }, 100)
+  r.gcs.close()
+  expect(seen.length > 1).toBe(true)
+  for (let i = 1; i < seen.length; i++) {
+    expect(seen[i] >= seen[i - 1]).toBe(true)
+  }
+  expect(seen[seen.length - 1]).toBe(got.data.length)
+  expect(estimates[0]).toBe(got.estimate)
+  expect(got.estimate).toBe(3000 * 12)
+}
+
+async function cancelsAndTerminates(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(1_000_000)
+  // A burst that goes on for a good while: cancel in the middle of it.
+  const ac = new AbortController()
+  const client = clientOf(r, ac.signal)
+  let cancelled = false
+  const run = readFile(client, PATH, (b: int, _e: int) => {
+    if (b > 20000 && !cancelled) {
+      cancelled = true
+      ac.abort()
+    }
+  }, 100)
+  try {
+    await run
+    expect("read").toBe("cancelled")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ABORTED")
+  }
+  await delay(50)
+  r.gcs.close()
+  // The terminate was sent after the cancel, and the vehicle's session is closed.
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 ")).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function cancelsBeforeStarting(): Promise<void> throws Error {
+  const r = rig(many(1))
+  const ac = new AbortController()
+  ac.abort()
+  try {
+    await readFile(clientOf(r, ac.signal), PATH)
+    expect("read").toBe("cancelled")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ABORTED")
+  }
+  r.gcs.close()
+}
+
+async function terminatesAfterAnError(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpMode = "unsupported"
+  try {
+    await readFile(clientOf(r), "@PARAM/param.pck")
+    expect("read").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ERRNO")
+  }
+  r.gcs.close()
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 ")).toBe(true)
+  const missing = rig(many(1))
+  try {
+    await readFile(clientOf(missing), "@PARAM/nothing.pck")
+    expect("read").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ERRNO")
+  }
+  missing.gcs.close()
+}
+
+async function givesUpWhenNothingComes(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(2000)
+  r.sim.ftpStallAfter = 1
+  // One packet a burst, and that one packet is lost every time: no progress.
+  r.sim.ftpLoss = 100
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 40, retries: 1, session: 7 })
+  try {
+    await readFile(client, PATH, (_b: int, _e: int) => {}, 30)
+    expect("read").toBe("timed out")
+  } catch (e: FtpError) {
+    expect(e.code == "FTP_TIMEOUT").toBe(true)
+  }
+  r.gcs.close()
+}
+
+/// What ends a read, as an error code, for the tests of a hostile vehicle.
+async function codeOf(r: Rig, maxBytes: int, progress: (bytes: int, estimate: int) => void throws Error): Promise<string> throws Error {
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 60, retries: 1, session: 7 })
+  try {
+    await readFile(client, PATH, progress, 40, maxBytes)
+    "read"
+  } catch (e: FtpError) {
+    e.code
+  }
+}
+
+async function endsWhenTheVehicleRepeatsWhatItSent(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(239 * 30)
+  r.sim.ftpMode = "repeat"
+  const started = Date.now() as int
+  const code = await codeOf(r, 16_777_216, (_b: int, _e: int) => {})
+  // The same chunk, over and over, never ends a burst by itself, and is never new data: the read gives up.
+  r.sim.ftpMode = "ok"
+  await delay(50)
+  r.gcs.close()
+  expect(code).toBe("FTP_TIMEOUT")
+  expect((Date.now() as int) - started < 5000).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileWithoutAnEnd(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(239 * 30)
+  r.sim.ftpMode = "endless"
+  const code = await codeOf(r, 100_000, (_b: int, _e: int) => {})
+  r.sim.ftpMode = "ok"
+  await delay(50)
+  r.gcs.close()
+  // Distinct offsets for ever: refused at the most a file may hold, nothing past it is kept.
+  expect(code).toBe("FTP_PROTOCOL")
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileOverTheMaximumSize(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(50_000)
+  expect(await codeOf(r, 10_000, (_b: int, _e: int) => {})).toBe("FTP_PROTOCOL")
+  expect(r.sim.openFtpSessions()).toBe(0)
+  // The same file under a maximum that holds it.
+  expect(await codeOf(r, 50_000, (_b: int, _e: int) => {})).toBe("read")
+  r.gcs.close()
+}
+
+async function terminatesWhenTheProgressCallbackThrows(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(100_000)
+  const code = await codeOf(r, 16_777_216, (_b: int, _e: int) => {
+    throw new Error("the callback broke")
+  })
+  r.gcs.close()
+  expect(code).toBe("FTP_CALLBACK")
+  expect(r.sim.openFtpSessions()).toBe(0)
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 ")).toBe(true)
+}
+
+function stateRefusesDataPastTheMaximum(): void {
+  const s = new ReadState(10, 7, VEHICLE, 25)
+  s.accept(0, chunkOf(10, 1))
+  s.accept(10, chunkOf(10, 2))
+  expect(s.failure == null).toBe(true)
+  s.accept(20, chunkOf(10, 3))
+  expect(s.failure != null).toBe(true)
+  expect(s.bytes).toBe(20)
+  const t = new ReadState(10, 7, VEHICLE, 25)
+  t.setEnd(30)
+  expect(t.failure != null).toBe(true)
+}
+
+function chunkOf(size: int, fill: int): Uint8Array {
+  const c = new Uint8Array(size)
+  for (let i = 0; i < size; i++) {
+    c.set(i, fill)
+  }
+  c
+}
+
+function stateOf(): ReadState {
+  new ReadState(10, 7, VEHICLE)
+}
+
+function chunksInAnyOrder(): void {
+  const s = stateOf()
+  // 5 chunks of 10 and a last one of 4, in an order that is nothing like the file's.
+  for (const k of [3, 1, 5, 0, 4]) {
+    s.accept(k * 10, chunkOf(if (k == 5) 4 else 10, k))
+  }
+  // The end is known (the short chunk), and chunk 2 is missing: not complete.
+  expect(s.complete()).toBe(false)
+  expect(s.holes(4).join(",")).toBe("20")
+  s.accept(20, chunkOf(10, 2))
+  expect(s.complete()).toBe(true)
+  const file = s.assemble()
+  expect(file.length).toBe(54)
+  expect(file[0]).toBe(0)
+  expect(file[25]).toBe(2)
+  expect(file[53]).toBe(5)
+  // A chunk that arrives twice counts once.
+  s.accept(20, chunkOf(10, 9))
+  expect(s.assemble()[25]).toBe(2)
+  expect(s.bytes).toBe(54)
+}
+
+function endWithAndWithoutHoles(): void {
+  const s = stateOf()
+  s.accept(0, chunkOf(10, 1))
+  s.accept(30, chunkOf(10, 4))
+  // EndOfFile at 40, with the chunks at 10 and 20 missing: the end is known, the file is not complete.
+  s.setEnd(40)
+  expect(s.end).toBe(40)
+  expect(s.complete()).toBe(false)
+  expect(s.holes(4).join(",")).toBe("10,20")
+  s.accept(10, chunkOf(10, 2))
+  expect(s.complete()).toBe(false)
+  s.accept(20, chunkOf(10, 3))
+  expect(s.complete()).toBe(true)
+  expect(s.assemble().length).toBe(40)
+  // An end where the data stops short of it, or beyond: the vehicle contradicts itself.
+  const t = stateOf()
+  t.accept(0, chunkOf(10, 1))
+  t.accept(10, chunkOf(10, 1))
+  t.setEnd(15)
+  expect(t.failure != null).toBe(true)
+  const u = stateOf()
+  u.setEnd(20)
+  u.setEnd(30)
+  expect(u.failure != null).toBe(true)
+  const v = stateOf()
+  v.setEnd(20)
+  v.accept(30, chunkOf(10, 1))
+  expect(v.failure != null).toBe(true)
+}
+
+function emptyFileIsCompleteAtItsEnd(): void {
+  const s = stateOf()
+  expect(s.complete()).toBe(false)
+  s.setEnd(0)
+  expect(s.complete()).toBe(true)
+  expect(s.assemble().length).toBe(0)
+}
+
+function refusesChunksNotOnTheGrid(): void {
+  const s = stateOf()
+  s.accept(5, chunkOf(10, 1))
+  expect(s.failure != null).toBe(true)
+}
+
+function aFullChunkLastNeedsTheEndFromTheVehicle(): void {
+  const s = stateOf()
+  s.accept(0, chunkOf(10, 1))
+  s.accept(10, chunkOf(10, 2))
+  // Two full chunks: the file may go on. Only the Nack EndOfFile says it ends at 20.
+  expect(s.complete()).toBe(false)
+  s.setEnd(20)
+  expect(s.complete()).toBe(true)
+}
+
+describe("reading a file with bursts", () => {
+  it("reads the packed parameter file in one burst and leaves no session open", readsTheParameterFile)
+  it("reads a 1 MB file, the same bytes with no loss", readsABigFileWithoutLoss)
+  it("reads a 1 MB file, the same bytes with 5% loss", readsABigFileWith5PercentLoss)
+  it("reads a 1 MB file, the same bytes with 20% loss", readsABigFileWith20PercentLoss)
+  it("reads files that end around the 2000-packet limit of a burst", readsFilesAroundTheBurstLimit)
+  it("reads an empty file", readsAnEmptyFile)
+  it("asks again from the first missing chunk after a burst that stalled", asksAgainFromWhereAStalledBurstStopped)
+  it("fills a few gaps and brings the file complete", fillsFewGapsWithSingleReads)
+  it("reports progress as data arrives, ending at the file's size", reportsProgress)
+  it("cancels in the middle of a burst, and still terminates the session", cancelsAndTerminates)
+  it("cancels before it starts", cancelsBeforeStarting)
+  it("terminates the session after an error", terminatesAfterAnError)
+  it("gives up when a vehicle brings nothing", givesUpWhenNothingComes)
+  it("gives up on a vehicle that repeats what it sent, and terminates", endsWhenTheVehicleRepeatsWhatItSent)
+  it("refuses a file that has no end, at the most a file may hold", refusesAFileWithoutAnEnd)
+  it("refuses a file over the maximum size, and reads one under it", refusesAFileOverTheMaximumSize)
+  it("terminates the session when the progress callback throws", terminatesWhenTheProgressCallbackThrows)
+})
+
+describe("the chunks of a file being read", () => {
+  it("assemble chunks that arrive in any order, and count one that arrives twice once", chunksInAnyOrder)
+  it("know the end of the file only as complete when no chunk is missing before it", endWithAndWithoutHoles)
+  it("complete an empty file at its end", emptyFileIsCompleteAtItsEnd)
+  it("refuse a chunk that is not at a multiple of the read size", refusesChunksNotOnTheGrid)
+  it("need the end from the vehicle after a full chunk", aFullChunkLastNeedsTheEndFromTheVehicle)
+  it("refuse data and an end past the maximum size", stateRefusesDataPastTheMaximum)
+})
