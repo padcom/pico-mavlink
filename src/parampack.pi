@@ -27,7 +27,8 @@ export const PARAM_PACK_READ_SIZE: int = 239
 /// A packed parameter file that cannot be used.
 export class ParamPackError extends Error {
   /// `BAD_MAGIC`, `TRUNCATED` (the file ends inside an entry or the header), `BAD_ENTRY` (a type or flags that are not valid, a
-  /// name that does not fit), `COUNT_MISMATCH` (the entries are not as many as the header says), `UNSUPPORTED_TYPE` and
+  /// name that does not fit), `COUNT_MISMATCH` (fewer entries than the header says), `TOO_MANY_ENTRIES` (more than it says: a
+  /// file that is wrong, not one that is cut short), `UNSUPPORTED_TYPE` and
   /// `BAD_NAME` and `BAD_READ_SIZE` (when encoding: a value, a name or a read size the format cannot carry).
   public readonly code: string
 
@@ -215,7 +216,7 @@ export function decodeParamPack(b: Uint8Array): ParamPack throws ParamPackError 
     at += 1
   }
   if (at < b.length) {
-    throw new ParamPackError("COUNT_MISMATCH", `the file has more than the ${count} parameters its header says`)
+    throw new ParamPackError("TOO_MANY_ENTRIES", `the file has more than the ${count} parameters its header says`)
   }
   const pack: ParamPack = { total, withDefaults: magic == PARAM_PACK_MAGIC_WITH_DEFAULTS, params }
   pack

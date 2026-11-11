@@ -156,7 +156,7 @@ export class SimulatedAutopilot {
   public ftp: bool = true
   /// How the FTP server misbehaves, for tests: `ok`; `unsupported` (every open fails with ENOENT, though the capability is set);
   /// `silent` (it never answers an FTP request); `corrupt` (the file has a wrong magic); `incomplete` (the file says the vehicle
-  /// has more parameters than it holds); `repeat` and `endless` (a burst that sends the first chunk again and again, or chunks at
+  /// has more parameters than it holds); `busy` (every open: no session free); `einval` (every read: EINVAL); `repeat` and `endless` (a burst that sends the first chunk again and again, or chunks at
   /// ever higher offsets with no end, until the mode is changed).
   public ftpMode: string = "ok"
   /// The share of FTP packets it drops on their way out, in percent (a lossy link), from a seeded sequence.
@@ -519,6 +519,10 @@ export class SimulatedAutopilot {
       ftpNack(ask, FtpNack.FAIL_ERRNO, 2)
       return
     }
+    if (ftpMode == "busy") {
+      ftpNack(ask, FtpNack.NO_SESSIONS_AVAILABLE)
+      return
+    }
     const now = Date.now() as int
     const mine = ftpSessions.get(req.session)
     if (mine != null && now - mine!.lastAt <= 3000) {
@@ -570,6 +574,10 @@ export class SimulatedAutopilot {
   /// The session of a read, or null after a Nack: a session that is not open is `FileNotFound` (as on the vehicle), and a size
   /// that is not the one the file was first read with is EINVAL. A size of 0 reads nothing and fixes nothing.
   ftpSessionForRead(ask: FtpAsk, size: int): FtpSession? {
+    if (ftpMode == "einval") {
+      ftpNack(ask, FtpNack.FAIL_ERRNO, 22)
+      return null
+    }
     const s = ftpSessions.get(ask.req.session)
     if (s == null) {
       ftpNack(ask, FtpNack.FILE_NOT_FOUND)

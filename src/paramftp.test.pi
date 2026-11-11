@@ -7,7 +7,9 @@ import { MavLinkError } from "./protocol"
 import { Param, ParamList, Target } from "./operations"
 import { SimParam, SimulatedAutopilot, defaultSimParams } from "./simulator"
 import { FtpError } from "./ftp"
-import { ParamDownload, ParamDownloadOptions, ParamFtp, fallbackOf } from "./paramftp"
+import { ParamDownload, ParamDownloadOptions, ParamFtp, fallbackOf, hasFtpBit } from "./paramftp"
+import { PackedParam, encodeParamPack } from "./parampack"
+import { MavProtocolCapability } from "./dialects/standard"
 import { MavParamType, ParamRequestList } from "./dialects/common"
 import { ParamEncoding, TypedParamValue, showParam } from "./params"
 
@@ -289,11 +291,107 @@ async function refusesRepeatedNames(): Promise<void> throws Error {
 function fallbackWords(): void {
   expect(fallbackOf(new FtpError("FTP_TIMEOUT", "x"))).toBe("timeout")
   expect(fallbackOf(new FtpError("FTP_INCOMPLETE", "x"))).toBe("incomplete")
+  // "unsupported" is for a vehicle that has no such file (the application may remember it for the connection)...
   expect(fallbackOf(new FtpError("FTP_NOT_FOUND", "x"))).toBe("unsupported")
+  expect(fallbackOf(new FtpError("FTP_PROTECTED", "x"))).toBe("unsupported")
   expect(fallbackOf(new FtpError("FTP_ERRNO", "x", 2))).toBe("unsupported")
-  expect(fallbackOf(new FtpError("FTP_NO_SESSIONS", "x"))).toBe("unsupported")
+  // ...a vehicle with no session free is busy, which is a timeout's kind of reason, not a missing file...
+  expect(fallbackOf(new FtpError("FTP_NO_SESSIONS", "x"))).toBe("timeout")
+  // ...and an error of one read (EINVAL, EIO), or any other refusal, is not a reason to give FTP up.
+  expect(fallbackOf(new FtpError("FTP_ERRNO", "x", 22))).toBe("protocol")
+  expect(fallbackOf(new FtpError("FTP_ERRNO", "x", 5))).toBe("protocol")
+  expect(fallbackOf(new FtpError("FTP_FAILED", "x"))).toBe("protocol")
   expect(fallbackOf(new FtpError("FTP_PROTOCOL", "x"))).toBe("protocol")
   expect(fallbackOf(new FtpError("FTP_EOF", "x"))).toBe("protocol")
+}
+
+function capabilityBits(): void {
+  // The whole u64 does not fit an int: only the low 32 bits are converted, so no pattern of the top bits panics.
+  const all: u64 = ((1 as u64) << 63) | (0x7FFFFFFFFFFFFFFF as u64)
+  expect(hasFtpBit(all)).toBe(true)
+  expect(hasFtpBit((1 as u64) << 63)).toBe(false)
+  expect(hasFtpBit(((1 as u64) << 63) | (MavProtocolCapability.FTP as u64))).toBe(true)
+  expect(hasFtpBit(MavProtocolCapability.FTP as u64)).toBe(true)
+  expect(hasFtpBit(0 as u64)).toBe(false)
+  expect(hasFtpBit((1 as u64) << 32)).toBe(false)
+}
+
+async function fallsBackForABusyVehicleAsTimeoutNotUnsupported(): Promise<void> throws Error {
+  const r = rig(many(100))
+  // Every session is taken: the open fails with no session free, after a reset and a second try.
+  r.sim.ftpMode = "busy"
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.count}`).toBe("list timeout 100")
+}
+
+async function fallsBackForAnErrorOfOneReadAsProtocol(): Promise<void> throws Error {
+  const r = rig(many(100))
+  // A read size the file refuses (EINVAL): the first read fixes it, the next differs, as a client bug would show.
+  r.sim.ftpMode = "einval"
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.count}`).toBe("list protocol 100")
+}
+
+async function aFileWithMoreEntriesThanTheVehicleHasIsNotIncomplete(): Promise<void> throws Error {
+  const r = rig(many(1))
+  const entries: PackedParam[] = []
+  for (let i = 0; i < 3; i++) {
+    const p: PackedParam = { name: `P${i}`, value: TypedParamValue.Int(i, MavParamType.INT32) }
+    entries.push(p)
+  }
+  // The header says the vehicle has 1 parameter, the file holds 3.
+  r.sim.ftpFile = encodeParamPack(entries, 1)
+  try {
+    await new ParamFtp(r.gcs, VEHICLE, FAST).run()
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_PROTOCOL")
+  }
+  r.gcs.close()
+}
+
+async function aThrowingProgressCallbackIsNotAFailureOfFtp(): Promise<void> throws Error {
+  const r = rig(many(300))
+  const requests: int[] = []
+  r.sim.conn.on((m: Received) => {
+    if (m.message instanceof ParamRequestList) {
+      requests.push(1)
+    }
+  })
+  let calls = 0
+  const counter: int[] = []
+  try {
+    await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run((_r: int, _t: int, _u: string) => {
+      counter.push(1)
+      throw new Error("the callback broke")
+    })
+    expect("downloaded").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_CALLBACK")
+  }
+  calls = counter.length
+  await delay(50)
+  r.gcs.close()
+  // The list was not tried (it would have called the callback again), and the FTP session is closed.
+  expect(requests.length).toBe(0)
+  expect(calls >= 1).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function aThrowingProgressCallbackEndsTheListToo(): Promise<void> throws Error {
+  const r = rig(many(300))
+  const list: ParamDownloadOptions = { timeoutMs: 500, retries: 2, quietMs: 300, silenceMs: 500, method: "list" }
+  try {
+    await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, list).run((_r: int, _t: int, _u: string) => {
+      throw new Error("the callback broke")
+    })
+    expect("downloaded").toBe("failed")
+  } catch (e: Error) {
+    expect(e.message).toBe("the callback broke")
+  }
+  r.gcs.close()
 }
 
 describe("the parameters by FTP", () => {
@@ -317,4 +415,10 @@ describe("the parameter download", () => {
   it("is cancelled for good, not retried by the list, and ends the FTP session", abortIsNotRetriedByTheList)
   it("is cancelled before it starts", abortsBeforeAnything)
   it("names why FTP failed in words", fallbackWords)
+  it("reads the FTP capability from the low 32 bits only, whatever the top ones are", capabilityBits)
+  it("falls back as a timeout, not as unsupported, for a vehicle with no session free", fallsBackForABusyVehicleAsTimeoutNotUnsupported)
+  it("falls back as a protocol error, not as unsupported, for the error of one read", fallsBackForAnErrorOfOneReadAsProtocol)
+  it("refuses a file with more entries than the vehicle has as nonsense, not as incomplete", aFileWithMoreEntriesThanTheVehicleHasIsNotIncomplete)
+  it("does not try the list when the progress callback threw", aThrowingProgressCallbackIsNotAFailureOfFtp)
+  it("ends the list too with what the progress callback threw", aThrowingProgressCallbackEndsTheListToo)
 })

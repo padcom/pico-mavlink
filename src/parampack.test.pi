@@ -270,7 +270,7 @@ function refusesWhatItCannotRead(): void throws ParamPackError {
   // A file that ends before the entries the header counts, and one with entries the header does not.
   expect(codeOf(good.slice(0, good.length - 2))).toBe("TRUNCATED")
   expect(codeOf(bytesOf([0x1b, 0x67, 2, 0, 2, 0, 0x01, 0x00, 0x41, 0x01]))).toBe("COUNT_MISMATCH")
-  expect(codeOf(bytesOf([0x1b, 0x67, 0, 0, 1, 0, 0x01, 0x00, 0x41, 0x01]))).toBe("COUNT_MISMATCH")
+  expect(codeOf(bytesOf([0x1b, 0x67, 0, 0, 1, 0, 0x01, 0x00, 0x41, 0x01]))).toBe("TOO_MANY_ENTRIES")
   expect(codeOf(good)).toBe("ok")
 }
 
@@ -341,7 +341,7 @@ function outcomeOf(b: Uint8Array): string {
   }
 }
 
-const CODES = ["pack", "BAD_MAGIC", "TRUNCATED", "BAD_ENTRY", "COUNT_MISMATCH"]
+const CODES = ["pack", "BAD_MAGIC", "TRUNCATED", "BAD_ENTRY", "COUNT_MISMATCH", "TOO_MANY_ENTRIES"]
 
 function onlyKnownOutcomes(): void {
   const rng = new Lcg()

@@ -52,18 +52,33 @@ export struct ParamDownloadOptions {
   signal?: AbortSignal
 }
 
-/// The words for why a failure of FTP means the list is used.
+/// ENOENT: the vehicle has no such file (its parameter file is not there, or FTP is off).
+const ENOENT: int = 2
+
+/// Whether a failure of FTP says the vehicle does not have the parameter file: "no such file", ENOENT, a protected file. Only
+/// that is "unsupported", which the application may remember for the whole connection.
+function missingFile(e: FtpError): bool {
+  e.code == "FTP_NOT_FOUND" || e.code == "FTP_PROTECTED" || (e.code == "FTP_ERRNO" && e.errno == ENOENT)
+}
+
+/// Whether AUTOPILOT_VERSION's capabilities (a u64, any bits) have the FTP bit. Only the low 32 bits are converted to an int: the
+/// whole u64 does not fit one, and a vehicle that sets its top bit must not panic the download.
+export function hasFtpBit(capabilities: u64): bool {
+  const low = (capabilities & (0xFFFFFFFF as u64)) as int
+  (low & MavProtocolCapability.FTP) != 0
+}
+
+/// The words for why a failure of FTP means the list is used: `unsupported` (the vehicle has no such file), `timeout` (no answer,
+/// or no session free: it is busy, try again), `incomplete` (too few parameters), else `protocol` (an answer that makes no sense,
+/// or an error of one read such as EINVAL or EIO: not a reason to give FTP up for good).
 export function fallbackOf(e: FtpError): string {
-  if (e.code == "FTP_TIMEOUT") {
+  if (e.code == "FTP_TIMEOUT" || e.code == "FTP_NO_SESSIONS") {
     return "timeout"
   }
   if (e.code == "FTP_INCOMPLETE") {
     return "incomplete"
   }
-  if (e.code == "FTP_NOT_FOUND" || e.code == "FTP_ERRNO" || e.code == "FTP_FAILED" || e.code == "FTP_PROTECTED" || e.code == "FTP_NO_SESSIONS") {
-    return "unsupported"
-  }
-  "protocol"
+  if (missingFile(e)) "unsupported" else "protocol"
 }
 
 /// The parameters in a decoded file, as the list gives them, or why the file is no good.
@@ -107,10 +122,12 @@ export class ParamFtp {
     this.options = options
   }
 
-  /// `progress(received, total, "bytes")` is called as the file arrives (`total` is the vehicle's estimate, 12 bytes a
-  /// parameter). Errors: `FTP_ABORTED`, `FTP_TIMEOUT`, `FTP_NOT_FOUND` ... (what the vehicle says), `FTP_PROTOCOL` (nonsense: a
-  /// corrupt file, a name twice) and `FTP_INCOMPLETE` (fewer parameters than the vehicle says it has).
-  public async run(progress: (received: int, total: int, unit: string) => void = (_r: int, _t: int, _u: string) => {}): Promise<ParamDownloadResult> throws FtpError {
+  /// `progress(received, total, "bytes")` is called as the file arrives. Both are bytes, and `total` is the vehicle's estimate
+  /// (12 bytes a parameter) of the size of the file: the file can be bigger than that, so `received` can pass `total` (clamp it
+  /// to show a percentage). Errors: `FTP_ABORTED`, `FTP_TIMEOUT`, `FTP_NOT_FOUND` ... (what the vehicle says), `FTP_PROTOCOL`
+  /// (nonsense: a corrupt file, a name twice, more entries than the header says), `FTP_INCOMPLETE` (fewer parameters than the
+  /// vehicle says it has) and `FTP_CALLBACK` (the `progress` callback threw).
+  public async run(progress: (received: int, total: int, unit: string) => void throws Error = (_r: int, _t: int, _u: string) => {}): Promise<ParamDownloadResult> throws FtpError {
     const started = Date.now() as int
     const client = new FtpClient(conn, target, { timeoutMs: options.timeoutMs, retries: options.retries, signal: options.signal })
     const path = if (options.withDefaults ?? false) `${PARAM_PACK_PATH}?withdefaults=1` else PARAM_PACK_PATH
@@ -125,10 +142,14 @@ export class ParamFtp {
     try {
       pack = decodeParamPack(file.data)
     } catch (e: ParamPackError) {
+      // (Fewer entries than the header says is a file that was cut short; more, or anything else, is a file that is wrong.)
       throw new FtpError(if (e.code == "COUNT_MISMATCH") "FTP_INCOMPLETE" else "FTP_PROTOCOL", `the parameter file: ${e.message}`)
     }
-    if (pack.params.length != pack.total) {
+    if (pack.params.length < pack.total) {
       throw new FtpError("FTP_INCOMPLETE", `the parameter file holds ${pack.params.length} of the ${pack.total} parameters`)
+    }
+    if (pack.params.length > pack.total) {
+      throw new FtpError("FTP_PROTOCOL", `the parameter file holds ${pack.params.length}, more than the ${pack.total} the vehicle has`)
     }
     const params = paramsOf(pack)
     const result: ParamDownloadResult = {
@@ -179,10 +200,10 @@ export class ParamDownload {
       return (given! & MavProtocolCapability.FTP) != 0
     }
     const v = await new AutopilotVersionRead(conn, target, { timeoutMs: options.timeoutMs, retries: options.retries, signal: options.signal }).run()
-    v != null && ((v!.capabilities as int) & MavProtocolCapability.FTP) != 0
+    v != null && hasFtpBit(v!.capabilities)
   }
 
-  async list(fallback: string?, started: int, progress: (received: int, total: int, unit: string) => void): Promise<ParamDownloadResult> throws Error {
+  async list(fallback: string?, started: int, progress: (received: int, total: int, unit: string) => void throws Error): Promise<ParamDownloadResult> throws Error {
     const listOptions: ParamOptions = {
       quietMs: options.quietMs,
       timeoutMs: options.timeoutMs,
@@ -199,7 +220,9 @@ export class ParamDownload {
   /// (`total` an estimate) and `parameters` for the list (`total` is the count the vehicle gives); only the ratio is comparable,
   /// and after a fallback it starts again from 0 in the new unit. A cancel is an `ABORTED` MavLinkError from whichever way was
   /// running, and no other way is tried after it.
-  public async run(progress: (received: int, total: int, unit: string) => void = (_r: int, _t: int, _u: string) => {}): Promise<ParamDownloadResult> throws Error {
+  /// (`received` can pass `total` for the file, whose size is an estimate: clamp it to show a percentage.) A `progress` that
+  /// throws ends the download with that error (`FTP_CALLBACK` for the file): it is not a failure of FTP, so the list is not tried.
+  public async run(progress: (received: int, total: int, unit: string) => void throws Error = (_r: int, _t: int, _u: string) => {}): Promise<ParamDownloadResult> throws Error {
     const started = Date.now() as int
     const method = options.method ?? "auto"
     if (method == "list") {
@@ -214,7 +237,8 @@ export class ParamDownload {
       if (e.code == "FTP_ABORTED") {
         throw new MavLinkError("ABORTED", "the parameter list: cancelled")
       }
-      if (method == "ftp") {
+      // A forced FTP has no fallback, and a callback that threw is the caller's: the list would call it again.
+      if (method == "ftp" || e.code == "FTP_CALLBACK") {
         throw e
       }
       return await list(fallbackOf(e), started, progress)

@@ -166,8 +166,10 @@ export class ParamList {
   count: int = -1
   lastArrival: int = 0
   /// Called with how many parameters have arrived and how many the autopilot says it has, each time a new one arrives (set it
-  /// before `run`). Does not change what `run` does.
-  public progress: (received: int, count: int) => void = (_received: int, _count: int) => {}
+  /// before `run`). Does not change what `run` does, except that a callback that throws ends it with that error.
+  public progress: (received: int, count: int) => void throws Error = (_received: int, _count: int) => {}
+  /// The first error the `progress` callback threw: `run` stops and throws it.
+  callbackError: Error? = null
 
   constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamOptions = {}) {
     this.conn = conn
@@ -180,6 +182,28 @@ export class ParamList {
 
   public async run(): Promise<ParamListResult> throws Error {
     const listener = conn.on((r: Received) => this.arrived(r))
+    try {
+      await ask()
+    } catch (e: Error) {
+      // Whatever ends the download early (a cancel, a callback that threw): the listener goes with it.
+      conn.off(listener)
+      throw e
+    }
+    conn.off(listener)
+    const params: Param[] = []
+    for (let i = 0; i < (if (count < 0) 0 else count); i++) {
+      const p = received.get(i)
+      if (p != null) {
+        params.push(p!)
+      }
+    }
+    const gone = missing()
+    const result: ParamListResult = { params, count: if (count < 0) 0 else count, missing: gone, complete: count >= 0 && gone.length == 0 }
+    result
+  }
+
+  /// The request for the list, and the requests for what did not arrive, a few rounds.
+  async ask(): Promise<void> throws Error {
     const request = new ParamRequestList()
     request.targetSystem = target.system as u8
     request.targetComponent = target.component as u8
@@ -200,17 +224,18 @@ export class ParamList {
       await quiet()
       round += 1
     }
-    conn.off(listener)
-    const params: Param[] = []
-    for (let i = 0; i < (if (count < 0) 0 else count); i++) {
-      const p = received.get(i)
-      if (p != null) {
-        params.push(p!)
+  }
+
+  /// Tells the callback that a parameter has arrived; what it throws is kept for `quiet` to throw (the listener cannot).
+  report(): void {
+    try {
+      const report = this.progress
+      report(received.size, count)
+    } catch (e: Error) {
+      if (callbackError == null) {
+        callbackError = e
       }
     }
-    const gone = missing()
-    const result: ParamListResult = { params, count: if (count < 0) 0 else count, missing: gone, complete: count >= 0 && gone.length == 0 }
-    result
   }
 
   arrived(r: Received): void {
@@ -223,8 +248,7 @@ export class ParamList {
           const isNew = !received.has(i)
           received.set(i, paramOf(m, encoding))
           if (isNew) {
-            const report = this.progress
-            report(received.size, count)
+            report()
           }
         }
         lastArrival = Date.now() as int
@@ -245,11 +269,15 @@ export class ParamList {
 
   /// Until nothing arrived for `quietMs`, or everything has.
   async quiet(): Promise<void> throws Error {
-    while ((Date.now() as int) - lastArrival < quietMs && (count < 0 || missing().length > 0)) {
+    while ((Date.now() as int) - lastArrival < quietMs && (count < 0 || missing().length > 0) && callbackError == null) {
       checkAborted(signal, "the parameter list")
       await delay(if (quietMs / 10 > 5) quietMs / 10 else 5)
     }
     checkAborted(signal, "the parameter list")
+    const failed = callbackError
+    if (failed != null) {
+      throw failed!
+    }
   }
 }
 
