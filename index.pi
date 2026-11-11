@@ -51,6 +51,14 @@ export {
 } from "./src/ftp"
 export { FtpFileResult, readFile } from "./src/ftpread"
 export {
+  PARAM_PACK_PATH,
+  ParamDownload,
+  ParamDownloadOptions,
+  ParamDownloadResult,
+  ParamFtp,
+  fallbackOf,
+} from "./src/paramftp"
+export {
   PARAM_PACK_MAGIC,
   PARAM_PACK_MAGIC_WITH_DEFAULTS,
   PARAM_PACK_READ_SIZE,
