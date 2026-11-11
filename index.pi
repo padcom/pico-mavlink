@@ -50,6 +50,16 @@ export {
   ftpPacketOf,
 } from "./src/ftp"
 export {
+  PARAM_PACK_MAGIC,
+  PARAM_PACK_MAGIC_WITH_DEFAULTS,
+  PARAM_PACK_READ_SIZE,
+  PackedParam,
+  ParamPack,
+  ParamPackError,
+  decodeParamPack,
+  encodeParamPack,
+} from "./src/parampack"
+export {
   AutopilotVersionRead,
   CommandCall,
   HeartbeatSender,
