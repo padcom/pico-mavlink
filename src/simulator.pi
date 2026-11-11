@@ -7,18 +7,68 @@
 // SYS_STATUS and ATTITUDE come at each tick unless MAV_CMD_SET_MESSAGE_INTERVAL (or REQUEST_DATA_STREAM for
 // their streams, EXTENDED_STATUS and EXTRA1) gave them a rate of their own, which it then keeps until it
 // reboots (`reboot()` forgets every rate, restarts the clock and can go quiet for a while).
+import { delay } from "std/timers"
 import { MavLinkConnection, Received } from "./connection"
+import { Target } from "./operations"
 import { MavLinkProtocolV2 } from "./protocol"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam } from "./params"
+import { PackedParam, ParamPackError, encodeParamPack } from "./parampack"
+import { FTP_MAX_DATA, FtpError, FtpNack, FtpOpcode, FtpPacket, ftpMessage, ftpPacketOf } from "./ftp"
 import { ByteStream } from "./stream"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, CommandAck, CommandLong, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
+import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
+
+/// The `n` bytes of `file` from `at` (fewer at its end).
+function slice(file: Uint8Array, at: int, n: int): Uint8Array {
+  const have = if (at + n > file.length) file.length - at else n
+  const out = new Uint8Array(if (have < 0) 0 else have)
+  for (let i = 0; i < out.length; i++) {
+    out.set(i, file[at + i])
+  }
+  out
+}
+
+/// How many parameters a packed parameter file says it holds (its header's `num_params`).
+function readCount(file: Uint8Array): int {
+  if (file.length < 4) 0 else (file[2] as int) | ((file[3] as int) << 8)
+}
+
+/// The number in `text` (digits only; 0 for anything else).
+function parseNumber(text: string): int {
+  let n = 0
+  for (const ch of text.split("")) {
+    const digit = "0123456789".indexOf(ch)
+    if (digit < 0) {
+      return 0
+    }
+    n = n * 10 + digit
+  }
+  n
+}
 
 /// One parameter of the simulated vehicle.
 export struct SimParam {
   id: string
   value: TypedParamValue
+  /// The firmware's default, when it differs from the value (served in the packed parameter file when asked for defaults).
+  firmwareDefault?: TypedParamValue
+}
+
+/// One open FTP session of the simulated vehicle: the file as it was made when it was opened.
+class FtpSession {
+  public readonly id: int
+  public readonly file: Uint8Array
+  /// The size every read of this file must ask for: fixed by the first read (the packed parameter file computes its padding from
+  /// it, and answers EINVAL to any other). 0 until the first read.
+  public readSize: int = 0
+  public lastAt: int = 0
+
+  constructor(id: int, file: Uint8Array) {
+    this.id = id
+    this.file = file
+    this.lastAt = Date.now() as int
+  }
 }
 
 /// ArduPilot Copter-like parameters (the Drone Configurator's fixtures use the same).
@@ -77,6 +127,23 @@ export class SimulatedAutopilot {
   bootedAt: int = 0
   /// Whether it is quiet (after a reboot, or set by hand): it sends nothing and hears nothing.
   public down: bool = false
+  /// Whether it has MAVLink FTP (the capability bit in AUTOPILOT_VERSION, and the server for "@PARAM/param.pck"). A vehicle
+  /// without it (a small board, `BRD_OPTIONS` bit 1) ignores FILE_TRANSFER_PROTOCOL.
+  public ftp: bool = true
+  /// How the FTP server misbehaves, for tests: `ok`; `unsupported` (every open fails with ENOENT, though the capability is set);
+  /// `silent` (it never answers an FTP request); `corrupt` (the file has a wrong magic); `incomplete` (the file says the vehicle
+  /// has more parameters than it holds).
+  public ftpMode: string = "ok"
+  /// The share of FTP packets it drops on their way out, in percent (a lossy link), from a seeded sequence.
+  public ftpLoss: int = 0
+  /// A burst stops after this many packets, with no end (a link that did not drain: the client must ask again). 0: never.
+  public ftpStallAfter: int = 0
+  /// What the FTP server was asked, one line each: "<opcode> s<session> o<offset> n<size>".
+  public readonly ftpLog: string[] = []
+  /// How many bursts it started.
+  public ftpBursts: int = 0
+  readonly ftpSessions: Map<int, FtpSession> = new Map<int, FtpSession>()
+  ftpSeed: int = 4242
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -262,7 +329,8 @@ export class SimulatedAutopilot {
         conn.send(ack)
         const v = new AutopilotVersion()
         v.capabilities = (MavProtocolCapability.PARAM_ENCODE_C_CAST | MavProtocolCapability.MAVLINK2
-            | MavProtocolCapability.MISSION_INT | MavProtocolCapability.COMMAND_INT) as u64
+            | MavProtocolCapability.MISSION_INT | MavProtocolCapability.COMMAND_INT
+            | (if (ftp) MavProtocolCapability.FTP else 0)) as u64
         v.flightSwVersion = 0x04050700   // 4.5.7 official
         conn.send(v)
       }
@@ -294,6 +362,10 @@ export class SimulatedAutopilot {
       if (forMe(m.targetSystem as int, m.targetComponent as int) && i >= 0 && i < params.length) {
         send(i)
       }
+    } else if (m instanceof FileTransferProtocol) {
+      if (ftp && forMe(m.targetSystem as int, m.targetComponent as int)) {
+        ftpHandle(m)
+      }
     } else if (m instanceof ParamSet) {
       const i = indexOf(m.paramId)
       if (forMe(m.targetSystem as int, m.targetComponent as int) && i >= 0) {
@@ -302,6 +374,244 @@ export class SimulatedAutopilot {
         send(i)
       }
     }
+  }
+
+  // --- MAVLink FTP: the packed parameter file, "@PARAM/param.pck", as ArduPilot serves it ---
+
+  /// How many FTP sessions are open.
+  public openFtpSessions(): int {
+    ftpSessions.size
+  }
+
+  /// The next number of a seeded sequence (the same loss on every run).
+  ftpRandom(n: int): int {
+    ftpSeed = (ftpSeed * 1103515245 + 12345) & 0x7FFFFFFF
+    (ftpSeed >> 8) % n
+  }
+
+  /// Whether the next FTP packet is lost on its way out.
+  ftpLost(): bool {
+    ftpLoss > 0 && ftpRandom(100) < ftpLoss
+  }
+
+  /// Sends a reply to FTP request `req`: Ack or Nack, with `data`.
+  ftpReply(req: FtpPacket, opcode: int, data: Uint8Array, seq: int, offset: int, burstComplete: bool): void {
+    if (ftpLost()) {
+      return
+    }
+    const p = new FtpPacket()
+    p.seq = seq & 0xFFFF
+    p.session = req.session
+    p.opcode = opcode
+    p.reqOpcode = req.opcode
+    p.size = data.length
+    p.data = data
+    p.offset = offset
+    p.burstComplete = burstComplete
+    try {
+      const to: Target = { system: 255, component: 0 }
+      const message = ftpMessage(to, p)
+      conn.send(message)
+      return
+    } catch (e: FtpError) {
+    }
+  }
+
+  ftpNack(req: FtpPacket, error: int, errno: int = 0): void {
+    const data = if (error == FtpNack.FAIL_ERRNO) new Uint8Array(2) else new Uint8Array(1)
+    data.set(0, error)
+    if (error == FtpNack.FAIL_ERRNO) {
+      data.set(1, errno)
+    }
+    ftpReply(req, FtpOpcode.NACK, data, req.seq + 1, req.offset, false)
+  }
+
+  ftpHandle(m: FileTransferProtocol): void {
+    let req: FtpPacket
+    try {
+      req = ftpPacketOf(m)
+    } catch (e: FtpError) {
+      return
+    }
+    ftpLog.push(`${req.opcode} s${req.session} o${req.offset} n${req.size}`)
+    if (ftpMode == "silent") {
+      return
+    }
+    if (req.opcode == FtpOpcode.RESET_SESSIONS) {
+      ftpSessions.clear()
+      ftpReply(req, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, 0, false)
+    } else if (req.opcode == FtpOpcode.OPEN_FILE_RO) {
+      ftpOpen(req)
+    } else if (req.opcode == FtpOpcode.READ_FILE) {
+      ftpRead(req)
+    } else if (req.opcode == FtpOpcode.BURST_READ_FILE) {
+      ftpBurst(req)
+    } else if (req.opcode == FtpOpcode.TERMINATE_SESSION) {
+      if (ftpSessions.has(req.session)) {
+        ftpSessions.delete(req.session)
+        ftpReply(req, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, 0, false)
+      } else {
+        ftpNack(req, FtpNack.INVALID_SESSION)
+      }
+    } else {
+      ftpNack(req, FtpNack.UNKNOWN_COMMAND)
+    }
+  }
+
+  /// OpenFileRO of "@PARAM/param.pck" (with the query `?start=N&count=C&withdefaults=1`, all optional): the Ack carries the
+  /// file's size, which is an estimate (12 bytes a parameter), as the vehicle's is.
+  ftpOpen(req: FtpPacket): void {
+    if (ftpMode == "unsupported") {
+      ftpNack(req, FtpNack.FAIL_ERRNO, 2)
+      return
+    }
+    // A session nobody has used for 3 s may be taken over; a full vehicle has no session free.
+    const now = Date.now() as int
+    if (ftpSessions.size >= 5 && !ftpSessions.has(req.session)) {
+      const idle: int[] = []
+      for (const [id, s] of ftpSessions) {
+        if (now - s.lastAt > 3000) {
+          idle.push(id)
+        }
+      }
+      if (idle.length == 0) {
+        ftpNack(req, FtpNack.NO_SESSIONS_AVAILABLE)
+        return
+      }
+      ftpSessions.delete(idle[0])
+    }
+    let name = ""
+    try {
+      name = new TextDecoder().decode(req.data)
+    } catch (e: TypeError) {
+    }
+    const parts = name.split("?")
+    if (parts[0] != "@PARAM/param.pck") {
+      ftpNack(req, FtpNack.FILE_NOT_FOUND)
+      return
+    }
+    let file: Uint8Array
+    try {
+      file = packedFile(if (parts.length > 1) parts[1] else "")
+    } catch (e: ParamPackError) {
+      ftpNack(req, FtpNack.FAIL_ERRNO, 5)
+      return
+    }
+    ftpSessions.set(req.session, new FtpSession(req.session, file))
+    const size = new Uint8Array(4)
+    const estimate = readCount(file) * 12
+    size.set(0, estimate & 0xFF)
+    size.set(1, (estimate >> 8) & 0xFF)
+    size.set(2, (estimate >> 16) & 0xFF)
+    size.set(3, (estimate >> 24) & 0xFF)
+    ftpReply(req, FtpOpcode.ACK, size, req.seq + 1, 0, false)
+  }
+
+  /// The session of a read, or null after a Nack (no such session, a size that is not the one the file was first read with).
+  ftpSessionForRead(req: FtpPacket, size: int): FtpSession? {
+    const s = ftpSessions.get(req.session)
+    if (s == null) {
+      ftpNack(req, FtpNack.INVALID_SESSION)
+      return null
+    }
+    s!.lastAt = Date.now() as int
+    // The file's padding is computed from the first read's size: any other size is refused (EINVAL), so that a client that
+    // changes it shows at once.
+    if (s!.readSize == 0) {
+      s!.readSize = size
+    } else if (s!.readSize != size) {
+      ftpNack(req, FtpNack.FAIL_ERRNO, 22)
+      return null
+    }
+    s
+  }
+
+  /// ReadFile: `size` bytes at `offset`. A size of 0 reads nothing (an Ack with no data), as a vehicle's does.
+  ftpRead(req: FtpPacket): void {
+    const s = ftpSessionForRead(req, req.size)
+    if (s == null) {
+      return
+    }
+    const file = s!.file
+    if (req.offset >= file.length) {
+      ftpNack(req, FtpNack.EOF)
+      return
+    }
+    ftpReply(req, FtpOpcode.ACK, slice(file, req.offset, req.size), req.seq + 1, req.offset, false)
+  }
+
+  /// BurstReadFile: Acks of `size` bytes (0: 239) from `offset`, up to 2000 packets, the last with burst_complete, and a Nack
+  /// EndOfFile where the file ends. A stalled burst (`ftpStallAfter`) stops with no end.
+  ftpBurst(req: FtpPacket): void {
+    const size = if (req.size == 0) FTP_MAX_DATA else req.size
+    const s = ftpSessionForRead(req, size)
+    if (s == null) {
+      return
+    }
+    ftpBursts += 1
+    this.burst(req, s!, size)
+  }
+
+  async burst(req: FtpPacket, s: FtpSession, size: int): Promise<void> throws AbortError {
+    const file = s.file
+    let offset = req.offset
+    let seq = req.seq + 1
+    let sent = 0
+    while (sent < 2000) {
+      if (down || !ftp) {
+        return
+      }
+      if (ftpStallAfter > 0 && sent >= ftpStallAfter) {
+        return
+      }
+      if (offset >= file.length) {
+        const eof = new Uint8Array(1)
+        eof.set(0, FtpNack.EOF)
+        ftpReply(req, FtpOpcode.NACK, eof, seq, offset, true)
+        return
+      }
+      const chunk = slice(file, offset, size)
+      sent += 1
+      const last = sent == 2000
+      ftpReply(req, FtpOpcode.ACK, chunk, seq, offset, last)
+      offset += chunk.length
+      seq += 1
+      // Let the rest of the link breathe: a long burst is not one tick of the event loop.
+      if (sent % 50 == 0) {
+        await delay(0)
+      }
+    }
+  }
+
+  /// The packed parameter file for a query.
+  packedFile(query: string): Uint8Array throws ParamPackError {
+    let start = 0
+    let count = params.length
+    let withDefaults = false
+    for (const pair of query.split("&")) {
+      const kv = pair.split("=")
+      if (kv.length == 2 && kv[0] == "start") {
+        start = parseNumber(kv[1])
+      } else if (kv.length == 2 && kv[0] == "count") {
+        count = parseNumber(kv[1])
+      } else if (kv.length == 2 && kv[0] == "withdefaults") {
+        withDefaults = kv[1] == "1"
+      }
+    }
+    const from = if (start > params.length) params.length else start
+    const to = if (from + count > params.length) params.length else from + count
+    const slice: PackedParam[] = []
+    for (let i = from; i < to; i++) {
+      const p = params[i]
+      const packed: PackedParam = { name: p.id, value: p.value, firmwareDefault: if (withDefaults) p.firmwareDefault else null }
+      slice.push(packed)
+    }
+    const total = if (ftpMode == "incomplete") params.length + 3 else params.length
+    const file = encodeParamPack(slice, total, withDefaults)
+    if (ftpMode == "corrupt") {
+      file.set(0, 0x00)
+    }
+    file
   }
 
   rounded(id: string, v: TypedParamValue): TypedParamValue {

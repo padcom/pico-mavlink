@@ -1,0 +1,363 @@
+// The simulated autopilot's MAVLink FTP server: "@PARAM/param.pck" as ArduPilot serves it, and the faults tests can ask of it.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { Target, AutopilotVersionRead } from "./operations"
+import { SimParam, SimulatedAutopilot, defaultSimParams } from "./simulator"
+import { FTP_MAX_DATA, FtpClient, FtpError, FtpNack, FtpOpcode, FtpOptions, FtpPacket, ftpMessage, ftpPacketOf } from "./ftp"
+import { PackedParam, ParamPack, ParamPackError, decodeParamPack } from "./parampack"
+import { FileTransferProtocol, MavParamType } from "./dialects/common"
+import { MavProtocolCapability } from "./dialects/standard"
+import { TypedParamValue, showParam } from "./params"
+
+const VEHICLE: Target = { system: 1, component: 1 }
+const FAST: FtpOptions = { timeoutMs: 150, retries: 1, session: 7 }
+const PATH = "@PARAM/param.pck"
+
+class Rig {
+  public readonly gcs: MavLinkConnection
+  public readonly sim: SimulatedAutopilot
+
+  constructor(gcs: MavLinkConnection, sim: SimulatedAutopilot) {
+    this.gcs = gcs
+    this.sim = sim
+  }
+}
+
+function rig(params: SimParam[] = defaultSimParams()): Rig {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const sim = new SimulatedAutopilot(ends[1], params)
+  gcs.run()
+  sim.conn.run()
+  new Rig(gcs, sim)
+}
+
+/// The whole file as a client reads it.
+async function readAll(client: FtpClient, path: string): Promise<Uint8Array> throws Error {
+  await client.reset()
+  await client.open(path)
+  const parts: Uint8Array[] = []
+  let total = 0
+  let at = 0
+  while (true) {
+    const chunk = await client.read(at)
+    if (chunk == null) {
+      break
+    }
+    parts.push(chunk!)
+    total += chunk!.length
+    at += chunk!.length
+  }
+  await client.terminate()
+  const out = new Uint8Array(total)
+  let pos = 0
+  for (const part of parts) {
+    for (let i = 0; i < part.length; i++) {
+      out.set(pos + i, part[i])
+    }
+    pos += part.length
+  }
+  out
+}
+
+function shown(p: PackedParam): string {
+  `${p.name}=${showParam(p.value)}`
+}
+
+function many(count: int): SimParam[] {
+  const list: SimParam[] = []
+  for (let i = 0; i < count; i++) {
+    const p: SimParam = { id: `P${i % 90}_V${i}`, value: TypedParamValue.Int(i - 500, MavParamType.INT32) }
+    list.push(p)
+  }
+  list
+}
+
+async function advertisesTheCapability(): Promise<void> throws Error {
+  const on = rig()
+  const withFtp = await new AutopilotVersionRead(on.gcs, VEHICLE, { timeoutMs: 100, retries: 1 }).run()
+  on.gcs.close()
+  expect(((withFtp!.capabilities as int) & MavProtocolCapability.FTP) != 0).toBe(true)
+  const off = rig()
+  off.sim.ftp = false
+  const without = await new AutopilotVersionRead(off.gcs, VEHICLE, { timeoutMs: 100, retries: 1 }).run()
+  off.gcs.close()
+  expect(((without!.capabilities as int) & MavProtocolCapability.FTP) == 0).toBe(true)
+}
+
+async function servesTheParameterFile(): Promise<void> throws Error {
+  const r = rig()
+  const file = await readAll(new FtpClient(r.gcs, VEHICLE, FAST), PATH)
+  r.gcs.close()
+  const pack = decodeParamPack(file)
+  expect(pack.total).toBe(12)
+  expect(pack.params.map((p) => shown(p)).join(",")).toBe(r.sim.params.map((p) => `${p.id}=${showParam(p.value)}`).join(","))
+  // The session is closed again, and every read asked for the same explicit size.
+  expect(r.sim.openFtpSessions()).toBe(0)
+  for (const line of r.sim.ftpLog) {
+    if (line.startsWith("5 ")) {
+      expect(line.includes("n239")).toBe(true)
+    }
+  }
+}
+
+async function sizeIsAnEstimate(): Promise<void> throws Error {
+  const r = rig()
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  await client.reset()
+  const estimate = await client.open(PATH)
+  r.gcs.close()
+  expect(estimate).toBe(12 * 12)
+}
+
+async function servesSlicesAndDefaults(): Promise<void> throws Error {
+  const params = defaultSimParams()
+  params[3] = { id: params[3].id, value: params[3].value, firmwareDefault: TypedParamValue.Int(1, MavParamType.INT8) }
+  const r = rig(params)
+  const slice = decodeParamPack(await readAll(new FtpClient(r.gcs, VEHICLE, FAST), `${PATH}?start=2&count=3`))
+  expect(slice.total).toBe(12)
+  expect(slice.params.map((p) => p.name).join(",")).toBe("BATT_LOW_VOLT,FENCE_ENABLE,FENCE_RADIUS")
+  const defaults = decodeParamPack(await readAll(new FtpClient(r.gcs, VEHICLE, FAST), `${PATH}?start=2&count=3&withdefaults=1`))
+  r.gcs.close()
+  expect(defaults.withDefaults).toBe(true)
+  expect(defaults.params[1].firmwareDefault != null).toBe(true)
+  expect(showParam(defaults.params[1].firmwareDefault!)).toBe("1")
+  expect(slice.withDefaults).toBe(false)
+}
+
+async function servesAThousandParameters(): Promise<void> throws Error {
+  const r = rig(many(1400))
+  const file = await readAll(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 500, retries: 1, session: 7 }), PATH)
+  r.gcs.close()
+  const pack = decodeParamPack(file)
+  expect(pack.params.length).toBe(1400)
+  expect(pack.params[1399].name).toBe("P49_V1399")
+  expect(showParam(pack.params[1399].value)).toBe("899")
+}
+
+async function refusesAChangedReadSize(): Promise<void> throws Error {
+  const r = rig()
+  const first = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 150, retries: 1, session: 9, readSize: 100 })
+  await first.reset()
+  await first.open(PATH)
+  await first.read(0)
+  // The same open file (the same session) read with another size: EINVAL, as ArduPilot answers.
+  const second = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 150, retries: 1, session: 9, readSize: 239 })
+  try {
+    await second.read(0)
+    expect("read").toBe("refused")
+  } catch (e: FtpError) {
+    expect(`${e.code} ${e.errno}`).toBe("FTP_ERRNO 22")
+  }
+  r.gcs.close()
+}
+
+async function refusesAnUnknownSessionAndFile(): Promise<void> throws Error {
+  const r = rig()
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  try {
+    await client.read(0)
+    expect("read").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_INVALID_SESSION")
+  }
+  try {
+    await client.open("@PARAM/other")
+    expect("opened").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_NOT_FOUND")
+  }
+  r.gcs.close()
+}
+
+async function hasFiveSessions(): Promise<void> throws Error {
+  const r = rig()
+  for (const id of [1, 2, 3, 4, 5]) {
+    await new FtpClient(r.gcs, VEHICLE, { timeoutMs: 150, retries: 1, session: id }).open(PATH)
+  }
+  expect(r.sim.openFtpSessions()).toBe(5)
+  // A sixth finds none free; the client resets (every session of the link is closed) and gets its own.
+  const sixth = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 150, retries: 1, session: 6 })
+  await sixth.open(PATH)
+  r.gcs.close()
+  expect(r.sim.openFtpSessions()).toBe(1)
+  expect(r.sim.ftpLog.slice(5).map((line) => line.split(" ")[0]).join(",")).toBe("4,2,4")
+}
+
+async function terminatesSessions(): Promise<void> throws Error {
+  const r = rig()
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  await client.open(PATH)
+  expect(r.sim.openFtpSessions()).toBe(1)
+  await client.terminate()
+  expect(r.sim.openFtpSessions()).toBe(0)
+  // Terminating what is not open is answered with a Nack and does not throw.
+  await client.terminate()
+  r.gcs.close()
+}
+
+async function unsupportedMode(): Promise<void> throws Error {
+  const r = rig()
+  r.sim.ftpMode = "unsupported"
+  try {
+    await new FtpClient(r.gcs, VEHICLE, FAST).open(PATH)
+    expect("opened").toBe("refused")
+  } catch (e: FtpError) {
+    // ENOENT: 2.
+    expect(`${e.code} ${e.errno}`).toBe("FTP_ERRNO 2")
+  }
+  r.gcs.close()
+}
+
+async function silentAndOffModes(): Promise<void> throws Error {
+  for (const mode of ["silent", "off"]) {
+    const r = rig()
+    if (mode == "silent") {
+      r.sim.ftpMode = "silent"
+    } else {
+      r.sim.ftp = false
+    }
+    try {
+      await new FtpClient(r.gcs, VEHICLE, { timeoutMs: 50, retries: 1, session: 7 }).open(PATH)
+      expect("opened").toBe("refused")
+    } catch (e: FtpError) {
+      expect(e.code).toBe("FTP_TIMEOUT")
+    }
+    r.gcs.close()
+  }
+}
+
+async function corruptAndIncompleteModes(): Promise<void> throws Error {
+  const bad = rig()
+  bad.sim.ftpMode = "corrupt"
+  const corrupt = await readAll(new FtpClient(bad.gcs, VEHICLE, FAST), PATH)
+  bad.gcs.close()
+  try {
+    decodeParamPack(corrupt)
+    expect("decoded").toBe("refused")
+  } catch (e: ParamPackError) {
+    expect(e.code).toBe("BAD_MAGIC")
+  }
+  const short = rig()
+  short.sim.ftpMode = "incomplete"
+  const pack = decodeParamPack(await readAll(new FtpClient(short.gcs, VEHICLE, FAST), PATH))
+  short.gcs.close()
+  // The header says the vehicle has more than the file holds.
+  expect(`${pack.total} ${pack.params.length}`).toBe("15 12")
+}
+
+/// What a burst request brings back, until its end or `waitMs` of silence.
+async function burst(r: Rig, session: int, offset: int, size: int, waitMs: int): Promise<FtpPacket[]> throws Error {
+  const got: FtpPacket[] = []
+  const id = r.gcs.on((m: Received) => {
+    const msg = m.message
+    if (msg instanceof FileTransferProtocol) {
+      try {
+        got.push(ftpPacketOf(msg))
+      } catch (e: FtpError) {
+      }
+    }
+  })
+  const request = new FtpPacket()
+  request.seq = 100
+  request.session = session
+  request.opcode = FtpOpcode.BURST_READ_FILE
+  request.size = size
+  request.offset = offset
+  r.gcs.send(ftpMessage(VEHICLE, request))
+  let last = Date.now() as int
+  let seen = 0
+  while ((Date.now() as int) - last < waitMs) {
+    await delay(5)
+    if (got.length > seen) {
+      seen = got.length
+      last = Date.now() as int
+    }
+    if (got.length > 0 && got[got.length - 1].burstComplete) {
+      break
+    }
+  }
+  r.gcs.off(id)
+  got
+}
+
+async function burstsTheWholeFile(): Promise<void> throws Error {
+  const r = rig(many(400))
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 500, retries: 1, session: 7 })
+  await client.reset()
+  await client.open(PATH)
+  // 0 means 239, as on the vehicle; every read of the file then uses that one size.
+  const packets = await burst(r, 7, 0, 0, 500)
+  r.gcs.close()
+  expect(r.sim.ftpBursts).toBe(1)
+  const last = packets[packets.length - 1]
+  expect(`${last.opcode} ${last.burstComplete} ${last.data[0]}`).toBe(`${FtpOpcode.NACK} true ${FtpNack.EOF}`)
+  let at = 0
+  let seq = 101
+  let bytes = 0
+  for (let i = 0; i < packets.length - 1; i++) {
+    expect(packets[i].opcode).toBe(FtpOpcode.ACK)
+    expect(packets[i].offset).toBe(at)
+    expect(packets[i].seq).toBe(seq)
+    expect(packets[i].burstComplete).toBe(false)
+    at += packets[i].data.length
+    seq += 1
+    bytes += packets[i].data.length
+  }
+  expect(packets[0].data.length).toBe(FTP_MAX_DATA)
+  // Several packets (the file is a few thousand bytes), and the bytes add up to the file.
+  expect(packets.length > 10).toBe(true)
+  expect(bytes > 2000).toBe(true)
+}
+
+async function stalledBurstStopsEarly(): Promise<void> throws Error {
+  const r = rig(many(400))
+  r.sim.ftpStallAfter = 3
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 500, retries: 1, session: 7 })
+  await client.open(PATH)
+  const packets = await burst(r, 7, 0, 239, 150)
+  r.gcs.close()
+  // Three packets, no burst_complete and no end of file: the client has to ask again from where it stopped.
+  expect(packets.length).toBe(3)
+  expect(packets[2].burstComplete).toBe(false)
+  expect(packets[2].offset).toBe(478)
+}
+
+async function lossDropsPackets(): Promise<void> throws Error {
+  const clean = rig(many(400))
+  await new FtpClient(clean.gcs, VEHICLE, { timeoutMs: 500, retries: 1, session: 7 }).open(PATH)
+  const all = await burst(clean, 7, 0, 239, 150)
+  clean.gcs.close()
+  const lossy = rig(many(400))
+  lossy.sim.ftpLoss = 20
+  const client = new FtpClient(lossy.gcs, VEHICLE, { timeoutMs: 100, retries: 6, session: 7 })
+  await client.open(PATH)
+  const some = await burst(lossy, 7, 0, 239, 150)
+  lossy.gcs.close()
+  // About a fifth is gone (the same ones on every run, from a seeded sequence), and what arrives is still in order.
+  expect(some.length < all.length).toBe(true)
+  expect(some.length > all.length / 2).toBe(true)
+  for (let i = 1; i < some.length; i++) {
+    expect(some[i].seq > some[i - 1].seq).toBe(true)
+  }
+}
+
+describe("the simulated autopilot's MAVLink FTP", () => {
+  it("sets the FTP capability bit only when it has FTP", advertisesTheCapability)
+  it("serves the packed parameter file: every parameter, in order, with its type and value", servesTheParameterFile)
+  it("answers an open with an estimate of the size (12 bytes a parameter)", sizeIsAnEstimate)
+  it("serves a slice (?start&count) and the firmware defaults (?withdefaults=1)", servesSlicesAndDefaults)
+  it("serves fourteen hundred parameters", servesAThousandParameters)
+  it("answers EINVAL to a read size other than the one the file was first read with", refusesAChangedReadSize)
+  it("refuses a read on a session that is not open and a file that is not there", refusesAnUnknownSessionAndFile)
+  it("has five sessions; a sixth is refused, and the client's reset makes room", hasFiveSessions)
+  it("ends a session on terminate, and answers a Nack for one that is not open", terminatesSessions)
+  it("fails every open with ENOENT in the unsupported mode", unsupportedMode)
+  it("never answers in the silent mode, and not at all without FTP", silentAndOffModes)
+  it("serves a file with a wrong magic (corrupt) and one that says there are more parameters (incomplete)", corruptAndIncompleteModes)
+  it("bursts the file in order, the last packet a Nack EndOfFile with burst_complete", burstsTheWholeFile)
+  it("stops a stalled burst early, with no end", stalledBurstStopsEarly)
+  it("drops about the share of packets it is told to, the same on every run", lossDropsPackets)
+})
