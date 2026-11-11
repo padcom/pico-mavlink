@@ -28,7 +28,7 @@ export const PARAM_PACK_READ_SIZE: int = 239
 export class ParamPackError extends Error {
   /// `BAD_MAGIC`, `TRUNCATED` (the file ends inside an entry or the header), `BAD_ENTRY` (a type or flags that are not valid, a
   /// name that does not fit), `COUNT_MISMATCH` (the entries are not as many as the header says), `UNSUPPORTED_TYPE` and
-  /// `BAD_NAME` (when encoding: a value or a name the format cannot carry).
+  /// `BAD_NAME` and `BAD_READ_SIZE` (when encoding: a value, a name or a read size the format cannot carry).
   public readonly code: string
 
   constructor(code: string, message: string) {
@@ -134,8 +134,14 @@ function nameOf(shared: Uint8Array, common: int, b: Uint8Array, at: int, n: int)
   name
 }
 
-/// A name as text; bytes that are not text make the entry bad.
+/// A name as text. A parameter's name is printable ASCII (0x21 to 0x7E, no space): anything else makes the entry bad, which
+/// also keeps the decoder from making text of bytes that are not (a decoder replaces them, it does not refuse them).
 function textOf(name: Uint8Array, entry: int): string throws ParamPackError {
+  for (let i = 0; i < name.length; i++) {
+    if (name[i] < 0x21 || name[i] > 0x7E) {
+      throw new ParamPackError("BAD_ENTRY", `the name of entry ${entry} has the byte ${name[i]}, which is not printable ASCII`)
+    }
+  }
   try {
     new TextDecoder().decode(name)
   } catch (e: TypeError) {
@@ -172,6 +178,10 @@ export function decodeParamPack(b: Uint8Array): ParamPack throws ParamPackError 
     }
     if (flags > 1) {
       throw new ParamPackError("BAD_ENTRY", `entry ${params.length} has the flags ${flags}`)
+    }
+    // A default can only follow where the file says it may (the magic of a file written with defaults).
+    if (flags == 1 && magic != PARAM_PACK_MAGIC_WITH_DEFAULTS) {
+      throw new ParamPackError("BAD_ENTRY", `entry ${params.length} has a default, and the file's magic says it has none`)
     }
     if (at + 1 >= b.length) {
       throw new ParamPackError("TRUNCATED", `the file ends inside entry ${params.length}`)
@@ -261,6 +271,10 @@ export function encodeParamPack(
   withDefaults: bool = false,
   readSize: int = 239,
 ): Uint8Array throws ParamPackError {
+  // A read packet smaller than two values cannot hold the padding rule (it would never end, or divide by zero).
+  if (readSize < 8) {
+    throw new ParamPackError("BAD_READ_SIZE", `a read size of ${readSize} bytes is too small: at least 8`)
+  }
   const out: int[] = []
   const magic = if (withDefaults) PARAM_PACK_MAGIC_WITH_DEFAULTS else PARAM_PACK_MAGIC
   writeHeader(out, magic, params.length, total)
@@ -269,6 +283,11 @@ export function encodeParamPack(
     const nameBytes = new TextEncoder().encode(p.name)
     if (nameBytes.length < 1 || nameBytes.length > 16) {
       throw new ParamPackError("BAD_NAME", `the name "${p.name}" is ${nameBytes.length} bytes: the file holds 1 to 16`)
+    }
+    for (let i = 0; i < nameBytes.length; i++) {
+      if (nameBytes[i] < 0x21 || nameBytes[i] > 0x7E) {
+        throw new ParamPackError("BAD_NAME", `the name "${p.name}" has a character that is not printable ASCII`)
+      }
     }
     const type = typeOfValue(p.value)
     const nibble = nibbleOf(type)

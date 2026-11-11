@@ -194,7 +194,7 @@ function allTypesAtTheirExtremes(): void throws ParamPackError {
 
 function padsBeforeValuesAtEveryOffset(): void throws ParamPackError {
   // Whatever the read size, no multi-byte value crosses the edge of a read packet, and the decoder skips the padding.
-  for (const readSize of [7, 16, 31, 64, 239]) {
+  for (const readSize of [8, 9, 16, 31, 64, 239]) {
     const params = generated(400)
     const file = encodeParamPack(params, 400, false, readSize)
     expect(sameAll(decodeParamPack(file).params, params)).toBe(true)
@@ -294,6 +294,97 @@ function refusesWhatItCannotWrite(): void {
   expect(encodeCode([withDefault], true)).toBe("ok")
 }
 
+function namesArePrintableAscii(): void {
+  // A space, a control byte and a byte above 0x7E in a name are refused, and so is a name written with them.
+  expect(codeOf(bytesOf([0x1b, 0x67, 1, 0, 1, 0, 0x01, 0x00, 0x20, 0x01]))).toBe("BAD_ENTRY")
+  expect(codeOf(bytesOf([0x1b, 0x67, 1, 0, 1, 0, 0x01, 0x00, 0x07, 0x01]))).toBe("BAD_ENTRY")
+  expect(codeOf(bytesOf([0x1b, 0x67, 1, 0, 1, 0, 0x01, 0x00, 0xE9, 0x01]))).toBe("BAD_ENTRY")
+  expect(codeOf(bytesOf([0x1b, 0x67, 1, 0, 1, 0, 0x01, 0x00, 0x7E, 0x01]))).toBe("ok")
+  expect(encodeCode([int8("A B", 1)], false)).toBe("BAD_NAME")
+  expect(encodeCode([int8("Ä", 1)], false)).toBe("BAD_NAME")
+}
+
+function aDefaultNeedsTheMagicOfDefaults(): void {
+  // Flags 1 under the magic of a file without defaults: refused (a vehicle only sets it when asked for defaults).
+  expect(codeOf(bytesOf([0x1b, 0x67, 1, 0, 1, 0, 0x11, 0x00, 0x41, 0x01, 0x02]))).toBe("BAD_ENTRY")
+  expect(codeOf(bytesOf([0x1c, 0x67, 1, 0, 1, 0, 0x11, 0x00, 0x41, 0x01, 0x02]))).toBe("ok")
+}
+
+function aReadSizeThatCannotWork(): void {
+  for (const size of [0, 1, 3, -5, 7]) {
+    try {
+      encodeParamPack([int32("A", 1)], 1, false, size)
+      expect(`read size ${size} was accepted`).toBe("refused")
+    } catch (e: ParamPackError) {
+      expect(e.code).toBe("BAD_READ_SIZE")
+    }
+  }
+  expect(encodeCode8()).toBe("ok")
+}
+
+function encodeCode8(): string {
+  try {
+    encodeParamPack([int32("A", 1)], 1, false, 8)
+    "ok"
+  } catch (e: ParamPackError) {
+    e.code
+  }
+}
+
+/// What decoding `b` comes to: "pack" or the code of the error. Anything else would panic the test.
+function outcomeOf(b: Uint8Array): string {
+  try {
+    decodeParamPack(b)
+    "pack"
+  } catch (e: ParamPackError) {
+    e.code
+  }
+}
+
+const CODES = ["pack", "BAD_MAGIC", "TRUNCATED", "BAD_ENTRY", "COUNT_MISMATCH"]
+
+function onlyKnownOutcomes(): void {
+  const rng = new Lcg()
+  // Random bytes under a valid magic, of every length from 0 to a few hundred.
+  for (let round = 0; round < 3000; round++) {
+    const length = rng.next(300)
+    const b = new Uint8Array(length)
+    for (let i = 0; i < length; i++) {
+      b.set(i, rng.next(256))
+    }
+    if (length >= 6 && rng.next(4) != 0) {
+      b.set(0, if (rng.next(2) == 0) 0x1b else 0x1c)
+      b.set(1, 0x67)
+    }
+    expect(CODES.includes(outcomeOf(b))).toBe(true)
+  }
+}
+
+function damagedValidFiles(): void throws ParamPackError {
+  const rng = new Lcg()
+  const good = encodeParamPack(generated(120), 120)
+  const goodWithDefaults = encodeParamPack(generated(60), 60, true)
+  for (const original of [good, goodWithDefaults]) {
+    for (let round = 0; round < 1500; round++) {
+      const kind = rng.next(3)
+      const copy = if (kind == 1) new Uint8Array(rng.next(original.length + 1)) else new Uint8Array(original.length + rng.next(40))
+      for (let i = 0; i < copy.length; i++) {
+        copy.set(i, if (i < original.length) original[i] else rng.next(256))
+      }
+      if (kind == 0) {
+        // Flipped bytes.
+        for (let k = 0; k < 1 + rng.next(4); k++) {
+          copy.set(rng.next(copy.length), rng.next(256))
+        }
+      }
+      // Cut (kind 1) and extended (kind 2) files are as they were made above.
+      expect(CODES.includes(outcomeOf(copy))).toBe(true)
+    }
+  }
+  // The undamaged files still decode.
+  expect(decodeParamPack(good).params.length).toBe(120)
+}
+
 function headerHasTheMagics(): void throws ParamPackError {
   const plain = encodeParamPack([int8("A", 1)], 1)
   const defaults = encodeParamPack([int8("A", 1)], 1, true)
@@ -313,6 +404,11 @@ describe("the packed parameter file", () => {
   it("holds no parameters", emptyFile)
   it("has the right magic in its header", headerHasTheMagics)
   it("ignores padding after the last entry", trailingPaddingIsFine)
+  it("holds only printable ASCII in a name, reading and writing", namesArePrintableAscii)
+  it("takes a default only under the magic of a file with defaults", aDefaultNeedsTheMagicOfDefaults)
+  it("refuses a read size under 8 (which would never end, or divide by zero)", aReadSizeThatCannotWork)
+  it("comes to a pack or a known error for random bytes under a valid magic", onlyKnownOutcomes)
+  it("comes to a pack or a known error for valid files that are flipped, cut or extended", damagedValidFiles)
   it("refuses a bad magic, a bad type or flags, a cut-off entry and a count that does not match", refusesWhatItCannotRead)
   it("refuses to write a name or a type the file cannot hold", refusesWhatItCannotWrite)
 })
