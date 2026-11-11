@@ -156,7 +156,8 @@ export class SimulatedAutopilot {
   public ftp: bool = true
   /// How the FTP server misbehaves, for tests: `ok`; `unsupported` (every open fails with ENOENT, though the capability is set);
   /// `silent` (it never answers an FTP request); `corrupt` (the file has a wrong magic); `incomplete` (the file says the vehicle
-  /// has more parameters than it holds).
+  /// has more parameters than it holds); `repeat` and `endless` (a burst that sends the first chunk again and again, or chunks at
+  /// ever higher offsets with no end, until the mode is changed).
   public ftpMode: string = "ok"
   /// The share of FTP packets it drops on their way out, in percent (a lossy link), from a seeded sequence.
   public ftpLoss: int = 0
@@ -616,7 +617,28 @@ export class SimulatedAutopilot {
     this.burst(ask, s!, size)
   }
 
+  /// A hostile burst: the first chunk again and again (`repeat`), or chunks at ever higher offsets with no end (`endless`), until
+  /// the mode is changed or the vehicle goes down.
+  async hostileBurst(ask: FtpAsk, s: FtpSession, size: int): Promise<void> throws AbortError {
+    const mode = ftpMode
+    const chunk = slice(s.file, 0, size)
+    let seq = ask.req.seq + 1
+    let n = 0
+    while (ftpMode == mode && !down && ftp) {
+      ftpReply(ask, FtpOpcode.ACK, chunk, seq, if (mode == "repeat") 0 else n * size, false, false)
+      seq += 1
+      n += 1
+      if (n % 50 == 0) {
+        await delay(0)
+      }
+    }
+  }
+
   async burst(ask: FtpAsk, s: FtpSession, size: int): Promise<void> throws AbortError {
+    if (ftpMode == "repeat" || ftpMode == "endless") {
+      await hostileBurst(ask, s, size)
+      return
+    }
     const req = ask.req
     const file = s.file
     let offset = req.offset
