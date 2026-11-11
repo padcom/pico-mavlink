@@ -1,0 +1,364 @@
+// MAVLink FTP (https://mavlink.io/en/services/ftp.html): the packet that rides in FILE_TRANSFER_PROTOCOL, and a client that does
+// one request at a time: reset the sessions, open a file for reading, read a chunk, terminate. Everything is asked again after a
+// timeout, with the same sequence number (the vehicle answers a repeat of a request from its cache), and every operation can be
+// cancelled with an AbortSignal. Burst reads and filling gaps come on top of this (the next module), and so do the other file
+// operations.
+//
+// The packet (payload of FILE_TRANSFER_PROTOCOL, 251 bytes, little-endian):
+//   seq u16, session u8, opcode u8, size u8, req_opcode u8, burst_complete u8, padding u8, offset u32, then up to 239 data bytes.
+// A reply has opcode Ack (128) or Nack (129), its req_opcode names the request, and its seq is the request's plus one. A Nack's
+// first data byte is the error (the second the errno, for `FailErrno`).
+import { MavLinkConnection, Received } from "./connection"
+import { FileTransferProtocol } from "./dialects/common"
+import { Target } from "./operations"
+import { byteAt, readUint, writeUint } from "./bytes"
+
+/// The size of the header of a packet, and the most data one carries.
+export const FTP_HEADER_SIZE: int = 12
+export const FTP_MAX_DATA: int = 239
+
+/// The FTP opcodes (MAV_FTP_OPCODE).
+export class FtpOpcode {
+  public static readonly NONE: int = 0
+  public static readonly TERMINATE_SESSION: int = 1
+  public static readonly RESET_SESSIONS: int = 2
+  public static readonly LIST_DIRECTORY: int = 3
+  public static readonly OPEN_FILE_RO: int = 4
+  public static readonly READ_FILE: int = 5
+  public static readonly CREATE_FILE: int = 6
+  public static readonly WRITE_FILE: int = 7
+  public static readonly REMOVE_FILE: int = 8
+  public static readonly CREATE_DIRECTORY: int = 9
+  public static readonly REMOVE_DIRECTORY: int = 10
+  public static readonly OPEN_FILE_WO: int = 11
+  public static readonly TRUNCATE_FILE: int = 12
+  public static readonly RENAME: int = 13
+  public static readonly CALC_FILE_CRC32: int = 14
+  public static readonly BURST_READ_FILE: int = 15
+  public static readonly ACK: int = 128
+  public static readonly NACK: int = 129
+}
+
+/// The errors of a Nack (MAV_FTP_ERR).
+export class FtpNack {
+  public static readonly NONE: int = 0
+  public static readonly FAIL: int = 1
+  public static readonly FAIL_ERRNO: int = 2
+  public static readonly INVALID_DATA_SIZE: int = 3
+  public static readonly INVALID_SESSION: int = 4
+  public static readonly NO_SESSIONS_AVAILABLE: int = 5
+  public static readonly EOF: int = 6
+  public static readonly UNKNOWN_COMMAND: int = 7
+  public static readonly FILE_EXISTS: int = 8
+  public static readonly FILE_PROTECTED: int = 9
+  public static readonly FILE_NOT_FOUND: int = 10
+}
+
+/// Why an FTP operation failed.
+export class FtpError extends Error {
+  /// `FTP_TIMEOUT` (no answer after the tries), `FTP_ABORTED` (cancelled), `FTP_PROTOCOL` (a packet that is not one), `FTP_EOF`,
+  /// `FTP_NOT_FOUND`, `FTP_NO_SESSIONS`, `FTP_INVALID_SESSION`, `FTP_PROTECTED`, `FTP_EXISTS`, `FTP_ERRNO` (with the vehicle's
+  /// errno), `FTP_FAILED` (any other Nack).
+  public readonly code: string
+  /// The errno the vehicle gave with `FTP_ERRNO`, else 0.
+  public readonly errno: int
+
+  constructor(code: string, message: string, errno: int = 0) {
+    super(message)
+    this.code = code
+    this.errno = errno
+  }
+}
+
+/// One FTP packet.
+export class FtpPacket {
+  public seq: int = 0
+  public session: int = 0
+  public opcode: int = 0
+  /// How many bytes of data it carries; in a read request, how many bytes are asked for.
+  public size: int = 0
+  public reqOpcode: int = 0
+  public burstComplete: bool = false
+  public offset: int = 0
+  public data: Uint8Array = new Uint8Array(0)
+
+  /// The 251 bytes of the payload of FILE_TRANSFER_PROTOCOL.
+  public toPayload(): Uint8Array throws FtpError {
+    if (data.length > FTP_MAX_DATA) {
+      throw new FtpError("FTP_PROTOCOL", `${data.length} bytes of data: a packet carries at most ${FTP_MAX_DATA}`)
+    }
+    const b = new Uint8Array(251)
+    writeUint(b, 0, 2, seq)
+    writeUint(b, 2, 1, session)
+    writeUint(b, 3, 1, opcode)
+    writeUint(b, 4, 1, size)
+    writeUint(b, 5, 1, reqOpcode)
+    writeUint(b, 6, 1, if (burstComplete) 1 else 0)
+    writeUint(b, 8, 4, offset)
+    for (let i = 0; i < data.length; i++) {
+      b.set(FTP_HEADER_SIZE + i, data[i])
+    }
+    b
+  }
+
+  /// A packet from the bytes of a payload. A payload shorter than the header, or one that says it carries more than it does or
+  /// more than a packet can, is an `FTP_PROTOCOL` error. (For a reply, `size` is the number of data bytes; a request that asks for
+  /// bytes, a read, has no data, so its size is not checked against the bytes there.)
+  public static fromPayload(b: Uint8Array): FtpPacket throws FtpError {
+    if (b.length < FTP_HEADER_SIZE) {
+      throw new FtpError("FTP_PROTOCOL", `an FTP payload of ${b.length} bytes: its header needs ${FTP_HEADER_SIZE}`)
+    }
+    const p = new FtpPacket()
+    p.seq = readUint(b, 0, 2)
+    p.session = byteAt(b, 2)
+    p.opcode = byteAt(b, 3)
+    p.size = byteAt(b, 4)
+    p.reqOpcode = byteAt(b, 5)
+    p.burstComplete = byteAt(b, 6) != 0
+    p.offset = readUint(b, 8, 4)
+    if (p.size > FTP_MAX_DATA) {
+      throw new FtpError("FTP_PROTOCOL", `an FTP packet that says it carries ${p.size} bytes: at most ${FTP_MAX_DATA}`)
+    }
+    const have = if (b.length - FTP_HEADER_SIZE < p.size) b.length - FTP_HEADER_SIZE else p.size
+    const data = new Uint8Array(have)
+    for (let i = 0; i < have; i++) {
+      data.set(i, b[FTP_HEADER_SIZE + i])
+    }
+    p.data = data
+    if (p.size > have && (p.opcode == FtpOpcode.ACK || p.opcode == FtpOpcode.NACK)) {
+      throw new FtpError("FTP_PROTOCOL", `an FTP reply that says it carries ${p.size} bytes and has ${have}`)
+    }
+    p
+  }
+}
+
+/// The FILE_TRANSFER_PROTOCOL message that carries `p` to `target` (network 0).
+export function ftpMessage(target: Target, p: FtpPacket): FileTransferProtocol throws FtpError {
+  const m = new FileTransferProtocol()
+  m.targetNetwork = 0 as u8
+  m.targetSystem = target.system as u8
+  m.targetComponent = target.component as u8
+  const bytes = p.toPayload()
+  const payload: u8[] = []
+  for (let i = 0; i < 251; i++) {
+    payload.push(bytes[i] as u8)
+  }
+  m.payload = payload
+  m
+}
+
+/// The packet in a FILE_TRANSFER_PROTOCOL message.
+export function ftpPacketOf(m: FileTransferProtocol): FtpPacket throws FtpError {
+  const bytes = new Uint8Array(m.payload.length)
+  for (let i = 0; i < m.payload.length; i++) {
+    bytes.set(i, m.payload[i])
+  }
+  FtpPacket.fromPayload(bytes)
+}
+
+/// The error a Nack stands for.
+export function errorOfNack(what: string, p: FtpPacket): FtpError {
+  const err = byteAt(p.data, 0)
+  const errno = byteAt(p.data, 1)
+  if (err == FtpNack.EOF) {
+    return new FtpError("FTP_EOF", `${what}: end of file`)
+  }
+  if (err == FtpNack.FILE_NOT_FOUND) {
+    return new FtpError("FTP_NOT_FOUND", `${what}: no such file`)
+  }
+  if (err == FtpNack.NO_SESSIONS_AVAILABLE) {
+    return new FtpError("FTP_NO_SESSIONS", `${what}: the vehicle has no FTP session free`)
+  }
+  if (err == FtpNack.INVALID_SESSION) {
+    return new FtpError("FTP_INVALID_SESSION", `${what}: the vehicle does not know this session`)
+  }
+  if (err == FtpNack.FILE_PROTECTED) {
+    return new FtpError("FTP_PROTECTED", `${what}: the file is protected`)
+  }
+  if (err == FtpNack.FILE_EXISTS) {
+    return new FtpError("FTP_EXISTS", `${what}: the file exists`)
+  }
+  if (err == FtpNack.FAIL_ERRNO) {
+    return new FtpError("FTP_ERRNO", `${what}: failed with errno ${errno}`, errno)
+  }
+  new FtpError("FTP_FAILED", `${what}: refused (error ${err})`)
+}
+
+export struct FtpOptions {
+  /// How long to wait for one reply (default 1000 ms).
+  timeoutMs?: int
+  /// How many times to ask again (default 3).
+  retries?: int
+  /// How many bytes every read asks for (default 239, the most a packet carries). A file may fix its read size at the first read
+  /// (the packed parameter file does): every read of one open file uses this one size.
+  readSize?: int
+  /// The session this client uses on the vehicle (1 to 255; default: from the clock, so that two runs differ).
+  session?: int
+  /// Cancels the operation that is running: it fails with `FTP_ABORTED`.
+  signal?: AbortSignal
+}
+
+/// One packet of a request that is not for a file's bytes.
+function request(seq: int, session: int, opcode: int, offset: int, data: Uint8Array, size: int): FtpPacket {
+  const p = new FtpPacket()
+  p.seq = seq
+  p.session = session
+  p.opcode = opcode
+  p.size = size
+  p.offset = offset
+  p.data = data
+  p
+}
+
+/// Whether `r` answers the request `seq` / `opcode` that went to `target`: an Ack or Nack from it for that opcode, with the
+/// sequence number the vehicle gives a reply (the request's plus one).
+function answers(r: Received, target: Target, seq: int, opcode: int): bool {
+  const m = r.message
+  if (!(m instanceof FileTransferProtocol)) {
+    return false
+  }
+  const h = r.packet.header
+  if (h.sysid != target.system || (target.component != 0 && h.compid != target.component)) {
+    return false
+  }
+  try {
+    const p = ftpPacketOf(m)
+    return (p.opcode == FtpOpcode.ACK || p.opcode == FtpOpcode.NACK) && p.reqOpcode == opcode && p.seq == ((seq + 1) & 0xFFFF)
+  } catch (e: FtpError) {
+    return false
+  }
+}
+
+function clamp(v: int, lo: int, hi: int): int {
+  if (v < lo) lo else if (v > hi) hi else v
+}
+
+/// A client for the FTP of one vehicle: one request at a time. `conn.run()` must be running.
+export class FtpClient {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly timeoutMs: int
+  readonly retries: int
+  public readonly readSize: int
+  public readonly session: int
+  readonly signal: AbortSignal?
+  seq: int = 0
+
+  constructor(conn: MavLinkConnection, target: Target, options: FtpOptions = {}) {
+    this.conn = conn
+    this.target = target
+    // Values that cannot work are brought into range, not passed on: a read size over 239 would ask for more than a packet
+    // carries (and over 255 wrap in the size byte), 0 reads nothing; a session outside 1 to 255 wraps in its byte; fewer than
+    // 0 tries would not even send.
+    this.timeoutMs = clamp(options.timeoutMs ?? 1000, 1, 3_600_000)
+    this.retries = clamp(options.retries ?? 3, 0, 100)
+    this.readSize = clamp(options.readSize ?? FTP_MAX_DATA, 1, FTP_MAX_DATA)
+    this.session = clamp(options.session ?? (1 + (Date.now() as int) % 255), 1, 255)
+    this.signal = options.signal
+  }
+
+  aborted(): bool {
+    signal != null && signal!.aborted
+  }
+
+  /// Sends a request and waits for its reply, asking again (with the same sequence number) after a timeout. Gives the Ack or the
+  /// Nack; what a Nack means is for the caller. `FTP_TIMEOUT` when nothing answers, `FTP_ABORTED` when cancelled. A `quiet` call
+  /// is what runs after a cancel, to leave the vehicle's session closed: it ignores the cancel, asks once, and waits only
+  /// briefly.
+  async call(opcode: int, session: int, offset: int, data: Uint8Array, size: int, quiet: bool = false): Promise<FtpPacket> throws FtpError {
+    seq = (seq + 1) & 0xFFFF
+    const mine = seq
+    const message = ftpMessage(target, request(mine, session, opcode, offset, data, size))
+    const tries = if (quiet) 0 else retries
+    const wait = if (quiet && timeoutMs > 500) 500 else timeoutMs
+    const ignoreAbort = quiet
+    for (let attempt = 0; attempt <= tries; attempt++) {
+      if (!ignoreAbort && aborted()) {
+        throw new FtpError("FTP_ABORTED", `FTP ${opcode}: cancelled`)
+      }
+      const reply = conn.waitFor((r: Received) => answers(r, target, mine, opcode), wait, if (ignoreAbort) null else signal)
+      try {
+        await conn.send(message)
+      } catch (e: Error) {
+        throw new FtpError("FTP_PROTOCOL", `FTP ${opcode}: could not send (${e.message})`)
+      }
+      let r: Received? = null
+      try {
+        r = await reply
+      } catch (e: Error) {
+        throw new FtpError("FTP_PROTOCOL", `FTP ${opcode}: the link failed (${e.message})`)
+      }
+      if (r != null) {
+        const m = r!.message
+        if (m instanceof FileTransferProtocol) {
+          return ftpPacketOf(m)
+        }
+      }
+    }
+    if (!ignoreAbort && aborted()) {
+      throw new FtpError("FTP_ABORTED", `FTP ${opcode}: cancelled`)
+    }
+    throw new FtpError("FTP_TIMEOUT", `no answer to FTP ${opcode} from ${target.system}/${target.component} after ${tries + 1} tries`)
+  }
+
+  /// Closes every session this client (system, component and link) has on the vehicle. The vehicle always acks it: done first,
+  /// so that a session a crashed earlier run left open cannot make `open` fail with `FTP_NO_SESSIONS`.
+  public async reset(): Promise<void> throws FtpError {
+    const r = await call(FtpOpcode.RESET_SESSIONS, 0, 0, new Uint8Array(0), 0)
+    if (r.opcode == FtpOpcode.NACK) {
+      throw errorOfNack("resetting the FTP sessions", r)
+    }
+  }
+
+  /// Opens `path` for reading; the size the vehicle gives (an estimate, for a file it makes up as it goes). A vehicle that has
+  /// no session free is reset, and asked once more.
+  public async open(path: string): Promise<int> throws FtpError {
+    const name = new TextEncoder().encode(path)
+    if (name.length > FTP_MAX_DATA) {
+      throw new FtpError("FTP_PROTOCOL", `the path is ${name.length} bytes: at most ${FTP_MAX_DATA}`)
+    }
+    let r = await call(FtpOpcode.OPEN_FILE_RO, session, 0, name, name.length)
+    if (r.opcode == FtpOpcode.NACK && byteAt(r.data, 0) == FtpNack.NO_SESSIONS_AVAILABLE) {
+      await reset()
+      r = await call(FtpOpcode.OPEN_FILE_RO, session, 0, name, name.length)
+    }
+    if (r.opcode == FtpOpcode.NACK) {
+      throw errorOfNack(`opening ${path}`, r)
+    }
+    // The Ack carries the file's size in 4 bytes: one that does not is not an answer to this request.
+    if (r.data.length < 4) {
+      throw new FtpError("FTP_PROTOCOL", `opening ${path}: the reply has ${r.data.length} bytes, the size needs 4`)
+    }
+    readUint(r.data, 0, 4)
+  }
+
+  /// The `readSize` bytes at `offset` of the open file (fewer at its end), or null at the end of the file.
+  public async read(offset: int): Promise<Uint8Array?> throws FtpError {
+    const r = await call(FtpOpcode.READ_FILE, session, offset, new Uint8Array(0), readSize)
+    if (r.opcode == FtpOpcode.NACK) {
+      const e = errorOfNack(`reading at ${offset}`, r)
+      if (e.code == "FTP_EOF") {
+        return null
+      }
+      throw e
+    }
+    if (r.offset != offset) {
+      throw new FtpError("FTP_PROTOCOL", `asked for the bytes at ${offset}, got the ones at ${r.offset}`)
+    }
+    // The end of a file is a Nack, never an empty Ack: an empty one would leave a loop over the offsets where it is, for good.
+    if (r.data.length == 0) {
+      throw new FtpError("FTP_PROTOCOL", `asked for the bytes at ${offset}, got none and no end of file`)
+    }
+    r.data
+  }
+
+  /// Ends this client's session on the vehicle. Always call it when done, also after an error or a cancel (it is sent after a
+  /// cancel too: once, and it waits at most half a second), and it never throws: a vehicle that does not answer has closed the
+  /// session (it kills an idle one itself).
+  public async terminate(): Promise<void> {
+    try {
+      await call(FtpOpcode.TERMINATE_SESSION, session, 0, new Uint8Array(0), 0, true)
+    } catch (e: FtpError) {
+    }
+  }
+}

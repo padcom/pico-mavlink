@@ -37,6 +37,19 @@ export {
   showParam,
 } from "./src/params"
 export {
+  FTP_HEADER_SIZE,
+  FTP_MAX_DATA,
+  FtpClient,
+  FtpError,
+  FtpNack,
+  FtpOpcode,
+  FtpOptions,
+  FtpPacket,
+  errorOfNack,
+  ftpMessage,
+  ftpPacketOf,
+} from "./src/ftp"
+export {
   PARAM_PACK_MAGIC,
   PARAM_PACK_MAGIC_WITH_DEFAULTS,
   PARAM_PACK_READ_SIZE,
