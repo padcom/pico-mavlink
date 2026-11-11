@@ -49,6 +49,7 @@ export {
   ftpMessage,
   ftpPacketOf,
 } from "./src/ftp"
+export { FtpFileResult, readFile } from "./src/ftpread"
 export {
   PARAM_PACK_MAGIC,
   PARAM_PACK_MAGIC_WITH_DEFAULTS,

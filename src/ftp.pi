@@ -235,13 +235,13 @@ function clamp(v: int, lo: int, hi: int): int {
 
 /// A client for the FTP of one vehicle: one request at a time. `conn.run()` must be running.
 export class FtpClient {
-  readonly conn: MavLinkConnection
-  readonly target: Target
-  readonly timeoutMs: int
-  readonly retries: int
+  public readonly conn: MavLinkConnection
+  public readonly target: Target
+  public readonly timeoutMs: int
+  public readonly retries: int
   public readonly readSize: int
   public readonly session: int
-  readonly signal: AbortSignal?
+  public readonly signal: AbortSignal?
   seq: int = 0
 
   constructor(conn: MavLinkConnection, target: Target, options: FtpOptions = {}) {
@@ -257,17 +257,22 @@ export class FtpClient {
     this.signal = options.signal
   }
 
-  aborted(): bool {
+  public aborted(): bool {
     signal != null && signal!.aborted
+  }
+
+  /// The sequence number of the next request (for the burst reads of `readFile`, which are answered by many packets).
+  public nextSeq(): int {
+    seq = (seq + 1) & 0xFFFF
+    seq
   }
 
   /// Sends a request and waits for its reply, asking again (with the same sequence number) after a timeout. Gives the Ack or the
   /// Nack; what a Nack means is for the caller. `FTP_TIMEOUT` when nothing answers, `FTP_ABORTED` when cancelled. A `quiet` call
   /// is what runs after a cancel, to leave the vehicle's session closed: it ignores the cancel, asks once, and waits only
   /// briefly.
-  async call(opcode: int, session: int, offset: int, data: Uint8Array, size: int, quiet: bool = false): Promise<FtpPacket> throws FtpError {
-    seq = (seq + 1) & 0xFFFF
-    const mine = seq
+  public async call(opcode: int, session: int, offset: int, data: Uint8Array, size: int, quiet: bool = false): Promise<FtpPacket> throws FtpError {
+    const mine = nextSeq()
     const message = ftpMessage(target, request(mine, session, opcode, offset, data, size))
     const tries = if (quiet) 0 else retries
     const wait = if (quiet && timeoutMs > 500) 500 else timeoutMs

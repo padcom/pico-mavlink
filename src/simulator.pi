@@ -162,6 +162,8 @@ export class SimulatedAutopilot {
   public ftpLoss: int = 0
   /// A burst stops after this many packets, with no end (a link that did not drain: the client must ask again). 0: never.
   public ftpStallAfter: int = 0
+  /// Serve these bytes as the file instead of the packed parameter file (to test a reader with files of a given length).
+  public ftpFile: Uint8Array? = null
   /// What the FTP server was asked, one line each: "<opcode> s<session> o<offset> n<size>".
   public readonly ftpLog: string[] = []
   /// How many bursts it started.
@@ -648,6 +650,9 @@ export class SimulatedAutopilot {
 
   /// The packed parameter file for a query.
   packedFile(query: string): Uint8Array throws ParamPackError {
+    if (ftpFile != null) {
+      return ftpFile!
+    }
     let start = 0
     let count = params.length
     let withDefaults = false
