@@ -1,0 +1,211 @@
+// The parameters of a vehicle by MAVLink FTP: the packed parameter file `@PARAM/param.pck`, read with bursts (`readFile`) and
+// decoded, in seconds where the PARAM_REQUEST_LIST stream takes tens of them. `ParamDownload` is the one entry point for an
+// application: it uses FTP where the vehicle has it, and the list where it does not or where FTP fails, and says which it used
+// and why (`source`, `fallback`). A user's cancel is never turned into a retry by the other path.
+import { MavLinkConnection } from "./connection"
+import { MavProtocolCapability } from "./dialects/standard"
+import { MavLinkError } from "./protocol"
+import { FtpClient, FtpError } from "./ftp"
+import { readFile } from "./ftpread"
+import { Param, ParamList, ParamListResult, ParamOptions, Target, AutopilotVersionRead } from "./operations"
+import { PackedParam, ParamPack, ParamPackError, decodeParamPack } from "./parampack"
+import { ParamEncoding } from "./params"
+
+/// The path of the vehicle's packed parameter file.
+export const PARAM_PACK_PATH: string = "@PARAM/param.pck"
+
+/// A parameter download, by whichever way. The first four fields are those of `ParamListResult`.
+export struct ParamDownloadResult {
+  params: Param[]
+  count: int
+  missing: int[]
+  complete: bool
+  /// `ftp` (the packed parameter file) or `list` (PARAM_REQUEST_LIST).
+  source: string
+  /// Why FTP was not used, when `source` is `list`: `unsupported` (no capability, or the vehicle refuses the file), `timeout`,
+  /// `protocol` (answers that make no sense, a corrupt file), `incomplete` (the file did not hold every parameter), `disabled`
+  /// (the caller asked for the list).
+  fallback?: string
+  elapsedMs: int
+  /// The firmware default of the parameters that have one that differs, in the order of the list (`index` as in `params`), when
+  /// they were asked for and the vehicle has them. Empty otherwise.
+  defaults: Param[]
+}
+
+export struct ParamDownloadOptions {
+  /// `auto` (default): FTP where the vehicle has it, else the list. `ftp`: FTP only, its failure is the error. `list`: the list.
+  method?: string
+  /// Ask for the firmware defaults (FTP only).
+  withDefaults?: bool
+  /// The vehicle's capabilities (the low 32 bits of AUTOPILOT_VERSION.capabilities) when the caller has them already; else
+  /// they are asked for.
+  capabilities?: int
+  /// How long to wait for one reply (default 1000 ms), and how many times to ask again (default 3): for FTP and the list.
+  timeoutMs?: int
+  retries?: int
+  /// How long a quiet link means the list is over (default 1000 ms), and how long a burst may be silent (default 250 ms).
+  quietMs?: int
+  silenceMs?: int
+  /// Cancels the download: it fails with an `ABORTED` MavLinkError, whichever way it is going.
+  signal?: AbortSignal
+}
+
+/// The words for why a failure of FTP means the list is used.
+export function fallbackOf(e: FtpError): string {
+  if (e.code == "FTP_TIMEOUT") {
+    return "timeout"
+  }
+  if (e.code == "FTP_INCOMPLETE") {
+    return "incomplete"
+  }
+  if (e.code == "FTP_NOT_FOUND" || e.code == "FTP_ERRNO" || e.code == "FTP_FAILED" || e.code == "FTP_PROTECTED" || e.code == "FTP_NO_SESSIONS") {
+    return "unsupported"
+  }
+  "protocol"
+}
+
+/// The parameters in a decoded file, as the list gives them, or why the file is no good.
+function paramsOf(pack: ParamPack): Param[] throws FtpError {
+  const seen = new Map<string, bool>()
+  const out: Param[] = []
+  for (let i = 0; i < pack.params.length; i++) {
+    const p: PackedParam = pack.params[i]
+    if (seen.has(p.name)) {
+      throw new FtpError("FTP_PROTOCOL", `the parameter file names ${p.name} twice`)
+    }
+    seen.set(p.name, true)
+    const q: Param = { id: p.name, index: i, value: p.value }
+    out.push(q)
+  }
+  out
+}
+
+function defaultsOf(pack: ParamPack): Param[] {
+  const out: Param[] = []
+  for (let i = 0; i < pack.params.length; i++) {
+    const d = pack.params[i].firmwareDefault
+    if (d != null) {
+      const q: Param = { id: pack.params[i].name, index: i, value: d! }
+      out.push(q)
+    }
+  }
+  out
+}
+
+/// Downloads the parameters by FTP, or fails: whatever is short of every parameter (the file's header says how many there are,
+/// and its entries have to be that many) is an `FtpError` and never a partial list.
+export class ParamFtp {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly options: ParamDownloadOptions
+
+  constructor(conn: MavLinkConnection, target: Target, options: ParamDownloadOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.options = options
+  }
+
+  /// `progress(received, total)` is called as the file arrives (`total` is the vehicle's estimate, 12 bytes a parameter), in
+  /// bytes. Errors: `FTP_ABORTED`, `FTP_TIMEOUT`, `FTP_NOT_FOUND` ... (what the vehicle says), `FTP_PROTOCOL` (nonsense: a
+  /// corrupt file, a name twice) and `FTP_INCOMPLETE` (fewer parameters than the vehicle says it has).
+  public async run(progress: (received: int, total: int) => void = (_received: int, _total: int) => {}): Promise<ParamDownloadResult> throws FtpError {
+    const started = Date.now() as int
+    const client = new FtpClient(conn, target, { timeoutMs: options.timeoutMs, retries: options.retries, signal: options.signal })
+    const path = if (options.withDefaults ?? false) `${PARAM_PACK_PATH}?withdefaults=1` else PARAM_PACK_PATH
+    const file = await readFile(client, path, progress, options.silenceMs ?? 250)
+    let pack: ParamPack
+    try {
+      pack = decodeParamPack(file.data)
+    } catch (e: ParamPackError) {
+      throw new FtpError(if (e.code == "COUNT_MISMATCH") "FTP_INCOMPLETE" else "FTP_PROTOCOL", `the parameter file: ${e.message}`)
+    }
+    if (pack.params.length != pack.total) {
+      throw new FtpError("FTP_INCOMPLETE", `the parameter file holds ${pack.params.length} of the ${pack.total} parameters`)
+    }
+    const params = paramsOf(pack)
+    const result: ParamDownloadResult = {
+      params,
+      count: params.length,
+      missing: [],
+      complete: true,
+      source: "ftp",
+      elapsedMs: (Date.now() as int) - started,
+      defaults: defaultsOf(pack),
+    }
+    result
+  }
+}
+
+function listResult(r: ParamListResult, fallback: string?, elapsedMs: int): ParamDownloadResult {
+  const out: ParamDownloadResult = {
+    params: r.params,
+    count: r.count,
+    missing: r.missing,
+    complete: r.complete,
+    source: "list",
+    fallback: fallback,
+    elapsedMs,
+    defaults: [],
+  }
+  out
+}
+
+/// The one way an application downloads the parameters: FTP where the vehicle has it and it works, else the list.
+export class ParamDownload {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly encoding: ParamEncoding
+  readonly options: ParamDownloadOptions
+
+  constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamDownloadOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.encoding = encoding
+    this.options = options
+  }
+
+  /// Whether the vehicle says it has FTP: the capabilities given, else AUTOPILOT_VERSION asked for.
+  async hasFtp(): Promise<bool> throws Error {
+    const given = options.capabilities
+    if (given != null) {
+      return (given! & MavProtocolCapability.FTP) != 0
+    }
+    const v = await new AutopilotVersionRead(conn, target, { timeoutMs: options.timeoutMs, retries: options.retries, signal: options.signal }).run()
+    v != null && ((v!.capabilities as int) & MavProtocolCapability.FTP) != 0
+  }
+
+  async list(fallback: string?, started: int): Promise<ParamDownloadResult> throws Error {
+    const listOptions: ParamOptions = {
+      quietMs: options.quietMs,
+      timeoutMs: options.timeoutMs,
+      retries: options.retries,
+      signal: options.signal,
+    }
+    const r = await new ParamList(conn, target, encoding, listOptions).run()
+    listResult(r, fallback, (Date.now() as int) - started)
+  }
+
+  /// Downloads the parameters. The `progress` is that of `ParamFtp.run` (and is not called for the list). A cancel is an
+  /// `ABORTED` MavLinkError from whichever way was running, and no other way is tried after it.
+  public async run(progress: (received: int, total: int) => void = (_received: int, _total: int) => {}): Promise<ParamDownloadResult> throws Error {
+    const started = Date.now() as int
+    const method = options.method ?? "auto"
+    if (method == "list") {
+      return await list("disabled", started)
+    }
+    if (method == "auto" && !(await hasFtp())) {
+      return await list("unsupported", started)
+    }
+    try {
+      return await new ParamFtp(conn, target, options).run(progress)
+    } catch (e: FtpError) {
+      if (e.code == "FTP_ABORTED") {
+        throw new MavLinkError("ABORTED", "the parameter list: cancelled")
+      }
+      if (method == "ftp") {
+        throw e
+      }
+      return await list(fallbackOf(e), started)
+    }
+  }
+}

@@ -1,0 +1,274 @@
+// ParamFtp and ParamDownload against the simulated vehicle: the same parameters as the list, and the way back to the list.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError } from "./protocol"
+import { Param, ParamList, Target } from "./operations"
+import { SimParam, SimulatedAutopilot, defaultSimParams } from "./simulator"
+import { FtpError } from "./ftp"
+import { ParamDownload, ParamDownloadOptions, ParamFtp, fallbackOf } from "./paramftp"
+import { MavParamType, ParamRequestList } from "./dialects/common"
+import { ParamEncoding, TypedParamValue, showParam } from "./params"
+
+const VEHICLE: Target = { system: 1, component: 1 }
+const FAST: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60 }
+
+class Rig {
+  public readonly gcs: MavLinkConnection
+  public readonly sim: SimulatedAutopilot
+
+  constructor(gcs: MavLinkConnection, sim: SimulatedAutopilot) {
+    this.gcs = gcs
+    this.sim = sim
+  }
+}
+
+function rig(params: SimParam[]): Rig {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const sim = new SimulatedAutopilot(ends[1], params)
+  gcs.run()
+  sim.conn.run()
+  new Rig(gcs, sim)
+}
+
+function many(count: int): SimParam[] {
+  const list: SimParam[] = []
+  for (let i = 0; i < count; i++) {
+    const value = if (i % 3 == 0) TypedParamValue.Real((i as f64) * 0.25, MavParamType.REAL32) else TypedParamValue.Int(i - 500, MavParamType.INT32)
+    const p: SimParam = { id: `P${i % 90}_V${i}`, value }
+    list.push(p)
+  }
+  list
+}
+
+function shown(p: Param): string {
+  `${p.index} ${p.id} ${showParam(p.value)}`
+}
+
+function ftpRequests(r: Rig): int {
+  r.sim.ftpLog.length
+}
+
+async function sameAsTheList(): Promise<void> throws Error {
+  const r = rig(many(1400))
+  const ftp = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  const list = await new ParamList(r.gcs, VEHICLE, ParamEncoding.CCast, { quietMs: 60 }).run()
+  r.gcs.close()
+  expect(`${ftp.source} ${ftp.complete} ${ftp.count} ${ftp.missing.length}`).toBe("ftp true 1400 0")
+  expect(ftp.fallback == null).toBe(true)
+  expect(list.complete).toBe(true)
+  expect(ftp.params.length).toBe(list.params.length)
+  for (let i = 0; i < list.params.length; i++) {
+    expect(shown(ftp.params[i])).toBe(shown(list.params[i]))
+  }
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function reportsMonotonicProgress(): Promise<void> throws Error {
+  const r = rig(many(3000))
+  const seen: int[] = []
+  const totals: int[] = []
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run((received: int, total: int) => {
+    seen.push(received)
+    totals.push(total)
+  })
+  r.gcs.close()
+  expect(got.source).toBe("ftp")
+  expect(seen.length > 1).toBe(true)
+  for (let i = 1; i < seen.length; i++) {
+    expect(seen[i] >= seen[i - 1]).toBe(true)
+  }
+  expect(totals[0]).toBe(3000 * 12)
+}
+
+async function carriesFirmwareDefaultsWhenAsked(): Promise<void> throws Error {
+  const params = defaultSimParams()
+  params[3] = { id: params[3].id, value: params[3].value, firmwareDefault: TypedParamValue.Int(1, MavParamType.INT8) }
+  const r = rig(params)
+  const plain = await new ParamFtp(r.gcs, VEHICLE, FAST).run()
+  const asked: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60, withDefaults: true }
+  const withDefaults = await new ParamFtp(r.gcs, VEHICLE, asked).run()
+  r.gcs.close()
+  expect(plain.defaults.length).toBe(0)
+  expect(withDefaults.defaults.length).toBe(1)
+  expect(withDefaults.defaults[0].index).toBe(3)
+  expect(showParam(withDefaults.defaults[0].value)).toBe("1")
+  expect(withDefaults.params.length).toBe(plain.params.length)
+}
+
+async function fallsBackWhenUnsupported(): Promise<void> throws Error {
+  const r = rig(many(200))
+  r.sim.ftpMode = "unsupported"
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.complete} ${got.count}`).toBe("list unsupported true 200")
+}
+
+async function fallsBackWhenSilent(): Promise<void> throws Error {
+  const r = rig(many(200))
+  r.sim.ftpMode = "silent"
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.complete} ${got.count}`).toBe("list timeout true 200")
+}
+
+async function fallsBackOnACorruptFile(): Promise<void> throws Error {
+  const r = rig(many(200))
+  r.sim.ftpMode = "corrupt"
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.complete} ${got.count}`).toBe("list protocol true 200")
+}
+
+async function fallsBackOnAnIncompleteFile(): Promise<void> throws Error {
+  const r = rig(many(200))
+  r.sim.ftpMode = "incomplete"
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.complete} ${got.count}`).toBe("list incomplete true 200")
+}
+
+async function usesNoFtpWithoutTheCapability(): Promise<void> throws Error {
+  const r = rig(many(200))
+  r.sim.ftp = false
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.count}`).toBe("list unsupported 200")
+  // Not one FTP packet went out.
+  expect(ftpRequests(r)).toBe(0)
+}
+
+async function takesTheCapabilitiesFromTheCaller(): Promise<void> throws Error {
+  const r = rig(many(100))
+  const none: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60, capabilities: 0 }
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, none).run()
+  r.gcs.close()
+  expect(`${got.source} ${got.fallback} ${got.count}`).toBe("list unsupported 100")
+  expect(ftpRequests(r)).toBe(0)
+}
+
+async function methodsListAndFtp(): Promise<void> throws Error {
+  const r = rig(many(100))
+  const list: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60, method: "list" }
+  const byList = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, list).run()
+  expect(`${byList.source} ${byList.fallback} ${byList.count}`).toBe("list disabled 100")
+  expect(ftpRequests(r)).toBe(0)
+  // A forced FTP that fails is the error: no fallback.
+  r.sim.ftpMode = "unsupported"
+  const forced: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60, method: "ftp" }
+  try {
+    await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, forced).run()
+    expect("downloaded").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ERRNO")
+  }
+  r.gcs.close()
+}
+
+async function abortIsNotRetriedByTheList(): Promise<void> throws Error {
+  const r = rig(many(3000))
+  const ac = new AbortController()
+  const options: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60, signal: ac.signal }
+  let cancelled = false
+  const listRequests: int[] = []
+  r.sim.conn.on((m: Received) => {
+    if (m.message instanceof ParamRequestList) {
+      listRequests.push(1)
+    }
+  })
+  const run = new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, options).run((received: int, _total: int) => {
+    if (received > 5000 && !cancelled) {
+      cancelled = true
+      ac.abort()
+    }
+  })
+  try {
+    await run
+    expect("downloaded").toBe("cancelled")
+  } catch (e: MavLinkError) {
+    expect(e.code).toBe("ABORTED")
+  }
+  await delay(100)
+  const requestsAfter = ftpRequests(r)
+  r.gcs.close()
+  expect(cancelled).toBe(true)
+  // The terminate went out, the session is closed, and the list was never asked for.
+  expect(listRequests.length).toBe(0)
+  expect(r.sim.openFtpSessions()).toBe(0)
+  expect(r.sim.ftpLog[requestsAfter - 1].startsWith("1 ")).toBe(true)
+}
+
+async function abortsBeforeAnything(): Promise<void> throws Error {
+  const r = rig(many(100))
+  const ac = new AbortController()
+  ac.abort()
+  const options: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60, signal: ac.signal }
+  try {
+    await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, options).run()
+    expect("downloaded").toBe("cancelled")
+  } catch (e: Error) {
+    expect(e.message.includes("cancelled")).toBe(true)
+  }
+  r.gcs.close()
+}
+
+async function downloadsWithLoss(): Promise<void> throws Error {
+  const r = rig(many(1400))
+  r.sim.ftpLoss = 10
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  const list = await new ParamList(r.gcs, VEHICLE, ParamEncoding.CCast, { quietMs: 60 }).run()
+  r.gcs.close()
+  expect(got.source).toBe("ftp")
+  expect(got.params.map((p) => shown(p)).join(",")).toBe(list.params.map((p) => shown(p)).join(","))
+}
+
+async function refusesRepeatedNames(): Promise<void> throws Error {
+  const params = many(20)
+  params[7] = { id: params[2].id, value: params[7].value }
+  const r = rig(params)
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run()
+  r.gcs.close()
+  // The file names one twice: no FTP list is trusted, the list path answers.
+  expect(`${got.source} ${got.fallback}`).toBe("list protocol")
+  const r2 = rig(params)
+  try {
+    await new ParamFtp(r2.gcs, VEHICLE, FAST).run()
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_PROTOCOL")
+  }
+  r2.gcs.close()
+}
+
+function fallbackWords(): void {
+  expect(fallbackOf(new FtpError("FTP_TIMEOUT", "x"))).toBe("timeout")
+  expect(fallbackOf(new FtpError("FTP_INCOMPLETE", "x"))).toBe("incomplete")
+  expect(fallbackOf(new FtpError("FTP_NOT_FOUND", "x"))).toBe("unsupported")
+  expect(fallbackOf(new FtpError("FTP_ERRNO", "x", 2))).toBe("unsupported")
+  expect(fallbackOf(new FtpError("FTP_NO_SESSIONS", "x"))).toBe("unsupported")
+  expect(fallbackOf(new FtpError("FTP_PROTOCOL", "x"))).toBe("protocol")
+  expect(fallbackOf(new FtpError("FTP_EOF", "x"))).toBe("protocol")
+}
+
+describe("the parameters by FTP", () => {
+  it("are the same as the list gives, entry by entry", sameAsTheList)
+  it("report monotonic progress, with the vehicle's estimate as the total", reportsMonotonicProgress)
+  it("carry the firmware defaults when asked", carriesFirmwareDefaultsWhenAsked)
+  it("are complete over a link that loses 10% of the packets", downloadsWithLoss)
+  it("refuse a file that names a parameter twice", refusesRepeatedNames)
+})
+
+describe("the parameter download", () => {
+  it("falls back to the list, reason unsupported, when the vehicle refuses the file", fallsBackWhenUnsupported)
+  it("falls back to the list, reason timeout, when the vehicle never answers", fallsBackWhenSilent)
+  it("falls back to the list, reason protocol, on a corrupt file", fallsBackOnACorruptFile)
+  it("falls back to the list, reason incomplete, on a file that holds fewer than the vehicle has", fallsBackOnAnIncompleteFile)
+  it("uses the list without one FTP packet when the vehicle does not have the capability", usesNoFtpWithoutTheCapability)
+  it("takes the capabilities from the caller, and does not ask for them", takesTheCapabilitiesFromTheCaller)
+  it("uses the list when asked to, and gives the error of a forced FTP", methodsListAndFtp)
+  it("is cancelled for good, not retried by the list, and ends the FTP session", abortIsNotRetriedByTheList)
+  it("is cancelled before it starts", abortsBeforeAnything)
+  it("names why FTP failed in words", fallbackWords)
+})
