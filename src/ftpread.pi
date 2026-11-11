@@ -18,6 +18,10 @@ import { FtpClient, FtpError, FtpNack, FtpOpcode, FtpPacket, errorOfNack, ftpMes
 /// The most a file may hold (16 MB: the packed parameter file of the biggest vehicle is under 1 MB), and the most data packets
 /// one burst may bring (a burst has 2000).
 export const MAX_FILE_BYTES: int = 16_777_216
+/// How long a whole read may take (ms), unless told otherwise.
+export const DEFAULT_DEADLINE_MS: int = 120_000
+/// The least a file's bound is, whatever size the vehicle gave (bytes).
+const MIN_BOUND_BYTES: int = 262_144
 const MAX_BURST_PACKETS: int = 4000
 
 /// A file as read, and how it went.
@@ -63,7 +67,14 @@ export class ReadState {
   public burstDone: bool = false
   public failure: FtpError? = null
   /// The most a file may hold (bytes): a vehicle that goes on past it is refused, not stored.
-  public readonly max: int
+  public max: int
+  /// When the read has taken too long (ms since 1970; 0: no limit).
+  public deadline: int = 0
+
+  /// Whether the read has run out of time.
+  public late(): bool {
+    deadline > 0 && (Date.now() as int) >= deadline
+  }
 
   constructor(size: int, session: int, target: Target, max: int = MAX_FILE_BYTES) {
     this.size = size
@@ -219,7 +230,7 @@ async function burst(client: FtpClient, s: ReadState, from: int, silenceMs: int,
     let reported = s.bytes
     // Over when the vehicle says so, when nothing NEW has come for `silenceMs` (a vehicle that repeats what it sent is as silent
     // as one that says nothing), or after more packets than a burst can have (2000, twice over).
-    while (!client.aborted() && s.failure == null && !s.burstDone && !s.complete() && s.burstPackets <= MAX_BURST_PACKETS) {
+    while (!client.aborted() && s.failure == null && !s.burstDone && !s.complete() && s.burstPackets <= MAX_BURST_PACKETS && !s.late()) {
       if ((Date.now() as int) - s.lastNew >= silenceMs) {
         break
       }
@@ -288,6 +299,9 @@ async function readRounds(client: FtpClient, s: ReadState, estimate: int, silenc
     if (client.aborted()) {
       throw cancelled()
     }
+    if (s.late() && !s.complete()) {
+      throw new FtpError("FTP_TIMEOUT", `the file is not whole after the time given for it (${s.bytes} bytes so far)`)
+    }
     const holes = s.holes(4)
     if (!s.complete() && holes.length > 0 && holes.length <= 4) {
       for (const at of holes) {
@@ -305,26 +319,45 @@ async function readRounds(client: FtpClient, s: ReadState, estimate: int, silenc
   }
 }
 
+/// The most a file may hold, given what the vehicle said its size is: `factor` times that (at least 256 kB), and never over `max`.
+/// Factor 0 means the vehicle's size says nothing (any file may be bigger): `max`.
+function boundOf(max: int, estimate: int, factor: int): int {
+  if (factor <= 0) {
+    return max
+  }
+  const derived = if (estimate * factor > MIN_BOUND_BYTES) estimate * factor else MIN_BOUND_BYTES
+  if (derived < max) derived else max
+}
+
 /// Reads the whole of `path`: resets the sessions, opens the file, bursts it and fills the gaps, terminates the session (also
 /// after an error or a cancel). `progress(bytes, estimate)` is called as data arrives, `estimate` being the size the vehicle
 /// gave on opening. `silenceMs` is how long a burst may be silent before it counts as over. Failures: `FTP_ABORTED` (the
 /// client's signal), `FTP_TIMEOUT` (no new data for `retries + 1` bursts), `FTP_PROTOCOL` (a vehicle that contradicts itself, or
 /// goes on past `maxBytes`), `FTP_CALLBACK` (the progress callback threw), and whatever a Nack of the vehicle says
 /// (`FTP_NOT_FOUND`, `FTP_ERRNO` ...). The session is terminated whatever ends the read.
+///
+/// Two more bounds on a vehicle that does not stop: `deadlineMs` is the most the whole read may take (default 120 s; 0: no limit),
+/// after which it fails with `FTP_TIMEOUT`; and with `estimateFactor` over 0 the most the file may hold is that many times the
+/// size the vehicle gave on opening (but at least 256 kB, and never over `maxBytes`), so a file that grows without end is refused
+/// when it is clearly bigger than it said, not at the 16 MB of `maxBytes`.
 export async function readFile(
   client: FtpClient,
   path: string,
   progress: (bytes: int, estimate: int) => void throws Error = (_bytes: int, _estimate: int) => {},
   silenceMs: int = 250,
   maxBytes: int = MAX_FILE_BYTES,
+  deadlineMs: int = DEFAULT_DEADLINE_MS,
+  estimateFactor: int = 0,
 ): Promise<FtpFileResult> throws FtpError {
   const started = Date.now() as int
   const s = new ReadState(client.readSize, client.session, client.target, maxBytes)
+  s.deadline = if (deadlineMs > 0) started + deadlineMs else 0
   const counts: int[] = [0, 0]
   let estimate = 0
   try {
     await client.reset()
     estimate = await client.open(path)
+    s.max = boundOf(maxBytes, estimate, estimateFactor)
     await readRounds(client, s, estimate, silenceMs, progress, counts)
   } catch (e: Error) {
     await client.terminate()

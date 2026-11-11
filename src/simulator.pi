@@ -632,7 +632,7 @@ export class SimulatedAutopilot {
     const chunk = slice(s.file, 0, size)
     let seq = ask.req.seq + 1
     let n = 0
-    while (ftpMode == mode && !down && ftp) {
+    while (ftpMode == mode && !down && ftp && ftpSessions.has(ask.req.session)) {
       ftpReply(ask, FtpOpcode.ACK, chunk, seq, if (mode == "repeat") 0 else n * size, false, false)
       seq += 1
       n += 1

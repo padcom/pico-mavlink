@@ -6,10 +6,13 @@ import { MavLinkConnection } from "./connection"
 import { MavProtocolCapability } from "./dialects/standard"
 import { MavLinkError } from "./protocol"
 import { FtpClient, FtpError } from "./ftp"
-import { MAX_FILE_BYTES, readFile } from "./ftpread"
+import { DEFAULT_DEADLINE_MS, MAX_FILE_BYTES, readFile } from "./ftpread"
 import { Param, ParamList, ParamListResult, ParamOptions, Target, AutopilotVersionRead } from "./operations"
 import { PackedParam, ParamPack, ParamPackError, decodeParamPack } from "./parampack"
 import { ParamEncoding } from "./params"
+
+/// How many times the size the vehicle gives for its parameter file the file may be (its size is an estimate).
+const FILE_SIZE_SLACK: int = 4
 
 /// The path of the vehicle's packed parameter file.
 export const PARAM_PACK_PATH: string = "@PARAM/param.pck"
@@ -46,8 +49,11 @@ export struct ParamDownloadOptions {
   /// How long a quiet link means the list is over (default 1000 ms), and how long a burst may be silent (default 250 ms).
   quietMs?: int
   silenceMs?: int
-  /** The most the parameter file may hold in bytes (default `MAX_FILE_BYTES`, 16 MB): a vehicle that goes on past it is refused. */
+  /// The most the parameter file may hold in bytes (default `MAX_FILE_BYTES`, 16 MB): a vehicle that goes on past it is refused.
+  /// (Over a file of four times the size the vehicle gave, at least 256 kB, it is refused sooner.)
   maxBytes?: int
+  /// The most the download by file transfer may take (default 120 s; 0: no limit): after it, `FTP_TIMEOUT`, and the list is used.
+  deadlineMs?: int
   /// Cancels the download: it fails with an `ABORTED` MavLinkError, whichever way it is going.
   signal?: AbortSignal
 }
@@ -137,6 +143,10 @@ export class ParamFtp {
       (received: int, total: int) => progress(received, total, "bytes"),
       options.silenceMs ?? 250,
       options.maxBytes ?? MAX_FILE_BYTES,
+      options.deadlineMs ?? DEFAULT_DEADLINE_MS,
+      // The size the vehicle gives for its parameter file is an estimate (12 bytes a parameter): a file four times bigger is not
+      // that file.
+      FILE_SIZE_SLACK,
     )
     let pack: ParamPack
     try {
