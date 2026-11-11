@@ -1,0 +1,499 @@
+// The FTP packet and the client, against a scripted vehicle on the other end of an in-memory pipe.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkProtocolV2 } from "./protocol"
+import { Target } from "./operations"
+import { FileTransferProtocol } from "./dialects/common"
+import {
+  FTP_MAX_DATA,
+  FtpClient,
+  FtpError,
+  FtpNack,
+  FtpOpcode,
+  FtpOptions,
+  FtpPacket,
+  errorOfNack,
+  ftpMessage,
+  ftpPacketOf,
+} from "./ftp"
+
+const VEHICLE: Target = { system: 1, component: 1 }
+const FAST: FtpOptions = { timeoutMs: 60, retries: 2, session: 7 }
+const PATH = "@PARAM/param.pck"
+
+/// The bytes as text ("" when they are not).
+function textOf(b: Uint8Array): string {
+  try {
+    new TextDecoder().decode(b)
+  } catch (e: TypeError) {
+    ""
+  }
+}
+
+/// A pretend vehicle's FTP server: serves one file, logs what it is asked, and misbehaves as told.
+class FakeFtp {
+  public readonly conn: MavLinkConnection
+  public readonly log: string[] = []
+  public file: Uint8Array = new Uint8Array(0)
+  /// The first this many requests are not answered.
+  public ignore: int = 0
+  public silent: bool = false
+  /// Answers the first OpenFileRO with "no session free".
+  public noSessionsOnce: bool = false
+  /// Answers every ReadFile with this Nack error (-1: no).
+  public readNack: int = -1
+  public readErrno: int = 0
+  /// Answers ReadFile at the wrong offset.
+  public wrongOffset: bool = false
+  /// Sends every reply from this component instead (to be ignored).
+  public asComponent: int = 1
+
+  constructor(stream: MemoryStream, component: int = 1) {
+    this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(1, component) })
+    this.asComponent = component
+    conn.on((r: Received) => this.handle(r))
+  }
+
+  handle(r: Received): void {
+    const m = r.message
+    if (silent || !(m instanceof FileTransferProtocol)) {
+      return
+    }
+    let req: FtpPacket
+    try {
+      req = ftpPacketOf(m)
+    } catch (e: FtpError) {
+      return
+    }
+    log.push(`${req.opcode} s${req.session} o${req.offset} n${req.size} q${req.seq}`)
+    if (ignore > 0) {
+      ignore -= 1
+      return
+    }
+    reply(req)
+  }
+
+  reply(req: FtpPacket): void {
+    const p = new FtpPacket()
+    p.seq = (req.seq + 1) & 0xFFFF
+    p.session = req.session
+    p.reqOpcode = req.opcode
+    p.offset = req.offset
+    p.opcode = FtpOpcode.ACK
+    if (req.opcode == FtpOpcode.OPEN_FILE_RO) {
+      if (noSessionsOnce) {
+        noSessionsOnce = false
+        nack(p, FtpNack.NO_SESSIONS_AVAILABLE, 0)
+      } else if (textOf(req.data) != PATH) {
+        nack(p, FtpNack.FILE_NOT_FOUND, 0)
+      } else {
+        const size = new Uint8Array(4)
+        size.set(0, file.length & 0xFF)
+        size.set(1, (file.length >> 8) & 0xFF)
+        size.set(2, (file.length >> 16) & 0xFF)
+        size.set(3, (file.length >> 24) & 0xFF)
+        p.data = size
+        p.size = 4
+      }
+    } else if (req.opcode == FtpOpcode.READ_FILE) {
+      if (readNack >= 0) {
+        nack(p, readNack, readErrno)
+      } else if (req.offset >= file.length) {
+        nack(p, FtpNack.EOF, 0)
+      } else {
+        const n = if (req.offset + req.size > file.length) file.length - req.offset else req.size
+        const chunk = new Uint8Array(n)
+        for (let i = 0; i < n; i++) {
+          chunk.set(i, file[req.offset + i])
+        }
+        p.data = chunk
+        p.size = n
+        if (wrongOffset) {
+          p.offset = req.offset + 1
+        }
+      }
+    }
+    send(p)
+  }
+
+  nack(p: FtpPacket, error: int, errno: int): void {
+    p.opcode = FtpOpcode.NACK
+    const data = if (error == FtpNack.FAIL_ERRNO) new Uint8Array(2) else new Uint8Array(1)
+    data.set(0, error)
+    if (error == FtpNack.FAIL_ERRNO) {
+      data.set(1, errno)
+    }
+    p.data = data
+    p.size = data.length
+  }
+
+  send(p: FtpPacket): void {
+    try {
+      const m = ftpMessage(VEHICLE, p)
+      conn.send(m)
+      return
+    } catch (e: FtpError) {
+    }
+  }
+
+  /// How many requests of this opcode were seen.
+  public count(opcode: int): int {
+    let n = 0
+    for (const line of log) {
+      if (line.startsWith(`${opcode} `)) {
+        n += 1
+      }
+    }
+    n
+  }
+}
+
+/// A file of `n` bytes that tell where they are.
+function fileOf(n: int): Uint8Array {
+  const b = new Uint8Array(n)
+  for (let i = 0; i < n; i++) {
+    b.set(i, (i * 7 + 3) & 0xFF)
+  }
+  b
+}
+
+class Rig {
+  public readonly gcs: MavLinkConnection
+  public readonly server: FakeFtp
+
+  constructor(gcs: MavLinkConnection, server: FakeFtp) {
+    this.gcs = gcs
+    this.server = server
+  }
+}
+
+function rig(): Rig {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const server = new FakeFtp(ends[1])
+  gcs.run()
+  server.conn.run()
+  new Rig(gcs, server)
+}
+
+function codeOf(e: FtpError): string {
+  e.code
+}
+
+// --- the packet ---
+
+function packetBytes(): void throws FtpError {
+  const p = new FtpPacket()
+  p.seq = 0x1234
+  p.session = 5
+  p.opcode = FtpOpcode.BURST_READ_FILE
+  p.size = 3
+  p.reqOpcode = FtpOpcode.READ_FILE
+  p.burstComplete = true
+  p.offset = 0x01020304
+  p.data = new Uint8Array(3)
+  p.data.set(0, 9)
+  p.data.set(1, 8)
+  p.data.set(2, 7)
+  const b = p.toPayload()
+  expect(b.length).toBe(251)
+  // seq u16, session, opcode, size, req_opcode, burst_complete, padding, offset u32, data: little-endian, as documented.
+  const head = [0x34, 0x12, 5, 15, 3, 5, 1, 0, 4, 3, 2, 1, 9, 8, 7]
+  for (let i = 0; i < head.length; i++) {
+    expect(b[i] as int).toBe(head[i])
+  }
+}
+
+function roundTripsEveryOpcode(): void throws FtpError {
+  for (const opcode of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 128, 129]) {
+    const p = new FtpPacket()
+    p.seq = 65535
+    p.session = 255
+    p.opcode = opcode
+    p.reqOpcode = 4
+    p.size = FTP_MAX_DATA
+    p.offset = 0xFFFFFFFF
+    p.data = fileOf(FTP_MAX_DATA)
+    const q = FtpPacket.fromPayload(p.toPayload())
+    expect(`${q.seq} ${q.session} ${q.opcode} ${q.reqOpcode} ${q.size} ${q.offset} ${q.burstComplete}`).toBe(
+      `65535 255 ${opcode} 4 ${FTP_MAX_DATA} 4294967295 false`)
+    expect(q.data.length).toBe(FTP_MAX_DATA)
+    expect(q.data[238] as int).toBe(p.data[238] as int)
+  }
+}
+
+function packetsThatAreNotOnes(): void {
+  expect(failureOf(new Uint8Array(5))).toBe("FTP_PROTOCOL")
+  const big = new Uint8Array(251)
+  big.set(4, 240)
+  expect(failureOf(big)).toBe("FTP_PROTOCOL")
+  // A reply that says it carries 100 bytes in a payload that has fewer.
+  const cut = new Uint8Array(20)
+  cut.set(3, FtpOpcode.ACK)
+  cut.set(4, 100)
+  expect(failureOf(cut)).toBe("FTP_PROTOCOL")
+  const tooMuch = new FtpPacket()
+  tooMuch.data = new Uint8Array(240)
+  try {
+    tooMuch.toPayload()
+    expect("accepted").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_PROTOCOL")
+  }
+}
+
+function failureOf(b: Uint8Array): string {
+  try {
+    FtpPacket.fromPayload(b)
+    "ok"
+  } catch (e: FtpError) {
+    e.code
+  }
+}
+
+function nackErrors(): void {
+  const p = new FtpPacket()
+  p.opcode = FtpOpcode.NACK
+  const cases: int[][] = [
+    [FtpNack.EOF, 0], [FtpNack.FILE_NOT_FOUND, 0], [FtpNack.NO_SESSIONS_AVAILABLE, 0], [FtpNack.INVALID_SESSION, 0],
+    [FtpNack.FILE_PROTECTED, 0], [FtpNack.FILE_EXISTS, 0], [FtpNack.FAIL_ERRNO, 22], [FtpNack.FAIL, 0], [FtpNack.UNKNOWN_COMMAND, 0],
+  ]
+  const names = [
+    "FTP_EOF", "FTP_NOT_FOUND", "FTP_NO_SESSIONS", "FTP_INVALID_SESSION", "FTP_PROTECTED", "FTP_EXISTS", "FTP_ERRNO", "FTP_FAILED", "FTP_FAILED",
+  ]
+  for (let i = 0; i < cases.length; i++) {
+    p.data = new Uint8Array(2)
+    p.data.set(0, cases[i][0])
+    p.data.set(1, cases[i][1])
+    const e = errorOfNack("x", p)
+    expect(e.code).toBe(names[i])
+    expect(e.errno).toBe(cases[i][1])
+  }
+}
+
+// --- the client ---
+
+async function readsAFile(): Promise<void> throws Error {
+  const r = rig()
+  r.server.file = fileOf(600)
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  await client.reset()
+  expect(await client.open(PATH)).toBe(600)
+  let got = 0
+  let at = 0
+  while (true) {
+    const chunk = await client.read(at)
+    if (chunk == null) {
+      break
+    }
+    for (let i = 0; i < chunk!.length; i++) {
+      expect(chunk![i] as int).toBe(r.server.file[at + i] as int)
+    }
+    got += chunk!.length
+    at += chunk!.length
+  }
+  await client.terminate()
+  r.gcs.close()
+  expect(got).toBe(600)
+  // Reset, open, three reads and the read that finds the end, terminate: in that order, on the client's session.
+  expect(r.server.log.map((line) => line.split(" ")[0] + line.split(" ")[1]).join(",")).toBe("2s0,4s7,5s7,5s7,5s7,5s7,1s7")
+}
+
+async function everyReadAsksForTheSameSize(): Promise<void> throws Error {
+  const r = rig()
+  r.server.file = fileOf(500)
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  await client.open(PATH)
+  await client.read(0)
+  await client.read(239)
+  await client.read(478)
+  r.gcs.close()
+  for (const line of r.server.log) {
+    if (line.startsWith("5 ")) {
+      // Never 0 (the packed parameter file would read nothing): always the explicit 239.
+      expect(line.includes("n239")).toBe(true)
+    }
+  }
+}
+
+async function asksAgainWithTheSameSequenceNumber(): Promise<void> throws Error {
+  const r = rig()
+  r.server.file = fileOf(10)
+  r.server.ignore = 2
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const size = await client.open(PATH)
+  r.gcs.close()
+  expect(size).toBe(10)
+  expect(r.server.log.length).toBe(3)
+  const seqs = r.server.log.map((line) => line.split(" ")[4])
+  expect(seqs[0] == seqs[1] && seqs[1] == seqs[2]).toBe(true)
+}
+
+async function timesOut(): Promise<void> throws Error {
+  const r = rig()
+  r.server.silent = true
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const started = Date.now() as int
+  try {
+    await client.open(PATH)
+    expect("answered").toBe("silent")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+  }
+  const took = (Date.now() as int) - started
+  r.gcs.close()
+  expect(took >= 150 && took < 1000).toBe(true)
+}
+
+async function recoversFromNoSessions(): Promise<void> throws Error {
+  const r = rig()
+  r.server.file = fileOf(10)
+  r.server.noSessionsOnce = true
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  expect(await client.open(PATH)).toBe(10)
+  r.gcs.close()
+  // Open, refused; reset; open again.
+  expect(r.server.log.map((line) => line.split(" ")[0]).join(",")).toBe("4,2,4")
+}
+
+async function reportsWhatTheVehicleRefuses(): Promise<void> throws Error {
+  const r = rig()
+  r.server.file = fileOf(10)
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  try {
+    await client.open("@PARAM/nothing")
+    expect("opened").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_NOT_FOUND")
+  }
+  await client.open(PATH)
+  r.server.readNack = FtpNack.FAIL_ERRNO
+  r.server.readErrno = 22
+  try {
+    await client.read(0)
+    expect("read").toBe("refused")
+  } catch (e: FtpError) {
+    expect(`${e.code} ${e.errno}`).toBe("FTP_ERRNO 22")
+  }
+  r.gcs.close()
+}
+
+async function ignoresRepliesNotForIt(): Promise<void> throws Error {
+  // A reply from another component of the system is not the vehicle's: the client keeps waiting, and times out.
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const server = new FakeFtp(ends[1], 9)
+  gcs.run()
+  server.conn.run()
+  server.file = fileOf(10)
+  const client = new FtpClient(gcs, VEHICLE, FAST)
+  try {
+    await client.open(PATH)
+    expect("answered").toBe("ignored")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+  }
+  gcs.close()
+}
+
+async function refusesAReplyAtTheWrongOffset(): Promise<void> throws Error {
+  const r = rig()
+  r.server.file = fileOf(300)
+  r.server.wrongOffset = true
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  await client.open(PATH)
+  try {
+    await client.read(0)
+    expect("read").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_PROTOCOL")
+  }
+  r.gcs.close()
+}
+
+async function abortsAndTerminates(): Promise<void> throws Error {
+  const r = rig()
+  r.server.file = fileOf(300)
+  const ac = new AbortController()
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 400, retries: 3, session: 7, signal: ac.signal })
+  await client.open(PATH)
+  // The vehicle goes quiet; the user cancels while a read waits for its reply.
+  r.server.silent = true
+  const pending = client.read(0)
+  await delay(30)
+  ac.abort()
+  try {
+    await pending
+    expect("read").toBe("aborted")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ABORTED")
+  }
+  // The terminate is sent after a cancel (best effort, bounded), and never throws, though nobody answers it.
+  r.server.silent = false
+  await client.terminate()
+  r.gcs.close()
+  expect(r.server.count(FtpOpcode.TERMINATE_SESSION)).toBe(1)
+}
+
+async function abortsBeforeAsking(): Promise<void> throws Error {
+  const r = rig()
+  const ac = new AbortController()
+  ac.abort()
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 60, retries: 1, session: 7, signal: ac.signal })
+  try {
+    await client.open(PATH)
+    expect("opened").toBe("aborted")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ABORTED")
+  }
+  r.gcs.close()
+  expect(r.server.log.length).toBe(0)
+}
+
+async function terminateNeverThrows(): Promise<void> throws Error {
+  const r = rig()
+  r.server.silent = true
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const started = Date.now() as int
+  await client.terminate()
+  r.gcs.close()
+  // Once, and briefly: not the whole retry schedule.
+  expect((Date.now() as int) - started < 400).toBe(true)
+}
+
+function messageCarriesThePacket(): void throws FtpError {
+  const p = new FtpPacket()
+  p.seq = 3
+  p.opcode = FtpOpcode.OPEN_FILE_RO
+  p.session = 2
+  p.data = new TextEncoder().encode("ab")
+  p.size = 2
+  const m = ftpMessage(VEHICLE, p)
+  expect(`${m.targetNetwork} ${m.targetSystem} ${m.targetComponent} ${m.payload.length}`).toBe("0 1 1 251")
+  const q = ftpPacketOf(m)
+  expect(`${q.seq} ${q.opcode} ${q.session} ${textOf(q.data)}`).toBe("3 4 2 ab")
+}
+
+describe("the FTP packet", () => {
+  it("lays out its header as documented", packetBytes)
+  it("round-trips every opcode, with the most data and the extreme values", roundTripsEveryOpcode)
+  it("refuses payloads that are not packets, and more data than a packet carries", packetsThatAreNotOnes)
+  it("rides in FILE_TRANSFER_PROTOCOL with the target and 251 payload bytes", messageCarriesThePacket)
+  it("names the errors of a Nack", nackErrors)
+})
+
+describe("the FTP client", () => {
+  it("resets, opens, reads a file to its end and terminates, on its own session", readsAFile)
+  it("asks for the same explicit size in every read", everyReadAsksForTheSameSize)
+  it("asks again after a timeout with the same sequence number", asksAgainWithTheSameSequenceNumber)
+  it("times out when nothing answers, after the tries", timesOut)
+  it("recovers from a vehicle with no session free by resetting and asking again", recoversFromNoSessions)
+  it("says what the vehicle refuses: no such file, an errno", reportsWhatTheVehicleRefuses)
+  it("ignores a reply from another component", ignoresRepliesNotForIt)
+  it("refuses a reply for another offset than the one asked", refusesAReplyAtTheWrongOffset)
+  it("fails with FTP_ABORTED when cancelled, and still sends the terminate", abortsAndTerminates)
+  it("does not even ask when it is cancelled already", abortsBeforeAsking)
+  it("never throws from terminate, and waits only briefly", terminateNeverThrows)
+})

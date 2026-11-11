@@ -37,6 +37,19 @@ export {
   showParam,
 } from "./src/params"
 export {
+  FTP_HEADER_SIZE,
+  FTP_MAX_DATA,
+  FtpClient,
+  FtpError,
+  FtpNack,
+  FtpOpcode,
+  FtpOptions,
+  FtpPacket,
+  errorOfNack,
+  ftpMessage,
+  ftpPacketOf,
+} from "./src/ftp"
+export {
   AutopilotVersionRead,
   CommandCall,
   HeartbeatSender,
