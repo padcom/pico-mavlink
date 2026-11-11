@@ -1,0 +1,333 @@
+// The packed parameter file an autopilot serves over MAVLink FTP ("@PARAM/param.pck"): every parameter of the vehicle in one
+// short file, names shared with the previous entry stored once, values in their real type. This module is the pure codec: bytes
+// in, parameters out, and the other way for tests and simulators. Nothing here talks to a link.
+//
+// Layout (little-endian), from the documented MAVLink parameter file format:
+//   header, 6 bytes:   magic u16 (0x671b, or 0x671c when entries may carry a default), num_params u16 (entries in this file),
+//                      total_params u16 (parameters the vehicle has)
+//   each entry:        byte 0: low nibble the type (1 INT8, 2 INT16, 3 INT32, 4 FLOAT), high nibble the flags (bit 0: a default
+//                      follows the value)
+//                      byte 1: low nibble how many leading bytes of the previous name this one shares, high nibble the name's
+//                      length minus one
+//                      then the bytes of the name that are not shared, the value (exactly the type's size), and with the flag
+//                      the default (the same type)
+//   zero bytes may stand before an entry (no type is 0): they keep a multi-byte value from crossing the edge of a read packet,
+//   which is what makes asking for a block again safe.
+import { byteAt, readF32, readI16, readI32, readI8, writeF32, writeUint } from "./bytes"
+import { MavParamType } from "./dialects/common"
+import { TypedParamValue } from "./params"
+
+/// The magic of a file whose entries have no defaults, and of one whose entries may.
+export const PARAM_PACK_MAGIC: int = 0x671b
+export const PARAM_PACK_MAGIC_WITH_DEFAULTS: int = 0x671c
+
+/// How many bytes a read packet carries: the size every read of the file uses, and the one the padding is computed for.
+export const PARAM_PACK_READ_SIZE: int = 239
+
+/// A packed parameter file that cannot be used.
+export class ParamPackError extends Error {
+  /// `BAD_MAGIC`, `TRUNCATED` (the file ends inside an entry or the header), `BAD_ENTRY` (a type or flags that are not valid, a
+  /// name that does not fit), `COUNT_MISMATCH` (the entries are not as many as the header says), `UNSUPPORTED_TYPE` and
+  /// `BAD_NAME` (when encoding: a value or a name the format cannot carry).
+  public readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.code = code
+  }
+}
+
+/// One parameter of the file.
+export struct PackedParam {
+  name: string
+  /// INT8, INT16, INT32 or REAL32 (FLOAT), as `TypedParamValue.Int` / `.Real` with that `MavParamType`.
+  value: TypedParamValue
+  /// The firmware's default, when the file has it for this parameter (it differs from the value).
+  firmwareDefault?: TypedParamValue
+}
+
+/// What a packed parameter file holds.
+export struct ParamPack {
+  /// How many parameters the vehicle has (the header's `total_params`); `params` may be a slice of them.
+  total: int
+  /// Whether the file could carry defaults (the magic).
+  withDefaults: bool
+  /// In the file's order, which is the order of PARAM_REQUEST_LIST: an entry's place is its parameter's index (for a whole file).
+  params: PackedParam[]
+}
+
+/// The size in bytes of a type of the file, or 0 for one it does not have.
+function sizeOf(type: int): int {
+  if (type == MavParamType.INT8) {
+    return 1
+  }
+  if (type == MavParamType.INT16) {
+    return 2
+  }
+  if (type == MavParamType.INT32 || type == MavParamType.REAL32) {
+    return 4
+  }
+  0
+}
+
+/// The file's type nibble for a MAV_PARAM_TYPE (0 when the file cannot carry it).
+function nibbleOf(type: int): int {
+  if (type == MavParamType.INT8) {
+    return 1
+  }
+  if (type == MavParamType.INT16) {
+    return 2
+  }
+  if (type == MavParamType.INT32) {
+    return 3
+  }
+  if (type == MavParamType.REAL32) {
+    return 4
+  }
+  0
+}
+
+/// The MAV_PARAM_TYPE for a file's type nibble (0 when it is not one).
+function typeOfNibble(nibble: int): int {
+  if (nibble == 1) {
+    return MavParamType.INT8
+  }
+  if (nibble == 2) {
+    return MavParamType.INT16
+  }
+  if (nibble == 3) {
+    return MavParamType.INT32
+  }
+  if (nibble == 4) {
+    return MavParamType.REAL32
+  }
+  0
+}
+
+function u16At(b: Uint8Array, at: int): int {
+  byteAt(b, at) | (byteAt(b, at + 1) << 8)
+}
+
+/// The value of `type` at `at`.
+function valueAt(b: Uint8Array, at: int, type: int): TypedParamValue {
+  if (type == MavParamType.INT8) {
+    return TypedParamValue.Int(readI8(b, at) as int, type)
+  }
+  if (type == MavParamType.INT16) {
+    return TypedParamValue.Int(readI16(b, at) as int, type)
+  }
+  if (type == MavParamType.INT32) {
+    return TypedParamValue.Int(readI32(b, at) as int, type)
+  }
+  TypedParamValue.Real(readF32(b, at) as f64, type)
+}
+
+/// The text of `n` bytes of `shared` followed by `n2` bytes of `b` from `at`.
+function nameOf(shared: Uint8Array, common: int, b: Uint8Array, at: int, n: int): Uint8Array {
+  const name = new Uint8Array(common + n)
+  for (let i = 0; i < common; i++) {
+    name.set(i, shared[i])
+  }
+  for (let i = 0; i < n; i++) {
+    name.set(common + i, b[at + i])
+  }
+  name
+}
+
+/// A name as text; bytes that are not text make the entry bad.
+function textOf(name: Uint8Array, entry: int): string throws ParamPackError {
+  try {
+    new TextDecoder().decode(name)
+  } catch (e: TypeError) {
+    throw new ParamPackError("BAD_ENTRY", `the name of entry ${entry} is not text`)
+  }
+}
+
+/// The parameters in a packed parameter file.
+export function decodeParamPack(b: Uint8Array): ParamPack throws ParamPackError {
+  if (b.length < 6) {
+    throw new ParamPackError("TRUNCATED", `the file has ${b.length} bytes: its header needs 6`)
+  }
+  const magic = u16At(b, 0)
+  if (magic != PARAM_PACK_MAGIC && magic != PARAM_PACK_MAGIC_WITH_DEFAULTS) {
+    throw new ParamPackError("BAD_MAGIC", `the file starts with ${magic}, not the magic ${PARAM_PACK_MAGIC} of a packed parameter file`)
+  }
+  const count = u16At(b, 2)
+  const total = u16At(b, 4)
+  const params: PackedParam[] = []
+  let previous = new Uint8Array(0)
+  let at = 6
+  while (params.length < count) {
+    // Zero bytes before an entry are padding.
+    while (at < b.length && b[at] == 0) {
+      at += 1
+    }
+    if (at >= b.length) {
+      throw new ParamPackError("COUNT_MISMATCH", `the file ends after ${params.length} of ${count} parameters`)
+    }
+    const type = typeOfNibble(byteAt(b, at) & 0xF)
+    const flags = byteAt(b, at) >> 4
+    if (type == 0) {
+      throw new ParamPackError("BAD_ENTRY", `entry ${params.length} has the type ${byteAt(b, at) & 0xF}, which the file does not have`)
+    }
+    if (flags > 1) {
+      throw new ParamPackError("BAD_ENTRY", `entry ${params.length} has the flags ${flags}`)
+    }
+    if (at + 1 >= b.length) {
+      throw new ParamPackError("TRUNCATED", `the file ends inside entry ${params.length}`)
+    }
+    const common = byteAt(b, at + 1) & 0xF
+    const nameLength = (byteAt(b, at + 1) >> 4) + 1
+    if (common > previous.length || common > nameLength) {
+      throw new ParamPackError("BAD_ENTRY", `entry ${params.length} shares ${common} bytes of a name that is ${previous.length} long`)
+    }
+    const fresh = nameLength - common
+    const size = sizeOf(type)
+    const end = at + 2 + fresh + size + (if (flags == 1) size else 0)
+    if (end > b.length) {
+      throw new ParamPackError("TRUNCATED", `the file ends inside entry ${params.length}`)
+    }
+    const nameBytes = nameOf(previous, common, b, at + 2, fresh)
+    const valueAt0 = at + 2 + fresh
+    const name = textOf(nameBytes, params.length)
+    const value = valueAt(b, valueAt0, type)
+    if (flags == 1) {
+      const withDefault: PackedParam = { name, value, firmwareDefault: valueAt(b, valueAt0 + size, type) }
+      params.push(withDefault)
+    } else {
+      const plain: PackedParam = { name, value }
+      params.push(plain)
+    }
+    previous = nameBytes
+    at = end
+  }
+  while (at < b.length && b[at] == 0) {
+    at += 1
+  }
+  if (at < b.length) {
+    throw new ParamPackError("COUNT_MISMATCH", `the file has more than the ${count} parameters its header says`)
+  }
+  const pack: ParamPack = { total, withDefaults: magic == PARAM_PACK_MAGIC_WITH_DEFAULTS, params }
+  pack
+}
+
+/// How many bytes of the name `a` and `b` have in common at the start, at most 15 (what a nibble holds) and at most `limit`.
+function sharedBytes(a: Uint8Array, b: Uint8Array, limit: int): int {
+  let n = 0
+  while (n < a.length && n < b.length && n < 15 && n < limit && a[n] == b[n]) {
+    n += 1
+  }
+  n
+}
+
+/// Appends the value (`size` bytes) to `out`.
+function putValue(out: int[], v: TypedParamValue): void throws ParamPackError {
+  const bytes = new Uint8Array(4)
+  match (v) {
+    Int { value, type } => {
+      if (type != MavParamType.INT8 && type != MavParamType.INT16 && type != MavParamType.INT32) {
+        throw new ParamPackError("UNSUPPORTED_TYPE", `MAV_PARAM_TYPE ${type} is not an integer type of the file`)
+      }
+      writeUint(bytes, 0, sizeOf(type), value)
+      for (let i = 0; i < sizeOf(type); i++) {
+        out.push(bytes[i] as int)
+      }
+    },
+    Real { value, type } => {
+      if (type != MavParamType.REAL32) {
+        throw new ParamPackError("UNSUPPORTED_TYPE", `MAV_PARAM_TYPE ${type} is not the float of the file`)
+      }
+      writeF32(bytes, 0, value as f32)
+      for (let i = 0; i < 4; i++) {
+        out.push(bytes[i] as int)
+      }
+    },
+  }
+}
+
+/// The MAV_PARAM_TYPE of a value.
+function typeOfValue(v: TypedParamValue): int {
+  match (v) {
+    Int { type } => type,
+    Real { type } => type,
+  }
+}
+
+/// A packed parameter file holding `params` (the slice of a vehicle that has `total`), with the padding a vehicle puts in for
+/// reads of `readSize` bytes: no value, and no default, crosses the edge of a read packet.
+export function encodeParamPack(
+  params: PackedParam[],
+  total: int,
+  withDefaults: bool = false,
+  readSize: int = 239,
+): Uint8Array throws ParamPackError {
+  const out: int[] = []
+  const magic = if (withDefaults) PARAM_PACK_MAGIC_WITH_DEFAULTS else PARAM_PACK_MAGIC
+  writeHeader(out, magic, params.length, total)
+  let previous = new Uint8Array(0)
+  for (const p of params) {
+    const nameBytes = new TextEncoder().encode(p.name)
+    if (nameBytes.length < 1 || nameBytes.length > 16) {
+      throw new ParamPackError("BAD_NAME", `the name "${p.name}" is ${nameBytes.length} bytes: the file holds 1 to 16`)
+    }
+    const type = typeOfValue(p.value)
+    const nibble = nibbleOf(type)
+    if (nibble == 0) {
+      throw new ParamPackError("UNSUPPORTED_TYPE", `MAV_PARAM_TYPE ${type} is not a type of the file`)
+    }
+    const hasDefault = p.firmwareDefault != null
+    if (hasDefault && !withDefaults) {
+      throw new ParamPackError("UNSUPPORTED_TYPE", `"${p.name}" has a default, and the file is written without them`)
+    }
+    // At least one byte of the name is written out, so that a name never rests wholly on the one before it.
+    const common = sharedBytes(previous, nameBytes, nameBytes.length - 1)
+    const entry: int[] = []
+    entry.push(nibble | (if (hasDefault) 0x10 else 0))
+    entry.push(common | ((nameBytes.length - 1) << 4))
+    for (let i = common; i < nameBytes.length; i++) {
+      entry.push(nameBytes[i] as int)
+    }
+    const valueFrom = entry.length
+    putValue(entry, p.value)
+    if (hasDefault) {
+      putValue(entry, p.firmwareDefault!)
+    }
+    // Pad before the entry until no value in it crosses a read packet's edge.
+    while (crosses(out.length, valueFrom, sizeOf(type), if (hasDefault) 2 else 1, readSize)) {
+      out.push(0)
+    }
+    for (const x of entry) {
+      out.push(x)
+    }
+    previous = nameBytes
+  }
+  const bytes = new Uint8Array(out.length)
+  for (let i = 0; i < out.length; i++) {
+    bytes.set(i, out[i])
+  }
+  bytes
+}
+
+function writeHeader(out: int[], magic: int, count: int, total: int): void {
+  out.push(magic & 0xFF)
+  out.push((magic >> 8) & 0xFF)
+  out.push(count & 0xFF)
+  out.push((count >> 8) & 0xFF)
+  out.push(total & 0xFF)
+  out.push((total >> 8) & 0xFF)
+}
+
+/// Whether the `values` values of `size` bytes, starting `valueFrom` bytes into an entry that starts at `start`, cross a multiple
+/// of `readSize`.
+function crosses(start: int, valueFrom: int, size: int, values: int, readSize: int): bool {
+  if (size < 2) {
+    return false
+  }
+  for (let v = 0; v < values; v++) {
+    const from = start + valueFrom + v * size
+    if (from / readSize != (from + size - 1) / readSize) {
+      return true
+    }
+  }
+  false
+}
