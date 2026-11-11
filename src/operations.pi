@@ -165,6 +165,9 @@ export class ParamList {
   readonly received: Map<int, Param> = new Map<int, Param>()
   count: int = -1
   lastArrival: int = 0
+  /// Called with how many parameters have arrived and how many the autopilot says it has, each time a new one arrives (set it
+  /// before `run`). Does not change what `run` does.
+  public progress: (received: int, count: int) => void = (_received: int, _count: int) => {}
 
   constructor(conn: MavLinkConnection, target: Target, encoding: ParamEncoding, options: ParamOptions = {}) {
     this.conn = conn
@@ -217,7 +220,12 @@ export class ParamList {
         count = m.paramCount as int
         const i = m.paramIndex as int
         if (i < count) {
+          const isNew = !received.has(i)
           received.set(i, paramOf(m, encoding))
+          if (isNew) {
+            const report = this.progress
+            report(received.size, count)
+          }
         }
         lastArrival = Date.now() as int
       }

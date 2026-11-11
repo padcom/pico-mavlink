@@ -70,12 +70,15 @@ async function reportsMonotonicProgress(): Promise<void> throws Error {
   const r = rig(many(3000))
   const seen: int[] = []
   const totals: int[] = []
-  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run((received: int, total: int) => {
+  const units: string[] = []
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run((received: int, total: int, unit: string) => {
     seen.push(received)
     totals.push(total)
+    units.push(unit)
   })
   r.gcs.close()
   expect(got.source).toBe("ftp")
+  expect(units[0]).toBe("bytes")
   expect(seen.length > 1).toBe(true)
   for (let i = 1; i < seen.length; i++) {
     expect(seen[i] >= seen[i - 1]).toBe(true)
@@ -149,6 +152,30 @@ async function takesTheCapabilitiesFromTheCaller(): Promise<void> throws Error {
   expect(ftpRequests(r)).toBe(0)
 }
 
+async function reportsProgressOfTheList(): Promise<void> throws Error {
+  const r = rig(many(300))
+  r.sim.ftpMode = "unsupported"
+  const seen: int[] = []
+  const totals: int[] = []
+  const units: string[] = []
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, FAST).run((received: int, total: int, unit: string) => {
+    seen.push(received)
+    totals.push(total)
+    units.push(unit)
+  })
+  r.gcs.close()
+  expect(got.source).toBe("list")
+  // One call for each parameter that arrived, counting up to the count the vehicle gives, in parameters.
+  expect(seen.length).toBe(300)
+  for (let i = 1; i < seen.length; i++) {
+    expect(seen[i]).toBe(seen[i - 1] + 1)
+  }
+  expect(seen[299]).toBe(300)
+  expect(totals[0]).toBe(300)
+  expect(units[0]).toBe("parameters")
+  expect(units[299]).toBe("parameters")
+}
+
 async function methodsListAndFtp(): Promise<void> throws Error {
   const r = rig(many(100))
   const list: ParamDownloadOptions = { timeoutMs: 100, retries: 2, quietMs: 60, silenceMs: 60, method: "list" }
@@ -178,7 +205,7 @@ async function abortIsNotRetriedByTheList(): Promise<void> throws Error {
       listRequests.push(1)
     }
   })
-  const run = new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, options).run((received: int, _total: int) => {
+  const run = new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, options).run((received: int, _total: int, _unit: string) => {
     if (received > 5000 && !cancelled) {
       cancelled = true
       ac.abort()
@@ -267,6 +294,7 @@ describe("the parameter download", () => {
   it("falls back to the list, reason incomplete, on a file that holds fewer than the vehicle has", fallsBackOnAnIncompleteFile)
   it("uses the list without one FTP packet when the vehicle does not have the capability", usesNoFtpWithoutTheCapability)
   it("takes the capabilities from the caller, and does not ask for them", takesTheCapabilitiesFromTheCaller)
+  it("reports the progress of the list too, in parameters", reportsProgressOfTheList)
   it("uses the list when asked to, and gives the error of a forced FTP", methodsListAndFtp)
   it("is cancelled for good, not retried by the list, and ends the FTP session", abortIsNotRetriedByTheList)
   it("is cancelled before it starts", abortsBeforeAnything)

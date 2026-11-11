@@ -105,14 +105,14 @@ export class ParamFtp {
     this.options = options
   }
 
-  /// `progress(received, total)` is called as the file arrives (`total` is the vehicle's estimate, 12 bytes a parameter), in
-  /// bytes. Errors: `FTP_ABORTED`, `FTP_TIMEOUT`, `FTP_NOT_FOUND` ... (what the vehicle says), `FTP_PROTOCOL` (nonsense: a
+  /// `progress(received, total, "bytes")` is called as the file arrives (`total` is the vehicle's estimate, 12 bytes a
+  /// parameter). Errors: `FTP_ABORTED`, `FTP_TIMEOUT`, `FTP_NOT_FOUND` ... (what the vehicle says), `FTP_PROTOCOL` (nonsense: a
   /// corrupt file, a name twice) and `FTP_INCOMPLETE` (fewer parameters than the vehicle says it has).
-  public async run(progress: (received: int, total: int) => void = (_received: int, _total: int) => {}): Promise<ParamDownloadResult> throws FtpError {
+  public async run(progress: (received: int, total: int, unit: string) => void = (_r: int, _t: int, _u: string) => {}): Promise<ParamDownloadResult> throws FtpError {
     const started = Date.now() as int
     const client = new FtpClient(conn, target, { timeoutMs: options.timeoutMs, retries: options.retries, signal: options.signal })
     const path = if (options.withDefaults ?? false) `${PARAM_PACK_PATH}?withdefaults=1` else PARAM_PACK_PATH
-    const file = await readFile(client, path, progress, options.silenceMs ?? 250)
+    const file = await readFile(client, path, (received: int, total: int) => progress(received, total, "bytes"), options.silenceMs ?? 250)
     let pack: ParamPack
     try {
       pack = decodeParamPack(file.data)
@@ -174,27 +174,31 @@ export class ParamDownload {
     v != null && ((v!.capabilities as int) & MavProtocolCapability.FTP) != 0
   }
 
-  async list(fallback: string?, started: int): Promise<ParamDownloadResult> throws Error {
+  async list(fallback: string?, started: int, progress: (received: int, total: int, unit: string) => void): Promise<ParamDownloadResult> throws Error {
     const listOptions: ParamOptions = {
       quietMs: options.quietMs,
       timeoutMs: options.timeoutMs,
       retries: options.retries,
       signal: options.signal,
     }
-    const r = await new ParamList(conn, target, encoding, listOptions).run()
+    const op = new ParamList(conn, target, encoding, listOptions)
+    op.progress = (received: int, count: int) => progress(received, count, "parameters")
+    const r = await op.run()
     listResult(r, fallback, (Date.now() as int) - started)
   }
 
-  /// Downloads the parameters. The `progress` is that of `ParamFtp.run` (and is not called for the list). A cancel is an
-  /// `ABORTED` MavLinkError from whichever way was running, and no other way is tried after it.
-  public async run(progress: (received: int, total: int) => void = (_received: int, _total: int) => {}): Promise<ParamDownloadResult> throws Error {
+  /// Downloads the parameters. `progress(received, total, unit)` is called as data arrives: `unit` is `bytes` for the file
+  /// (`total` an estimate) and `parameters` for the list (`total` is the count the vehicle gives); only the ratio is comparable,
+  /// and after a fallback it starts again from 0 in the new unit. A cancel is an `ABORTED` MavLinkError from whichever way was
+  /// running, and no other way is tried after it.
+  public async run(progress: (received: int, total: int, unit: string) => void = (_r: int, _t: int, _u: string) => {}): Promise<ParamDownloadResult> throws Error {
     const started = Date.now() as int
     const method = options.method ?? "auto"
     if (method == "list") {
-      return await list("disabled", started)
+      return await list("disabled", started, progress)
     }
     if (method == "auto" && !(await hasFtp())) {
-      return await list("unsupported", started)
+      return await list("unsupported", started, progress)
     }
     try {
       return await new ParamFtp(conn, target, options).run(progress)
@@ -205,7 +209,7 @@ export class ParamDownload {
       if (method == "ftp") {
         throw e
       }
-      return await list(fallbackOf(e), started)
+      return await list(fallbackOf(e), started, progress)
     }
   }
 }
