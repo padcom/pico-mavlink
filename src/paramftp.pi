@@ -6,7 +6,7 @@ import { MavLinkConnection } from "./connection"
 import { MavProtocolCapability } from "./dialects/standard"
 import { MavLinkError } from "./protocol"
 import { FtpClient, FtpError } from "./ftp"
-import { readFile } from "./ftpread"
+import { MAX_FILE_BYTES, readFile } from "./ftpread"
 import { Param, ParamList, ParamListResult, ParamOptions, Target, AutopilotVersionRead } from "./operations"
 import { PackedParam, ParamPack, ParamPackError, decodeParamPack } from "./parampack"
 import { ParamEncoding } from "./params"
@@ -46,6 +46,8 @@ export struct ParamDownloadOptions {
   /// How long a quiet link means the list is over (default 1000 ms), and how long a burst may be silent (default 250 ms).
   quietMs?: int
   silenceMs?: int
+  /** The most the parameter file may hold in bytes (default `MAX_FILE_BYTES`, 16 MB): a vehicle that goes on past it is refused. */
+  maxBytes?: int
   /// Cancels the download: it fails with an `ABORTED` MavLinkError, whichever way it is going.
   signal?: AbortSignal
 }
@@ -112,7 +114,13 @@ export class ParamFtp {
     const started = Date.now() as int
     const client = new FtpClient(conn, target, { timeoutMs: options.timeoutMs, retries: options.retries, signal: options.signal })
     const path = if (options.withDefaults ?? false) `${PARAM_PACK_PATH}?withdefaults=1` else PARAM_PACK_PATH
-    const file = await readFile(client, path, (received: int, total: int) => progress(received, total, "bytes"), options.silenceMs ?? 250)
+    const file = await readFile(
+      client,
+      path,
+      (received: int, total: int) => progress(received, total, "bytes"),
+      options.silenceMs ?? 250,
+      options.maxBytes ?? MAX_FILE_BYTES,
+    )
     let pack: ParamPack
     try {
       pack = decodeParamPack(file.data)

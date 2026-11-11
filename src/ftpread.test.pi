@@ -83,6 +83,7 @@ async function readsTheParameterFile(): Promise<void> throws Error {
   expect(pack.params.length).toBe(1500)
   // (A silence window long enough for a slow runner: the file comes in one burst.)
   expect(got.bursts <= 2).toBe(true)
+  expect(got.reads <= 1).toBe(true)
   // Reset, open, one burst, terminate: the session is closed again, and every read used the one size.
   expect(r.sim.openFtpSessions()).toBe(0)
   for (const line of r.sim.ftpLog) {
