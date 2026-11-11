@@ -425,6 +425,11 @@ export class SimulatedAutopilot {
     `${to.system}:${to.component}:${session}`
   }
 
+  forgetFtpReply(key: string): void {
+    ftpCache.delete(key)
+    return
+  }
+
   /// Sends a reply to the FTP request `ask`: Ack or Nack, with `data`, to whoever asked (its system and component). The reply
   /// is kept to answer a repeat of the request with (`remember`), also when it is lost on its way out.
   ftpReply(ask: FtpAsk, opcode: int, data: Uint8Array, seq: int, offset: int, burstComplete: bool, remember: bool = true): void {
@@ -477,7 +482,7 @@ export class SimulatedAutopilot {
     const cached = ftpCache.get(key)
     if (req.opcode == FtpOpcode.BURST_READ_FILE) {
       // A burst starts a new one every time, and is never resent from the cache.
-      const gone = ftpCache.delete(key)
+      forgetFtpReply(key)
     } else if (cached != null && cached!.seq == req.seq) {
       if (!ftpLost()) {
         conn.send(cached!.message)
