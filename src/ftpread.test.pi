@@ -264,6 +264,80 @@ async function givesUpWhenNothingComes(): Promise<void> throws Error {
   r.gcs.close()
 }
 
+/// What ends a read, as an error code, for the tests of a hostile vehicle.
+async function codeOf(r: Rig, maxBytes: int, progress: (bytes: int, estimate: int) => void throws Error): Promise<string> throws Error {
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 60, retries: 1, session: 7 })
+  try {
+    await readFile(client, PATH, progress, 40, maxBytes)
+    "read"
+  } catch (e: FtpError) {
+    e.code
+  }
+}
+
+async function endsWhenTheVehicleRepeatsWhatItSent(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(239 * 30)
+  r.sim.ftpMode = "repeat"
+  const started = Date.now() as int
+  const code = await codeOf(r, 16_777_216, (_b: int, _e: int) => {})
+  // The same chunk, over and over, never ends a burst by itself, and is never new data: the read gives up.
+  r.sim.ftpMode = "ok"
+  await delay(50)
+  r.gcs.close()
+  expect(code).toBe("FTP_TIMEOUT")
+  expect((Date.now() as int) - started < 5000).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileWithoutAnEnd(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(239 * 30)
+  r.sim.ftpMode = "endless"
+  const code = await codeOf(r, 100_000, (_b: int, _e: int) => {})
+  r.sim.ftpMode = "ok"
+  await delay(50)
+  r.gcs.close()
+  // Distinct offsets for ever: refused at the most a file may hold, nothing past it is kept.
+  expect(code).toBe("FTP_PROTOCOL")
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileOverTheMaximumSize(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(50_000)
+  expect(await codeOf(r, 10_000, (_b: int, _e: int) => {})).toBe("FTP_PROTOCOL")
+  expect(r.sim.openFtpSessions()).toBe(0)
+  // The same file under a maximum that holds it.
+  expect(await codeOf(r, 50_000, (_b: int, _e: int) => {})).toBe("read")
+  r.gcs.close()
+}
+
+async function terminatesWhenTheProgressCallbackThrows(): Promise<void> throws Error {
+  const r = rig(many(1))
+  r.sim.ftpFile = bytesOf(100_000)
+  const code = await codeOf(r, 16_777_216, (_b: int, _e: int) => {
+    throw new Error("the callback broke")
+  })
+  r.gcs.close()
+  expect(code).toBe("FTP_CALLBACK")
+  expect(r.sim.openFtpSessions()).toBe(0)
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 ")).toBe(true)
+}
+
+function stateRefusesDataPastTheMaximum(): void {
+  const s = new ReadState(10, 7, VEHICLE, 25)
+  s.accept(0, chunkOf(10, 1))
+  s.accept(10, chunkOf(10, 2))
+  expect(s.failure == null).toBe(true)
+  s.accept(20, chunkOf(10, 3))
+  expect(s.failure != null).toBe(true)
+  expect(s.bytes).toBe(20)
+  const t = new ReadState(10, 7, VEHICLE, 25)
+  t.setEnd(30)
+  expect(t.failure != null).toBe(true)
+}
+
 function chunkOf(size: int, fill: int): Uint8Array {
   const c = new Uint8Array(size)
   for (let i = 0; i < size; i++) {
@@ -366,6 +440,10 @@ describe("reading a file with bursts", () => {
   it("cancels before it starts", cancelsBeforeStarting)
   it("terminates the session after an error", terminatesAfterAnError)
   it("gives up when a vehicle brings nothing", givesUpWhenNothingComes)
+  it("gives up on a vehicle that repeats what it sent, and terminates", endsWhenTheVehicleRepeatsWhatItSent)
+  it("refuses a file that has no end, at the most a file may hold", refusesAFileWithoutAnEnd)
+  it("refuses a file over the maximum size, and reads one under it", refusesAFileOverTheMaximumSize)
+  it("terminates the session when the progress callback throws", terminatesWhenTheProgressCallbackThrows)
 })
 
 describe("the chunks of a file being read", () => {
@@ -374,4 +452,5 @@ describe("the chunks of a file being read", () => {
   it("complete an empty file at its end", emptyFileIsCompleteAtItsEnd)
   it("refuse a chunk that is not at a multiple of the read size", refusesChunksNotOnTheGrid)
   it("need the end from the vehicle after a full chunk", aFullChunkLastNeedsTheEndFromTheVehicle)
+  it("refuse data and an end past the maximum size", stateRefusesDataPastTheMaximum)
 })
