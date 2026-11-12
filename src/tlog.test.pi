@@ -55,6 +55,28 @@ function readAll(bytes: Uint8Array, chunk: int): Read {
     }
   }
   out.reader.finish()
+  // What the end of the file turned out to hold comes out of `next` too.
+  while (true) {
+    const r = out.reader.next()
+    if (r == null) {
+      break
+    }
+    out.records.push(r!)
+  }
+  out
+}
+
+/// The 8 bytes of a timestamp, then `rest`.
+function stamped(timeUs: int, rest: int[]): Uint8Array {
+  const out = new Uint8Array(8 + rest.length)
+  let t = timeUs
+  for (let i = 7; i >= 0; i--) {
+    out.set(i, t % 256)
+    t = t / 256
+  }
+  for (let i = 0; i < rest.length; i++) {
+    out.set(8 + i, rest[i])
+  }
   out
 }
 
@@ -204,6 +226,81 @@ function startsASegmentAtAStepBackAndAtAJumpButKeepsTheOrder(): void {
   expect(got.reader.report.jumps).toBe(1)
 }
 
+function aSmallStepBackIsJitterAndStaysInTheSegment(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1)
+  // 1 microsecond back, 3 milliseconds back, then 900 ms back from the latest time (steps do not add up).
+  w.addMessage(T0 + SECOND - 1, heartbeat(), 2)
+  w.addMessage(T0 + SECOND - 2, heartbeat(), 3)
+  w.addMessage(T0 + SECOND - 3000, heartbeat(), 4)
+  w.addMessage(T0 + SECOND + 200000, heartbeat(), 5)
+  w.addMessage(T0 + SECOND + 200000 - 900000, heartbeat(), 6)
+  w.addMessage(T0 + 2 * SECOND, heartbeat(), 7)
+  const got = readAll(w.bytes(), 40)
+
+  expect(got.records.map((r) => `${r.seq}:${r.segment}`).join(" ")).toBe("1:0 2:0 3:0 4:0 5:0 6:0 7:0")
+  expect(got.reader.report.segments).toBe(1)
+  expect(got.reader.report.backwards).toBe(0)
+  expect(got.reader.report.jitter).toBe(3)
+  expect(got.reader.report.lastUs).toBe(T0 + 2 * SECOND)
+
+  // A minute back is a new segment.
+  const w2 = new TlogWriter()
+  w2.addMessage(T0 + 100 * SECOND, heartbeat(), 1)
+  w2.addMessage(T0 + 110 * SECOND, heartbeat(), 2)
+  w2.addMessage(T0 + 50 * SECOND, heartbeat(), 3)
+  const got2 = readAll(w2.bytes(), 40)
+  expect(got2.reader.report.segments).toBe(2)
+  expect(got2.reader.report.backwards).toBe(1)
+  expect(got2.reader.report.jitter).toBe(0)
+}
+
+function anUnknownFrameBehindAJitterStepIsKeptAndCounted(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1)
+  // A frame of message 16777215 (no dialect has it), stamped 2 ms before the record before it.
+  w.raw(stamped(T0 - 2000, [0xFD, 3, 0, 0, 9, 1, 1, 255, 255, 255, 1, 2, 3, 0x12, 0x34]))
+  w.addMessage(T0 + SECOND, heartbeat(), 2)
+  const got = readAll(w.bytes(), 7)
+
+  expect(got.records.length).toBe(2)
+  expect(got.reader.report.unknown).toBe(1)
+  expect(got.reader.report.jitter).toBe(1)
+  expect(got.reader.report.segments).toBe(1)
+  expect(got.reader.report.bytesSkipped).toBe(0)
+  expect(accounted(got.reader)).toBe(true)
+}
+
+function aFalseStartAtTheEndCostsItsBytesAndTheRecordsBehindItAreGiven(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1)
+  // A timestamp and a header that claims 255 bytes of payload (a corrupted length), then two good records.
+  w.raw(stamped(T0 + SECOND, [0xFD, 255, 0]))
+  w.addMessage(T0 + 2 * SECOND, heartbeat(), 2)
+  w.addMessage(T0 + 3 * SECOND, heartbeat(), 3)
+  const got = readAll(w.bytes(), 1000)
+
+  expect(got.records.map((r) => r.seq).join(",")).toBe("1,2,3")
+  expect(got.reader.report.cutEnd).toBe(false)
+  expect(got.reader.report.bytesSkipped).toBe(11)
+  expect(accounted(got.reader)).toBe(true)
+
+  // The same, one byte at a time.
+  const slow = readAll(w.bytes(), 1)
+  expect(slow.records.map((r) => r.seq).join(",")).toBe("1,2,3")
+  expect(slow.reader.report.bytesSkipped).toBe(11)
+
+  // A real start of a frame with nothing valid behind it is still cutEnd.
+  const cut = new TlogWriter()
+  cut.addMessage(T0, heartbeat(), 1)
+  cut.raw(stamped(T0 + SECOND, [0xFD, 255, 0, 1, 1]))
+  const end = readAll(cut.bytes(), 1000)
+  expect(end.records.length).toBe(1)
+  expect(end.reader.report.cutEnd).toBe(true)
+  expect(end.reader.report.bytesSkipped).toBe(0)
+  expect(accounted(end.reader)).toBe(true)
+}
+
 function saysADateThatCannotBeRealIsNoDate(): void {
   const early = new TlogWriter()
   early.addMessage(5000000, heartbeat(), 1)
@@ -330,6 +427,9 @@ describe("the tlog reader", () => {
   it("does not take noise for an unknown frame before the recording has begun", doesNotTakeNoiseForAnUnknownFrameBeforeTheFirstRecord)
   it("recognises a signed frame and does not verify it", recognisesASignedFrameAndDoesNotVerifyIt)
   it("starts a segment at a step back and at a jump, and keeps the order of the file", startsASegmentAtAStepBackAndAtAJumpButKeepsTheOrder)
+  it("keeps a small step back in the segment and counts it as jitter", aSmallStepBackIsJitterAndStaysInTheSegment)
+  it("keeps an unknown frame behind a jitter step", anUnknownFrameBehindAJitterStepIsKeptAndCounted)
+  it("rescans the tail: a false start at the end costs its bytes, the records behind it are given", aFalseStartAtTheEndCostsItsBytesAndTheRecordsBehindItAreGiven)
   it("says a date that cannot be real is no date", saysADateThatCannotBeRealIsNoDate)
   it("takes no record whose time has the top bit set", takesNoRecordWhoseTimeHasTheTopBitSet)
   it("treats a file cut at any byte as cutEnd, not damage", aFileCutAnywhereIsCutEndNotDamage)

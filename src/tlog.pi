@@ -33,6 +33,11 @@ export const TLOG_MAX_FRAME: int = 10 + 255 + CHECKSUM_LENGTH + SIGNATURE_LENGTH
 /// A step of time in a recording above this (microseconds) starts a new segment: 30 s.
 export const TLOG_MAX_GAP_US: int = 30000000
 
+/// A step back in time of up to this (microseconds) is jitter, not a new stretch: 1 s. Real recordings step back a little (frames are
+/// stamped when they are received and written through a queue, several links swap, a clock is set by NTP); only more than this is a
+/// step back that starts a segment.
+export const TLOG_JITTER_US: int = 1000000
+
 /// 2000-01-01 and a year (366 days) in microseconds since 1970.
 const YEAR_2000_US: int = 946684800000000
 const A_YEAR_US: int = 31622400000000
@@ -43,6 +48,8 @@ export struct TlogOptions {
   magicNumbers?: Map<int, int>
   /// A step of time above this starts a new segment (default `TLOG_MAX_GAP_US`).
   maxGapUs?: int
+  /// A step back of up to this is jitter and stays in the segment (default `TLOG_JITTER_US`).
+  jitterUs?: int
   /// The time now, in microseconds since 1970, for judging whether a timestamp can be real (default: the clock).
   nowUs?: int
 }
@@ -96,9 +103,11 @@ export class TlogReport {
   public crcFailures: int = 0
   /// Frames of messages the dialect does not have, skipped whole (their CRC could not be checked).
   public unknown: int = 0
-  /// Steps of time backwards, and jumps forward of more than the gap: each started a segment.
+  /// Steps of time backwards (by more than the jitter), and jumps forward of more than the gap: each started a segment.
   public backwards: int = 0
   public jumps: int = 0
+  /// Steps back of up to the jitter (records and skipped unknown frames): counted, and no new segment.
+  public jitter: int = 0
   /// The segments, 1 for a recording that never stepped.
   public segments: int = 0
   /// The first and the last time as recorded, in microseconds; both 0 before the first record.
@@ -121,7 +130,12 @@ export class TlogReader {
   public readonly report: TlogReport = new TlogReport()
   readonly magicNumbers: Map<int, int>
   readonly maxGapUs: int
+  readonly jitterUs: int
   readonly nowUs: int
+  /// Records found in the tail by `finish` (a few at most), given by `next` first.
+  readonly rescued: TlogRecord[] = []
+  /// Set by `finish`: a start of a frame that is not whole is looked at, not waited for.
+  ending: bool = false
   buffer: Uint8Array = new Uint8Array(4096)
   start: int = 0
   end: int = 0
@@ -133,6 +147,7 @@ export class TlogReader {
   constructor(options: TlogOptions = {}) {
     this.magicNumbers = options.magicNumbers ?? MSG_ID_MAGIC_NUMBER
     this.maxGapUs = options.maxGapUs ?? TLOG_MAX_GAP_US
+    this.jitterUs = options.jitterUs ?? TLOG_JITTER_US
     this.nowUs = options.nowUs ?? (Date.now() as int) * 1000
   }
 
@@ -170,6 +185,16 @@ export class TlogReader {
 
   /// The next record, or null when what is fed holds no more whole record (feed more, or `finish`).
   public next(): TlogRecord? {
+    if (rescued.length > 0) {
+      const first = rescued[0]
+      rescued.splice(0, 1)
+      return first
+    }
+    scan()
+  }
+
+  /// The next record in what is fed, skipping what is no record.
+  scan(): TlogRecord? {
     while (true) {
       if (end - start < TLOG_TIMESTAMP_LENGTH + 2) {
         return null
@@ -185,6 +210,11 @@ export class TlogReader {
         continue
       }
       if (end - start < TLOG_TIMESTAMP_LENGTH + need) {
+        // At the end of the file this may be a false start with good records behind it: then it costs one byte, as in the middle.
+        if (ending && recordBehind()) {
+          skip(1)
+          continue
+        }
         return null
       }
       const record = take(need)
@@ -236,13 +266,56 @@ export class TlogReader {
     give(time, need, v2, msgid)
   }
 
+  /// Whether a whole record (a frame that is all here, with a CRC that holds or of a message the dialect lacks, at a time where the
+  /// recording is) starts at `p`, a position after `start`. Changes nothing.
+  validAt(p: int): bool {
+    if (end - p < TLOG_TIMESTAMP_LENGTH + 2 || buffer[p] >= 128) {
+      return false
+    }
+    const at = p + TLOG_TIMESTAMP_LENGTH
+    if (buffer[at] != MavLinkProtocolV1.START_BYTE && buffer[at] != MavLinkProtocolV2.START_BYTE) {
+      return false
+    }
+    const need = frameLength(at)
+    if (need < 0 || end - p < TLOG_TIMESTAMP_LENGTH + need) {
+      return false
+    }
+    const v2 = buffer[at] == MavLinkProtocolV2.START_BYTE
+    const msgid = if (v2) readUint(buffer, at + 7, 3) else buffer[at + 5]
+    const magic = magicNumbers.get(msgid)
+    if (magic == null) {
+      return plausible(timeAt(p))
+    }
+    const crcAt = at + need - CHECKSUM_LENGTH - (if (v2 && (buffer[at + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0) SIGNATURE_LENGTH else 0)
+    readUint(buffer, crcAt, 2) == x25crc(buffer, at + 1, crcAt, magic!)
+  }
+
+  /// Whether a whole record starts anywhere after `start` (at the end of the file: the start at `start` was false).
+  recordBehind(): bool {
+    for (let p = start + 1; p < end; p++) {
+      if (validAt(p)) {
+        return true
+      }
+    }
+    false
+  }
+
+  /// Whether a time is where the recording is: after a first record, not more than the jitter before the last, not more than the gap after.
+  plausible(time: int): bool {
+    last >= 0 && time >= 0 && time + jitterUs >= last && time - last <= maxGapUs
+  }
+
   /// A frame of a message that is not in the dialect: skipped whole if its time is where the recording is, else it was noise.
   skipUnknown(time: int, need: int): TlogRecord? {
-    if (last < 0 || time < last || time - last > maxGapUs) {
+    if (!plausible(time)) {
       skip(1)
       return null
     }
-    last = time
+    if (time < last) {
+      report.jitter += 1
+    } else {
+      last = time
+    }
     report.unknown += 1
     report.bytesUnknown += TLOG_TIMESTAMP_LENGTH + need
     start += TLOG_TIMESTAMP_LENGTH + need
@@ -272,6 +345,10 @@ export class TlogReader {
       report.firstUs = time
       report.segments = 1
       report.dated = time >= YEAR_2000_US && time <= nowUs + A_YEAR_US
+    } else if (time < last && last - time <= jitterUs) {
+      // A little back: jitter. `last` stays the latest time, so that steps back do not add up to a segment.
+      report.jitter += 1
+      return
     } else if (time < last) {
       segment += 1
       report.segments += 1
@@ -308,6 +385,15 @@ export class TlogReader {
   public finish(): void {
     if (done) {
       return
+    }
+    // The tail is looked at again, a byte at a time from a false start: only a real, incomplete start of a frame is `cutEnd`.
+    ending = true
+    while (true) {
+      const rest = scan()
+      if (rest == null) {
+        break
+      }
+      rescued.push(rest!)
     }
     done = true
     const left = end - start
