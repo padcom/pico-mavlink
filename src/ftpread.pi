@@ -192,7 +192,7 @@ export class ReadState {
       if (p.data.length > 0 && p.data[0] == FtpNack.EOF) {
         setEnd(p.offset)
       } else {
-        failure = errorOfNack("reading a burst", p)
+        failure = errorOfNack(`reading a burst at ${p.offset}`, p)
       }
     }
     if (p.burstComplete) {
