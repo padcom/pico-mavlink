@@ -35,6 +35,8 @@ export class FtpOpcode {
   public static readonly RENAME: int = 13
   public static readonly CALC_FILE_CRC32: int = 14
   public static readonly BURST_READ_FILE: int = 15
+  /// ArduPilot's own opcode: ListDirectory with the time of each entry (`F<name>\t<size>\t<mtime>`).
+  public static readonly LIST_DIRECTORY_WITH_TIME: int = 16
   public static readonly ACK: int = 128
   public static readonly NACK: int = 129
 }
@@ -57,8 +59,8 @@ export class FtpNack {
 /// Why an FTP operation failed.
 export class FtpError extends Error {
   /// `FTP_TIMEOUT` (no answer after the tries), `FTP_ABORTED` (cancelled), `FTP_PROTOCOL` (a packet that is not one), `FTP_EOF`,
-  /// `FTP_NOT_FOUND`, `FTP_NO_SESSIONS`, `FTP_INVALID_SESSION`, `FTP_PROTECTED`, `FTP_EXISTS`, `FTP_ERRNO` (with the vehicle's
-  /// errno), `FTP_FAILED` (any other Nack).
+  /// `FTP_NOT_FOUND`, `FTP_NO_SESSIONS`, `FTP_INVALID_SESSION`, `FTP_PROTECTED`, `FTP_EXISTS`, `FTP_UNKNOWN_COMMAND`,
+  /// `FTP_ERRNO` (with the vehicle's errno), `FTP_FAILED` (any other Nack).
   public readonly code: string
   /// The errno the vehicle gave with `FTP_ERRNO`, else 0.
   public readonly errno: int
@@ -178,11 +180,165 @@ export function errorOfNack(what: string, p: FtpPacket): FtpError {
   if (err == FtpNack.FILE_EXISTS) {
     return new FtpError("FTP_EXISTS", `${what}: the file exists`)
   }
+  if (err == FtpNack.UNKNOWN_COMMAND) {
+    return new FtpError("FTP_UNKNOWN_COMMAND", `${what}: the vehicle does not know the command`)
+  }
   if (err == FtpNack.FAIL_ERRNO) {
     return new FtpError("FTP_ERRNO", `${what}: failed with errno ${errno}`, errno)
   }
   new FtpError("FTP_FAILED", `${what}: refused (error ${err})`)
 }
+
+/// One entry of a directory listing.
+export class FtpEntry {
+  public readonly name: string
+  /// Whether it is a directory (else a file).
+  public readonly directory: bool
+  /// The size of a file, in bytes; 0 for a directory.
+  public readonly size: int
+  /// When a file was made (seconds since 1970), if the vehicle gives it; null when it does not. It is never made up.
+  public readonly time: int?
+
+  constructor(name: string, directory: bool, size: int, time: int? = null) {
+    this.name = name
+    this.directory = directory
+    this.size = size
+    this.time = time
+  }
+}
+
+/// The entries one reply of ListDirectory carries, and how many entries it stood for (the next request skips that many more than
+/// the ones before): a skip entry (`S`) and "." and ".." count, and are not returned.
+export class FtpListing {
+  public readonly entries: FtpEntry[]
+  public readonly count: int
+
+  constructor(entries: FtpEntry[], count: int) {
+    this.entries = entries
+    this.count = count
+  }
+}
+
+/// The number written in `text` with digits only, or -1 when it is not one (or is empty, or does not fit 32 bits).
+function digitsOf(text: string): int {
+  if (text.length == 0 || text.length > 10) {
+    return -1
+  }
+  let n = 0
+  for (const ch of text.split("")) {
+    const digit = "0123456789".indexOf(ch)
+    if (digit < 0) {
+      return -1
+    }
+    n = n * 10 + digit
+  }
+  if (n > 4294967295) -1 else n
+}
+
+/// Whether `b` is well-formed UTF-8 (no stray or missing continuation bytes, no overlong forms, no surrogates, nothing past U+10FFFF).
+/// A decoder replaces what is not, so that two different names could come out equal: names are checked first.
+function isUtf8(b: Uint8Array): bool {
+  let i = 0
+  while (i < b.length) {
+    const c = b[i] as int
+    let n = 0
+    let least = 0
+    let cp = c
+    if (c >= 0xC2 && c <= 0xDF) {
+      n = 1
+      least = 0x80
+      cp = c & 0x1F
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      n = 2
+      least = 0x800
+      cp = c & 0x0F
+    } else if (c >= 0xF0 && c <= 0xF4) {
+      n = 3
+      least = 0x10000
+      cp = c & 0x07
+    } else if (c >= 0x80) {
+      return false
+    }
+    if (n > 0 && i + n >= b.length) {
+      return false
+    }
+    for (let k = 1; k <= n; k++) {
+      const cc = b[i + k] as int
+      if ((cc & 0xC0) != 0x80) {
+        return false
+      }
+      cp = (cp << 6) | (cc & 0x3F)
+    }
+    if (n > 0 && (cp < least || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))) {
+      return false
+    }
+    i += n + 1
+  }
+  true
+}
+
+/// One entry of a listing, as ListDirectory writes it (`withTime` false) or ArduPilot's ListDirectoryWithTime:
+///   ListDirectory:          `F<name>\t<size>`, `D<name>`, `S` (to be skipped);
+///   ListDirectoryWithTime:  `F<name>\t<size>\t<mtime>`, `D<name>\t0\t<mtime>`, `S` (ArduPilot writes it for a name with a tab in it).
+/// The mtime is seconds since 1970; 0 means the vehicle has no time for it, which is no time (null), not 1970. The directory itself
+/// and its parent (".", "..") give null too. Anything else, including a field too many or too few, is an `FTP_PROTOCOL` error: in a
+/// plain listing a name with a tab in it would read as a size and a time, so a third field there is refused, not believed.
+function entryOf(text: string, withTime: bool): FtpEntry? throws FtpError {
+  const kind = text.slice(0, 1)
+  if (kind == "S") {
+    return null
+  }
+  const fields = text.slice(1, text.length).split("\t")
+  const wanted = if (!withTime) (if (kind == "D") 1 else 2) else 3
+  if (fields[0].length == 0 || (kind != "F" && kind != "D") || fields.length != wanted) {
+    throw new FtpError("FTP_PROTOCOL", `a directory entry that is not one${if (withTime) " (with a time)" else ""}: "${text}"`)
+  }
+  // "." and ".." (a real vehicle lists them) are the directory and its parent, not content: counted, not returned.
+  if (fields[0] == "." || fields[0] == "..") {
+    return null
+  }
+  const size = if (kind == "D" && !withTime) 0 else digitsOf(fields[1])
+  const mtime = if (withTime) digitsOf(fields[2]) else 0
+  if (size < 0 || mtime < 0) {
+    throw new FtpError("FTP_PROTOCOL", `a directory entry with a size or a time that is not a number: "${text}"`)
+  }
+  new FtpEntry(fields[0], kind == "D", if (kind == "D") 0 else size, if (mtime > 0) mtime else null)
+}
+
+/// The entries in the data of a ListDirectory (`withTime` false) or ListDirectoryWithTime reply: each ends with a NUL byte (one
+/// that does not is cut off, and an error), and each name is well-formed UTF-8 (else an error).
+export function parseListing(data: Uint8Array, withTime: bool = false): FtpListing throws FtpError {
+  const entries: FtpEntry[] = []
+  let count = 0
+  let from = 0
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] == 0) {
+      const bytes = data.slice(from, i)
+      if (!isUtf8(bytes)) {
+        throw new FtpError("FTP_PROTOCOL", "a directory entry that is not UTF-8 text")
+      }
+      let text = ""
+      try {
+        text = new TextDecoder().decode(bytes)
+      } catch (e: TypeError) {
+        throw new FtpError("FTP_PROTOCOL", "a directory entry that is not text")
+      }
+      const entry = entryOf(text, withTime)
+      count += 1
+      if (entry != null) {
+        entries.push(entry!)
+      }
+      from = i + 1
+    }
+  }
+  if (from < data.length) {
+    throw new FtpError("FTP_PROTOCOL", `a directory listing that ends in the middle of an entry (${data.length - from} bytes)`)
+  }
+  new FtpListing(entries, count)
+}
+
+/// The most entries `listDirectory` takes from one directory: a vehicle that never ends a listing cannot fill the memory.
+export const FTP_MAX_ENTRIES: int = 10_000
 
 export struct FtpOptions {
   /// How long to wait for one reply (default 1000 ms).
@@ -357,12 +513,98 @@ export class FtpClient {
     r.data
   }
 
+  /// The entries of the directory `path` ("/APM/LOGS", no trailing slash needed), in the order the vehicle gives them, in pages: each
+  /// request skips the entries already read (the offset). An empty directory is an empty list; a path that is not a directory fails
+  /// as the vehicle says (`FTP_NOT_FOUND`, `FTP_ERRNO`). A reply with no entries and no end of listing, a name twice
+  /// (a page that repeats), a name that is not UTF-8, or a listing longer than `FTP_MAX_ENTRIES` is `FTP_PROTOCOL`.
+  ///
+  /// Times: ArduPilot gives them to its own ListDirectoryWithTime (opcode 16) only, never to ListDirectory (3). So that is asked
+  /// first; a vehicle that does not know it (a Nack UNKNOWN_COMMAND) is asked with the plain one, and the client remembers that.
+  /// An entry has a time only when the vehicle gave one (a 0 is no time).
+  ///
+  /// The server keeps a listing open (a slot with the session number 0) for about 20 s: it is ended with a terminate after the
+  /// last page, and also after a failure or a cancel.
+  public async listDirectory(path: string): Promise<FtpEntry[]> throws FtpError {
+    const name = new TextEncoder().encode(path)
+    if (name.length > FTP_MAX_DATA) {
+      throw new FtpError("FTP_PROTOCOL", `the path is ${name.length} bytes: at most ${FTP_MAX_DATA}`)
+    }
+    let entries: FtpEntry[] = []
+    try {
+      entries = await listWithOrWithoutTime(path, name)
+    } catch (e: FtpError) {
+      await endSession(0)
+      throw e
+    }
+    await endSession(0)
+    entries
+  }
+
+  /// 0: it is not known yet whether the vehicle has ListDirectoryWithTime; 1: it has; 2: it has not (the plain one is used).
+  public listMode: int = 0
+
+  async listWithOrWithoutTime(path: string, name: Uint8Array): Promise<FtpEntry[]> throws FtpError {
+    if (listMode != 2) {
+      try {
+        const entries = await listPages(path, name, FtpOpcode.LIST_DIRECTORY_WITH_TIME)
+        listMode = 1
+        return entries
+      } catch (e: FtpError) {
+        if (e.code != "FTP_UNKNOWN_COMMAND") {
+          throw e
+        }
+        listMode = 2
+      }
+    }
+    await listPages(path, name, FtpOpcode.LIST_DIRECTORY)
+  }
+
+  /// All the pages of a listing, asked with `opcode` (ListDirectory or ListDirectoryWithTime).
+  async listPages(path: string, name: Uint8Array, opcode: int): Promise<FtpEntry[]> throws FtpError {
+    const withTime = opcode == FtpOpcode.LIST_DIRECTORY_WITH_TIME
+    const all: FtpEntry[] = []
+    const seen = new Set<string>()
+    let skip = 0
+    while (true) {
+      const r = await call(opcode, 0, skip, name, name.length)
+      if (r.opcode == FtpOpcode.NACK) {
+        const e = errorOfNack(`listing ${path}`, r)
+        if (e.code == "FTP_EOF") {
+          break
+        }
+        throw e
+      }
+      const page = parseListing(r.data, withTime)
+      if (page.count == 0) {
+        throw new FtpError("FTP_PROTOCOL", `listing ${path}: a reply with no entry at ${skip} and no end of listing`)
+      }
+      for (const entry of page.entries) {
+        // Names in a directory are unique: one seen again is a page that repeats.
+        if (seen.has(entry.name)) {
+          throw new FtpError("FTP_PROTOCOL", `listing ${path}: ${entry.name} twice`)
+        }
+        seen.add(entry.name)
+        all.push(entry)
+      }
+      skip += page.count
+      if (skip > FTP_MAX_ENTRIES) {
+        throw new FtpError("FTP_PROTOCOL", `listing ${path}: more than ${FTP_MAX_ENTRIES} entries`)
+      }
+    }
+    all
+  }
+
   /// Ends this client's session on the vehicle. Always call it when done, also after an error or a cancel (it is sent after a
   /// cancel too: once, and it waits at most half a second), and it never throws: a vehicle that does not answer has closed the
   /// session (it kills an idle one itself).
   public async terminate(): Promise<void> {
+    await endSession(session)
+  }
+
+  /// Ends session `id` on the vehicle: once, quietly (it ignores a cancel and waits at most half a second), and never throws.
+  async endSession(id: int): Promise<void> {
     try {
-      await call(FtpOpcode.TERMINATE_SESSION, session, 0, new Uint8Array(0), 0, true)
+      await call(FtpOpcode.TERMINATE_SESSION, id, 0, new Uint8Array(0), 0, true)
     } catch (e: FtpError) {
     }
   }

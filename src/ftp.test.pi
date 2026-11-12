@@ -298,7 +298,7 @@ function nackErrors(): void {
     [FtpNack.FILE_PROTECTED, 0], [FtpNack.FILE_EXISTS, 0], [FtpNack.FAIL_ERRNO, 22], [FtpNack.FAIL, 0], [FtpNack.UNKNOWN_COMMAND, 0],
   ]
   const names = [
-    "FTP_EOF", "FTP_NOT_FOUND", "FTP_NO_SESSIONS", "FTP_INVALID_SESSION", "FTP_PROTECTED", "FTP_EXISTS", "FTP_ERRNO", "FTP_FAILED", "FTP_FAILED",
+    "FTP_EOF", "FTP_NOT_FOUND", "FTP_NO_SESSIONS", "FTP_INVALID_SESSION", "FTP_PROTECTED", "FTP_EXISTS", "FTP_ERRNO", "FTP_FAILED", "FTP_UNKNOWN_COMMAND",
   ]
   for (let i = 0; i < cases.length; i++) {
     p.data = new Uint8Array(2)
