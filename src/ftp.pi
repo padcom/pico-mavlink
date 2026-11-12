@@ -311,8 +311,18 @@ export function parseListing(data: Uint8Array, withTime: bool = false): FtpListi
   const entries: FtpEntry[] = []
   let count = 0
   let from = 0
+  // Empty entries (NUL bytes with nothing before them) AFTER the last real entry are padding: an older server fills the rest of
+  // the packet with zeros. They are not entries and are not counted (the offset of the next page counts entries). An empty one
+  // between entries, or a reply of nothing else, is not padding.
+  let padding = false
   for (let i = 0; i < data.length; i++) {
-    if (data[i] == 0) {
+    if (data[i] == 0 && i == from) {
+      padding = true
+      from = i + 1
+    } else if (data[i] == 0) {
+      if (padding) {
+        throw new FtpError("FTP_PROTOCOL", `an empty directory entry before the entry at byte ${from}`)
+      }
       const bytes = data.slice(from, i)
       if (!isUtf8(bytes)) {
         throw new FtpError("FTP_PROTOCOL", "a directory entry that is not UTF-8 text")

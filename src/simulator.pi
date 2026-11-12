@@ -158,7 +158,7 @@ export class SimulatedAutopilot {
   /// How the FTP server misbehaves, for tests: `ok`; `unsupported` (every open fails with ENOENT, though the capability is set);
   /// `silent` (it never answers an FTP request); `corrupt` (the file has a wrong magic); `incomplete` (the file says the vehicle
   /// has more parameters than it holds); `busy` (every open: no session free); `einval` (every read: EINVAL); `repeat` and `endless` (a burst that sends the first chunk again and again, or chunks at
-  /// ever higher offsets with no end, until the mode is changed); `oldlist` (firmware without ListDirectoryWithTime: UNKNOWN_COMMAND), `failwithtime` (the same, answered with Fail, as Copter-4.7.2 does), `nocrc` (no CalcFileCRC32) and `badcrc` (a wrong CRC), `relist` and `emptylist` (a listing that repeats its first page, or answers with
+  /// ever higher offsets with no end, until the mode is changed); `oldlist` (firmware without ListDirectoryWithTime: UNKNOWN_COMMAND, and a listing padded with zeros to a full packet), `failwithtime` (the same, answered with Fail, as Copter-4.7.2 does), `padlist` (zero padding only), `nocrc` (no CalcFileCRC32) and `badcrc` (a wrong CRC), `relist` and `emptylist` (a listing that repeats its first page, or answers with
   /// nothing and no end).
   public ftpMode: string = "ok"
   /// The share of FTP packets it drops on their way out, in percent (a lossy link), from a seeded sequence.
@@ -650,7 +650,10 @@ export class SimulatedAutopilot {
       n += 1
       i += 1
     }
-    const data = new Uint8Array(bytes.length)
+    // An older server (modes `oldlist`, `failwithtime`, `padlist`) fills the rest of the packet with zeros: the data is the whole
+    // 239 bytes, and the entries are followed by empty ones.
+    const padded = ftpMode == "oldlist" || ftpMode == "failwithtime" || ftpMode == "padlist"
+    const data = new Uint8Array(if (padded) FTP_MAX_DATA else bytes.length)
     for (let k = 0; k < bytes.length; k++) {
       data.set(k, bytes[k])
     }
