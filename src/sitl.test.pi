@@ -65,6 +65,26 @@ async function findBinary(): Promise<string?> throws Error {
   null
 }
 
+/// The default parameter files of the quad (`--defaults a,b`), if the build ships them. Builds such as Copter-4.7.2 carry no
+/// defaults inside: without `copter.parm` the vehicle refuses to arm ("Motors: Check frame class and type"). They are looked for in
+/// `default_params` beside the executable (where drone-configurator's .github/sitl-build.sh puts them), else in the directory
+/// `SITL_DEFAULTS` names (for an executable reached through a link, which has nothing beside it).
+async function defaultsFor(binary: string): Promise<string[]> throws Error {
+  const dirs: string[] = []
+  const given = env.get("SITL_DEFAULTS")
+  if (given != null && given! != "") {
+    dirs.push(given!)
+  }
+  const slash = binary.lastIndexOf("/")
+  dirs.push(`${if (slash >= 0) binary.slice(0, slash) else "."}/default_params`)
+  for (const dir of dirs) {
+    if (await exists(`${dir}/copter.parm`)) {
+      return [`${dir}/copter.parm`]
+    }
+  }
+  []
+}
+
 /// Starts SITL and waits for its first heartbeat; null, with a line printed, when there is no SITL binary to start.
 async function startSitl(speedup: int = 1): Promise<Sitl?> throws Error {
   const binary = await findBinary()
@@ -76,6 +96,11 @@ async function startSitl(speedup: int = 1): Promise<Sitl?> throws Error {
   const dir = `/tmp/pico-mavlink-sitl-${Date.now()}-${instance}`
   await mkdir(dir, true)
   const args = ["-w", "--model", "quad", "--speedup", `${speedup}`, "-I", `${instance}`, "--sim-address=127.0.0.1"]
+  const defaults = await defaultsFor(binary!)
+  if (defaults.length > 0) {
+    args.push("--defaults")
+    args.push(defaults.join(","))
+  }
   const child = new Command(binary!, args, dir, null, false, "null", "null", "null").spawn()
   const link: MavLinkConnection[] = []
   try {
@@ -408,6 +433,13 @@ const FLIGHT_BUDGET_MS: int = 420_000
 ///   - after the disarm the file is still appended to: about 1 MB in the next 15 to 20 s, then tens of bytes at a time for 40 s and
 ///     more. So the listing's size is not final; the vehicle's CRC at the end of a download is the check, and a download that
 ///     differs because the file grew goes on from what it has (the CRC carried on) until the CRCs agree;
+///     (The same on Copter-4.7.2, the CI build: 5193728 bytes at the disarm, 6221824 15 s later, 6222609 at 20 s, a few tens of
+///     bytes more after that. It answers ListDirectory with every entry followed by a second NUL byte, see
+///     `readsTheBytesCopter472Sends` in ftplist.test.pi. Its listing has NO time for a file (the page says "No date"), and it answers
+///     ListDirectoryWithTime with "Unsupported FTP: 16" in a STATUSTEXT: the old firmware rejecting opcode 16, so the client's
+///     fallback to the plain listing is working as designed. It carries no defaults inside: started without `--defaults
+///     <dir>/default_params/copter.parm` it refuses the take-off with "Motors: Check frame class and type"; `startSitl` here
+///     passes them when they are beside the executable or in the directory `SITL_DEFAULTS` names.)
 ///   - CalcFileCRC32 works on a log, also while it is written;
 ///   - at `--speedup 5` a burst download fails with FILE_NOT_FOUND after ~11 bursts (the vehicle's session timeouts run on its sped
 ///     up clock): a download test needs speedup 1.
@@ -487,6 +519,21 @@ async function writesALogWhereFtpCanSeeIt(): Promise<void> throws Error {
     // does not ask for a size: it is chased. A download whose CRC differs from the vehicle's, while the file has grown, goes on from
     // what it has (the CRC is carried on) until the vehicle's CRC is ours.
     const sink = new CollectSink()
+    // Cancelled part way (after about a megabyte), as the interface's Cancel does; the chase below then goes on from what the sink
+    // holds, as the next download does.
+    const stop = new AbortController()
+    const first = new FtpClient(s.conn, s.target, { timeoutMs: 1000, retries: 3, signal: stop.signal })
+    try {
+      await downloadFile(first, `/logs/${found}`, sink, 0, 0, -1, (bytes: int, _e: int) => {
+        if (bytes > 1_000_000) {
+          stop.abort()
+        }
+      })
+      println("SPIKE the first download was through before it could be cancelled")
+    } catch (e: FtpError) {
+      println(`SPIKE cancelled: ${e.code}, the sink holds ${sink.total} bytes (${sink.total % 239} past a multiple of 239)`)
+      expect(e.code).toBe("FTP_ABORTED")
+    }
     let got: FileDownload? = null
     for (let attempt = 0; attempt < 4 && got == null && (Date.now() as int) < deadline; attempt++) {
       try {

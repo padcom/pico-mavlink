@@ -640,19 +640,23 @@ export class SimulatedAutopilot {
     let i = from
     while (i < entries!.length && (ftpListPage == 0 || n < ftpListPage)) {
       const enc = new TextEncoder().encode(entries![i])
-      if (bytes.length + enc.length + 1 > FTP_MAX_DATA) {
+      if (bytes.length + enc.length + 2 > FTP_MAX_DATA) {
         break
       }
       for (let k = 0; k < enc.length; k++) {
         bytes.push(enc[k] as int)
       }
       bytes.push(0)
+      // Copter-4.7.2 (modes `oldlist`, `failwithtime`) ends every entry with a second NUL byte, as captured from it.
+      if (ftpMode == "oldlist" || ftpMode == "failwithtime") {
+        bytes.push(0)
+      }
       n += 1
       i += 1
     }
-    // An older server (modes `oldlist`, `failwithtime`, `padlist`) fills the rest of the packet with zeros: the data is the whole
-    // 239 bytes, and the entries are followed by empty ones.
-    const padded = ftpMode == "oldlist" || ftpMode == "failwithtime" || ftpMode == "padlist"
+    // An older server (mode `padlist`) fills the rest of the packet with zeros: the data is the whole 239 bytes, and the entries
+    // are followed by empty ones.
+    const padded = ftpMode == "padlist"
     const data = new Uint8Array(if (padded) FTP_MAX_DATA else bytes.length)
     for (let k = 0; k < bytes.length; k++) {
       data.set(k, bytes[k])

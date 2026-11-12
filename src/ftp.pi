@@ -305,24 +305,41 @@ function entryOf(text: string, withTime: bool): FtpEntry? throws FtpError {
   new FtpEntry(fields[0], kind == "D", if (kind == "D") 0 else size, if (mtime > 0) mtime else null)
 }
 
+/// The first `max` bytes of `b` in hex, two digits each, separated by spaces ("46 61 00 ..."), with how many there are in all.
+export function hexOf(b: Uint8Array, max: int = 64): string {
+  const digits = "0123456789abcdef"
+  const shown = if (b.length < max) b.length else max
+  let out = ""
+  for (let i = 0; i < shown; i++) {
+    const v = b[i] as int
+    out += `${if (i > 0) " " else ""}${digits.slice(v >> 4, (v >> 4) + 1)}${digits.slice(v & 15, (v & 15) + 1)}`
+  }
+  `${b.length} bytes: ${out}${if (b.length > shown) " ..." else ""}`
+}
+
 /// The entries in the data of a ListDirectory (`withTime` false) or ListDirectoryWithTime reply: each ends with a NUL byte (one
-/// that does not is cut off, and an error), and each name is well-formed UTF-8 (else an error).
+/// that does not is cut off, and an error), and each name is well-formed UTF-8 (else an error). A page that cannot be read is an
+/// `FTP_PROTOCOL` error that carries the bytes of the page (the first 64, in hex), so that a log of it says how the server frames
+/// its entries.
 export function parseListing(data: Uint8Array, withTime: bool = false): FtpListing throws FtpError {
+  try {
+    return parseEntries(data, withTime)
+  } catch (e: FtpError) {
+    throw new FtpError(e.code, `${e.message} [the page, ${hexOf(data)}]`, e.errno)
+  }
+}
+
+function parseEntries(data: Uint8Array, withTime: bool): FtpListing throws FtpError {
   const entries: FtpEntry[] = []
   let count = 0
   let from = 0
-  // Empty entries (NUL bytes with nothing before them) AFTER the last real entry are padding: an older server fills the rest of
-  // the packet with zeros. They are not entries and are not counted (the offset of the next page counts entries). An empty one
-  // between entries, or a reply of nothing else, is not padding.
-  let padding = false
+  // Empty entries (a NUL byte with nothing before it) are not entries and are not counted (the offset of the next page counts
+  // entries): Copter-4.7.2 ends every entry with two NUL bytes ("D.\0\0D..\0\0"), and an older server fills the rest of the packet
+  // with zeros. A name cannot be empty, so there is nothing else an empty entry could be.
   for (let i = 0; i < data.length; i++) {
     if (data[i] == 0 && i == from) {
-      padding = true
       from = i + 1
     } else if (data[i] == 0) {
-      if (padding) {
-        throw new FtpError("FTP_PROTOCOL", `an empty directory entry before the entry at byte ${from}`)
-      }
       const bytes = data.slice(from, i)
       if (!isUtf8(bytes)) {
         throw new FtpError("FTP_PROTOCOL", "a directory entry that is not UTF-8 text")
@@ -625,7 +642,7 @@ export class FtpClient {
       }
       const page = parseListing(r.data, withTime)
       if (page.count == 0) {
-        throw new FtpError("FTP_PROTOCOL", `listing ${path}: a reply with no entry at ${skip} and no end of listing`)
+        throw new FtpError("FTP_PROTOCOL", `listing ${path}: a reply with no entry at ${skip} and no end of listing [the page, ${hexOf(r.data)}]`)
       }
       for (const entry of page.entries) {
         // Names in a directory are unique: one seen again is a page that repeats.
