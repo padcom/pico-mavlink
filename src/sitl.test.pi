@@ -3,11 +3,12 @@
 // Linux, and only where a SITL binary is there: `SITL_BINARY` (the path of the `arducopter` executable, built from ArduPilot's
 // source; drone-configurator's .github/sitl-build.sh builds one) or `arducopter` on the PATH. Without one the tests are skipped,
 // with a line saying so.
-// SITL is started in a directory of its own with a wiped EEPROM, as instance 3 (TCP 5790, so as not to meet a SITL on 5760), and
-// stopped when the test ends.
+// SITL is started in a directory of its own with a wiped EEPROM, as the first instance from 3 up whose TCP ports are free (5790
+// and the three above it for the first, so as not to meet a SITL on 5760 or another run), and stopped, its link closed and its
+// directory removed when the test ends or anything fails after it was started.
 import { describe, it, expect } from "std/test"
 import { delay } from "std/timers"
-import { connect } from "std/net"
+import { connect, listen } from "std/net"
 import { env, Child, Command } from "std/process"
 import { exists, mkdir, remove } from "std/fs"
 import { MavLinkConnection } from "./connection"
@@ -16,9 +17,6 @@ import { AutopilotVersionRead, ParamList, ParamRead, ParamWrite, Target, Vehicle
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
 import { MavParamType } from "./dialects/common"
-
-const INSTANCE = 3
-const PORT = 5760 + 10 * INSTANCE
 
 /// A running SITL and the connection to it.
 class Sitl {
@@ -69,23 +67,64 @@ async function startSitl(): Promise<Sitl?> throws Error {
     println("SITL tests skipped: no SITL_BINARY, and no arducopter on the PATH")
     return null
   }
-  const dir = `/tmp/pico-mavlink-sitl-${Date.now()}`
+  const instance = await freeInstance()
+  const dir = `/tmp/pico-mavlink-sitl-${Date.now()}-${instance}`
   await mkdir(dir, true)
-  const args = ["-w", "--model", "quad", "--speedup", "1", "-I", `${INSTANCE}`, "--sim-address=127.0.0.1"]
+  const args = ["-w", "--model", "quad", "--speedup", "1", "-I", `${instance}`, "--sim-address=127.0.0.1"]
   const child = new Command(binary!, args, dir, null, false, "null", "null", "null").spawn()
+  const link: MavLinkConnection[] = []
+  try {
+    return await connectTo(child, dir, 5760 + 10 * instance, link)
+  } catch (e: Error) {
+    // Whatever went wrong after SITL was started: it is stopped, its link closed and its directory removed.
+    child.kill("SIGKILL")
+    for (const c of link) {
+      c.close()
+    }
+    try {
+      await remove(dir, true)
+    } catch (removing: Error) {
+    }
+    throw e
+  }
+}
+
+/// The instance number (`-I`) of a SITL whose four TCP ports (5760 + 10 n, and the three above) nothing is listening on: the first
+/// from 3 up that is free, so two runs side by side, or a SITL on 5760, do not meet.
+async function freeInstance(): Promise<int> throws Error {
+  for (let n = 3; n < 40; n++) {
+    let free = true
+    for (let k = 0; k < 4 && free; k++) {
+      try {
+        const l = await listen(5760 + 10 * n + k)
+        l.close()
+      } catch (e: Error) {
+        free = false
+      }
+    }
+    if (free) {
+      return n
+    }
+  }
+  throw new Error("no free port for SITL between 5790 and 6150")
+}
+
+/// Connects to the SITL started, waits for its heartbeat and its capabilities. The connection it makes is put in `link` as soon as
+/// it exists, so that the caller can close it when this fails.
+async function connectTo(child: Child, dir: string, port: int, link: MavLinkConnection[]): Promise<Sitl> throws Error {
   let stream: TcpStream? = null
   for (let i = 0; i < 120 && stream == null; i++) {
     try {
-      stream = new TcpStream(await connect(PORT))
+      stream = new TcpStream(await connect(port))
     } catch (e: Error) {
       await delay(500)
     }
   }
   if (stream == null) {
-    child.kill("SIGKILL")
-    throw new Error(`SITL did not listen on ${PORT} within 60 s`)
+    throw new Error(`SITL did not listen on ${port} within 60 s`)
   }
   const conn = new MavLinkConnection(stream!)
+  link.push(conn)
   conn.run()
   const discovery = new VehicleDiscovery(conn)
   let target: Target? = null
@@ -98,12 +137,10 @@ async function startSitl(): Promise<Sitl?> throws Error {
     await delay(250)
   }
   if (target == null) {
-    child.kill("SIGKILL")
     throw new Error("SITL sent no heartbeat within 60 s")
   }
   const version = await new AutopilotVersionRead(conn, target!, { timeoutMs: 1000, retries: 3 }).run()
   if (version == null) {
-    child.kill("SIGKILL")
     throw new Error("SITL did not answer AUTOPILOT_VERSION")
   }
   new Sitl(child, dir, conn, target!, encodingOf(version!.capabilities) ?? ParamEncoding.CCast, version!.capabilities)
