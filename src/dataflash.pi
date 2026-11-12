@@ -14,7 +14,7 @@
 //
 // Field characters: b B (i8, u8), h H (i16, u16), i I (i32, u32), q Q (i64, u64), f d (f32, f64), n N Z (text of 4, 16, 64
 // bytes), c C (i16, u16 times 0.01), e E (i32, u32 times 0.01), L (i32 times 1e-7: latitude, longitude), M (u8: the flight mode),
-// a (int16[32]: skipped). A 64-bit value is held as an f64: exact up to 2^53, which holds microseconds for 285 years.
+// a (int16[32]: in `DfMessage.lists`, by `list(name)`; the batch samples of ISBD are such arrays). A 64-bit value is held as an f64: exact up to 2^53, which holds microseconds for 285 years.
 import { readChars, readF32, readF64, readI16, readI32, readI64, readI8, readU16, readU32, readU64, readU8, writeF32, writeF64, writeUint } from "./bytes"
 import { ByteStream } from "./stream"
 
@@ -118,6 +118,8 @@ export class DfFormat {
   /// The index of the first field called TimeUS (a Q) or TimeMS (an I), and which of them it is; -1 when there is none.
   public readonly timeField: int
   public readonly timeIsMs: bool
+  /// Whether a field is an array (`a`): only then do messages of this format carry `lists`.
+  public readonly hasArrays: bool
 
   constructor(type: int, length: int, name: string, format: string, labels: string, fields: DfField[]) {
     this.type = type
@@ -138,6 +140,11 @@ export class DfFormat {
     }
     this.timeField = at
     this.timeIsMs = ms
+    let arrays = false
+    for (const f of fields) {
+      arrays = arrays || f.kind == 0x61
+    }
+    this.hasArrays = arrays
   }
 
   /// The index of the field called `name`, or -1.
@@ -159,18 +166,29 @@ export class DfMessage {
   public readonly offset: int
   public readonly nums: f64[]
   public readonly texts: string[]
+  /// The arrays of the fields that are one (the `a` character: 32 int16): for each field, its values, and none for a field that is
+  /// not an array. Empty altogether for a format that has no array field (nothing is allocated for those).
+  public readonly lists: f64[][]
 
-  constructor(format: DfFormat, offset: int, nums: f64[], texts: string[]) {
+  constructor(format: DfFormat, offset: int, nums: f64[], texts: string[], lists: f64[][] = []) {
     this.format = format
     this.offset = offset
     this.nums = nums
     this.texts = texts
+    this.lists = lists
   }
 
-  /// The number of the field called `name`, or null when there is no such field.
+  /// The values of the array field called `name` (32 of them), or null when there is no such field or it is not an array.
+  public list(name: string): f64[]? {
+    const i = format.indexOf(name)
+    if (i < 0 || i >= lists.length || lists[i].length == 0) null else lists[i]
+  }
+
+  /// The number of the field called `name`, or null when there is no such field or it is an array (`a`: a batch of samples has no
+  /// single value; use `list`).
   public num(name: string): f64? {
     const i = format.indexOf(name)
-    if (i < 0) null else nums[i]
+    if (i < 0 || format.fields[i].kind == 0x61) null else nums[i]
   }
 
   /// The text of the field called `name`, or null when there is no such field.
@@ -335,6 +353,7 @@ function numberAt(b: Uint8Array, p: int, k: int): f64 {
 function decodeFields(f: DfFormat, b: Uint8Array, at: int): DfMessage {
   const nums: f64[] = []
   const texts: string[] = []
+  const lists: f64[][] = []
   for (const field of f.fields) {
     const p = at + field.offset
     const k = field.kind
@@ -347,8 +366,20 @@ function decodeFields(f: DfFormat, b: Uint8Array, at: int): DfMessage {
     }
     nums.push(v)
     texts.push(s)
+    if (f.hasArrays) {
+      lists.push(if (k == 0x61) arrayAt(b, p) else [])
+    }
   }
-  new DfMessage(f, 0, nums, texts)
+  new DfMessage(f, 0, nums, texts, lists)
+}
+
+/// The 32 int16 of an `a` field at `p`.
+function arrayAt(b: Uint8Array, p: int): f64[] {
+  const out: f64[] = []
+  for (let i = 0; i < 32; i++) {
+    out.push(readI16(b, p + 2 * i) as f64)
+  }
+  out
 }
 
 /// Reads messages from chunks of a log, fed with `push`, and gives them with `next`. Holds only what has not been given yet (a
@@ -458,7 +489,7 @@ export class DfDecoder {
       return fmtMessage(f, payload, at)
     }
     const m = decodeFields(f, payload, 0)
-    const msg = new DfMessage(f, base + at, m.nums, m.texts)
+    const msg = new DfMessage(f, base + at, m.nums, m.texts, m.lists)
     note(msg)
     msg
   }
@@ -468,7 +499,7 @@ export class DfDecoder {
     if (isFmtOfFmt(payload)) {
       // Every log begins with the FMT of FMT, as the reader already knows it.
       const m = decodeFields(f, payload, 0)
-      return new DfMessage(f, base + at, m.nums, m.texts)
+      return new DfMessage(f, base + at, m.nums, m.texts, m.lists)
     }
     const why: string[] = []
     const defined = formatFromFmt(payload, why)
@@ -500,7 +531,7 @@ export class DfDecoder {
       }
     }
     const m = decodeFields(f, payload, 0)
-    new DfMessage(f, base + at, m.nums, m.texts)
+    new DfMessage(f, base + at, m.nums, m.texts, m.lists)
   }
 
   /// The byte-sized id a field holds (a character: -128 to 255), or null when it is not a number or not one of those; the
@@ -692,8 +723,9 @@ export class DfEncoder {
   }
 
   /// Writes a message of a defined type: `nums` and `texts` have a value for each field (the unused one 0 or ""). A number is
-  /// the value, not the raw count: it is divided by the field character's scale. Returns false for a type that is not defined.
-  public add(type: int, nums: f64[], texts: string[]): bool {
+  /// the value, not the raw count: it is divided by the field character's scale. An array field (`a`) takes its 32 int16 from
+  /// `lists[i]` (fewer are padded with zeros, more are cut). Returns false for a type that is not defined.
+  public add(type: int, nums: f64[], texts: string[], lists: f64[][] = []): bool {
     const f = formats[type]
     if (f == null) {
       return false
@@ -710,7 +742,9 @@ export class DfEncoder {
         writeF64(payload, field.offset, v)
       } else if (isTextKind(k)) {
         putText(payload, field.offset, field.size, if (i < texts.length) texts[i] else "")
-      } else if (k != 0x61) {
+      } else if (k == 0x61) {
+        putArray(payload, field.offset, if (i < lists.length) lists[i] else [])
+      } else {
         writeUint(payload, field.offset, field.size, roundOf(raw))
       }
     }
@@ -751,6 +785,13 @@ export class DfEncoder {
 /// The nearest integer to `v` (halves away from zero).
 function roundOf(v: f64): int {
   (if (v < 0.0) v - 0.5 else v + 0.5) as int
+}
+
+/// Writes 32 int16 at `at`: the values (rounded), the missing ones as zeros.
+function putArray(b: Uint8Array, at: int, values: f64[]): void {
+  for (let i = 0; i < 32; i++) {
+    writeUint(b, at + 2 * i, 2, if (i < values.length) roundOf(values[i]) else 0)
+  }
 }
 
 /// Writes `text` into `n` bytes at `at`, cut at `n` and padded with zeros.

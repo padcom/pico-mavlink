@@ -220,6 +220,55 @@ function readsTheDefinitionsArduPilotWrites(): void {
   expect(m[5].timeUs()).toBe(8000000)
 }
 
+/// The raw IMU batch of ArduPilot (AP_InertialSensor_Backend, "ISBH" and "ISBD"): a header for a batch, and data messages that carry
+/// 32 int16 for each axis. The spectrum reads them.
+function readsTheArraysOfABatchOfSamples(): void {
+  const e = new DfEncoder()
+  expect(e.define(150, "ISBH", "QHBBHHQf", "TimeUS,N,type,instance,mul,smp_cnt,SampleUS,smp_rate")).toBe(true)
+  expect(e.define(151, "ISBD", "QHHaaa", "TimeUS,N,seqno,x,y,z")).toBe(true)
+  expect(e.formats[151]!.length).toBe(3 + 8 + 2 + 2 + 3 * 64)
+  expect(e.formats[150]!.length).toBe(31)
+  expect(e.formats[151]!.hasArrays).toBe(true)
+  expect(e.formats[150]!.hasArrays).toBe(false)
+  e.add(150, [1000.0, 1.0, 0.0, 0.0, 1.0, 64.0, 1000.0, 1000.0], ["", "", "", "", "", "", "", ""])
+  const x: f64[] = []
+  const y: f64[] = []
+  const z: f64[] = []
+  for (let i = 0; i < 32; i++) {
+    x.push((i * 100 - 1600) as f64)
+    y.push(-(i as f64))
+    z.push(32767.0 - i as f64)
+  }
+  e.add(151, [2000.0, 1.0, 0.0, 0.0, 0.0, 0.0], ["", "", "", "", "", ""], [[], [], [], x, y, z])
+  // A short array is padded with zeros.
+  e.add(151, [3000.0, 1.0, 1.0, 0.0, 0.0, 0.0], ["", "", "", "", "", ""], [[], [], [], [5.0, -6.0], [], []])
+  for (const chunk of [1, 17, 1000]) {
+    const m = readAll(e.bytes(), chunk)
+    expect(m.length).toBe(5)
+    const batch = m[3]
+    expect(batch.format.name).toBe("ISBD")
+    expect(batch.list("x")!.length).toBe(32)
+    expect(batch.list("x")![0]).toBe(-1600.0)
+    expect(batch.list("x")![31]).toBe(1500.0)
+    expect(batch.list("y")![31]).toBe(-31.0)
+    expect(batch.list("z")![0]).toBe(32767.0)
+    expect(batch.num("seqno")).toBe(0.0)
+    expect(batch.timeUs()).toBe(2000)
+    const next = m[4]
+    expect(next.list("x")![0]).toBe(5.0)
+    expect(next.list("x")![1]).toBe(-6.0)
+    expect(next.list("x")![2]).toBe(0.0)
+    // Not an array, or not a field: none. The header has no arrays at all.
+    expect(batch.list("seqno") == null).toBe(true)
+    // An array has no single value: num() is not found for it (a chart of it would be made-up zeros).
+    expect(batch.num("x") == null).toBe(true)
+    expect(batch.num("seqno")).toBe(0.0)
+    expect(batch.list("nothing") == null).toBe(true)
+    expect(m[2].list("N") == null).toBe(true)
+    expect(m[2].lists.length).toBe(0)
+  }
+}
+
 function skipsGarbageAndGoesOnWithWhatItCanRead(): void {
   const e = allFieldsEncoder()
   sample(e, 1000.0)
@@ -564,6 +613,7 @@ describe("the DataFlash reader", () => {
   it("knows the time of a message: TimeUS, or TimeMS in microseconds, or none", knowsTheTimeOfAMessage)
   it("takes note of units and multipliers (FMTU, UNIT, MULT)", takesNoteOfUnitsAndMultipliers)
   it("reads the definitions ArduPilot writes (captured from a real log)", readsTheDefinitionsArduPilotWrites)
+  it("reads the arrays of a batch of samples (ISBH and ISBD: int16[32] for each axis)", readsTheArraysOfABatchOfSamples)
   it("skips garbage and unknown types, and goes on with what it can read", skipsGarbageAndGoesOnWithWhatItCanRead)
   it("refuses formats that do not add up, and a redefined FMT", refusesFormatsThatDoNotAddUp)
   it("does not stop on a time that is not an int (2^63 and over)", doesNotStopOnATimeThatIsNotAnInt)
