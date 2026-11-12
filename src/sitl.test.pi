@@ -22,7 +22,7 @@ import { FtpClient, FtpEntry, FtpError, hexOf } from "./ftp"
 import { Crc32, crc32Of } from "./crc32"
 import { FileDownload, FileSink, downloadFile } from "./logdownload"
 import { DfDecoder } from "./dataflash"
-import { TlogReader, TlogWriter } from "./tlog"
+import { TLOG_TIMESTAMP_LENGTH, TlogReader, TlogWriter } from "./tlog"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
 
 /// A running SITL and the connection to it.
@@ -690,6 +690,31 @@ async function recordsTheLinkAndReadsItBack(): Promise<void> throws Error {
   }
 }
 
+/// With `TLOG_KEEP` set to a path, writes the recording there, cut after the last whole record that ends within 140000 bytes: how
+/// `src/fixtures/mavproxy.tlog` (the recording `readsAMavproxyRecordingFromAFile` reads with no SITL and no MAVProxy) was made.
+async function keepIfAsked(path: string): Promise<void> throws Error {
+  const to = env.get("TLOG_KEEP")
+  if (to == null || to! == "") {
+    return
+  }
+  const bytes = await readBytes(path)
+  const reader = new TlogReader()
+  let kept = 0
+  reader.push(bytes)
+  while (true) {
+    const r = reader.next()
+    if (r == null) {
+      break
+    }
+    if (kept + TLOG_TIMESTAMP_LENGTH + r!.frame.length > 140000) {
+      break
+    }
+    kept += TLOG_TIMESTAMP_LENGTH + r!.frame.length
+  }
+  await writeBytes(to!, bytes.slice(0, kept))
+  println(`kept ${kept} of ${bytes.length} bytes in ${to!}`)
+}
+
 /// A recording that another program wrote: MAVProxy (`MAVPROXY`, the path of its `mavproxy.py`, in a Python environment of its own) is
 /// connected to SITL's second serial port, writes `mav.tlog` as it always does, and is killed (so the file may end in the middle of a
 /// record, which is `cutEnd`, not damage). Our reader reads it as it is: the report is printed and what must hold for a recording a
@@ -718,6 +743,7 @@ async function readsARecordingAnotherProgramWrote(): Promise<void> throws Error 
     expect(reader.report.bytesSkipped).toBe(0)
     expect(reader.report.dated).toBe(true)
     expect((reader.report.byId.get(30) ?? 0) > 10).toBe(true)
+    await keepIfAsked(`${s.dir}/mav.tlog`)
   } finally {
     if (proxy != null) {
       proxy!.kill("SIGKILL")
