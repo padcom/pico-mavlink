@@ -464,8 +464,9 @@ export class FtpClient {
     throw new FtpError("FTP_TIMEOUT", `no answer to FTP ${opcode} from ${target.system}/${target.component} after ${tries + 1} tries`)
   }
 
-  /// Closes every session this client (system, component and link) has on the vehicle. The vehicle always acks it: done first,
-  /// so that a session a crashed earlier run left open cannot make `open` fail with `FTP_NO_SESSIONS`.
+  /// Closes every session this system and component have on the vehicle over this link: not only this client's, but those of any
+  /// other `FtpClient` of the same connection too (the vehicle keys sessions by system, component and channel). The vehicle always
+  /// acks it: done first, so that a session a crashed earlier run left open cannot make `open` fail with `FTP_NO_SESSIONS`.
   public async reset(): Promise<void> throws FtpError {
     const r = await call(FtpOpcode.RESET_SESSIONS, 0, 0, new Uint8Array(0), 0)
     if (r.opcode == FtpOpcode.NACK) {
@@ -525,8 +526,10 @@ export class FtpClient {
   /// Nack UNKNOWN_COMMAND, and also a Nack FAIL: the firmware that CI builds (Copter-4.7.2) answers the opcode it has no code
   /// for with Fail. An entry has a time only when the vehicle gave one (a 0 is no time).
   ///
-  /// A listing begins with a ResetSessions (every session this client has on the vehicle is closed: a parameter download or an
-  /// earlier listing may have left one), and a plain listing that is answered with Fail is asked once more after another reset.
+  /// A listing begins with a ResetSessions. That closes EVERY session this system and component have on the vehicle over this
+  /// link, those of other `FtpClient`s and of a file that is being read included (a parameter download or an earlier listing may
+  /// have left one that the vehicle objects to): a caller must not list while another operation of its own is under way on the
+  /// same link. A plain listing that is answered with Fail is asked once more after another reset.
   /// An error names the opcode that was used.
   ///
   /// The server keeps a listing open (a slot with the session number 0) for a while: it is ended with a terminate after the last
