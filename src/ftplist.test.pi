@@ -183,7 +183,9 @@ async function listsALogDirectory(): Promise<void> throws Error {
   // The vehicle gave no time, so there is none: it is not made up.
   expect(entries[0].time == null).toBe(true)
   // ListDirectoryWithTime (16) is asked first; the listing is ended with a terminate of session 0.
-  expect(r.sim.ftpLog[0].startsWith("16 s0 o0")).toBe(true)
+  // A listing begins with a reset of the sessions; then ListDirectoryWithTime (16) is asked.
+  expect(r.sim.ftpLog[0].startsWith("2 ")).toBe(true)
+  expect(r.sim.ftpLog[1].startsWith("16 s0 o0")).toBe(true)
   expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
 }
 
@@ -223,6 +225,63 @@ async function fallsBackToThePlainListingAndRemembersIt(): Promise<void> throws 
   // 16 once (refused), then only the plain one: a page and the end of the listing, for each of the two listings.
   const opcodes = r.sim.ftpLog.filter((line) => line.startsWith("16 ") || line.startsWith("3 ")).map((line) => line.split(" ")[0])
   expect(opcodes.join(",")).toBe("16,3,3,3,3")
+}
+
+async function fallsBackToThePlainListingWhenTheTimeOpcodeIsAnsweredWithFail(): Promise<void> throws Error {
+  const r = withLogs()
+  // Copter-4.7.2 answers an opcode it has no code for with Fail, not UNKNOWN_COMMAND.
+  r.sim.ftpMode = "failwithtime"
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const entries = await client.listDirectory("/APM/LOGS")
+  const again = await client.listDirectory("/APM/LOGS")
+  r.gcs.close()
+  expect(entries.map((e) => e.name).join(",")).toBe("00000001.BIN,00000002.BIN,LASTLOG.TXT")
+  expect(again.length).toBe(3)
+  expect(client.listMode).toBe(2)
+  // 16 once (Fail), then only the plain one.
+  const opcodes = r.sim.ftpLog.filter((line) => line.startsWith("16 ") || line.startsWith("3 ")).map((line) => line.split(" ")[0])
+  expect(opcodes.join(",")).toBe("16,3,3,3,3")
+}
+
+async function asksAPlainListingAgainOnFailAfterAReset(): Promise<void> throws Error {
+  const r = withLogs()
+  r.sim.ftpMode = "oldlist"
+  r.sim.ftpFailLists = 1
+  const entries = await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/LOGS")
+  r.gcs.close()
+  expect(entries.length).toBe(3)
+  // The reset before the listing, the listing refused, the reset again, the listing.
+  const resets = r.sim.ftpLog.filter((line) => line.startsWith("2 ")).length
+  expect(resets >= 3).toBe(true)
+}
+
+async function failsWhenThePlainListingStaysRefusedAndNamesTheOpcode(): Promise<void> throws Error {
+  const r = withLogs()
+  r.sim.ftpMode = "oldlist"
+  r.sim.ftpFailLists = 10
+  try {
+    await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/LOGS")
+    expect("listed").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_FAILED")
+    expect(e.message.includes("with ListDirectory:")).toBe(true)
+  }
+  r.gcs.close()
+  // Asked twice (the second after the reset), not again and again; and the session is ended.
+  expect(r.sim.ftpLog.filter((line) => line.startsWith("3 ")).length).toBe(2)
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
+}
+
+async function namesTheTimeOpcodeInAnError(): Promise<void> throws Error {
+  const r = withLogs()
+  try {
+    await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/NOPE")
+    expect("listed").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ERRNO")
+    expect(e.message.includes("with ListDirectoryWithTime")).toBe(true)
+  }
+  r.gcs.close()
 }
 
 async function skipsANameWithATabInAListingWithTime(): Promise<void> throws Error {
@@ -409,6 +468,10 @@ describe("the directory listing of the FTP client", () => {
   it("lists directories and files, the root, and a path with a slash at its end", listsDirectoriesAndFilesAndTheRoot)
   it("gives the time of a file when the vehicle does", givesTheTimeWhenTheVehicleDoes)
   it("falls back to the plain listing for firmware without ListDirectoryWithTime, and remembers it", fallsBackToThePlainListingAndRemembersIt)
+  it("falls back to the plain listing when the time opcode is answered with Fail (Copter-4.7.2), and remembers it", fallsBackToThePlainListingWhenTheTimeOpcodeIsAnsweredWithFail)
+  it("asks a plain listing again once when it is answered with Fail, after a reset of the sessions", asksAPlainListingAgainOnFailAfterAReset)
+  it("fails, naming the opcode, when the plain listing stays refused", failsWhenThePlainListingStaysRefusedAndNamesTheOpcode)
+  it("names the opcode used in an error", namesTheTimeOpcodeInAnError)
   it("leaves out a name with a tab in a listing with time (the vehicle writes S)", skipsANameWithATabInAListingWithTime)
   it("refuses a name with a tab in a plain listing instead of reading it as a size and a time", refusesANameWithATabInAPlainListing)
   it("ends the listing with a terminate also after a failure", endsTheListingAlsoAfterAFailure)

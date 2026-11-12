@@ -315,18 +315,22 @@ async function downloadsAFileAndMatchesItsCrc(): Promise<void> throws Error {
   const s = sitl!
   try {
     const client = new FtpClient(s.conn, s.target, { timeoutMs: 1000, retries: 3 })
-    // A file whose size is the real one: the listing's size is what the download must find.
+    // A file whose size is the real one: the listing's size is what the download must find. Not a file by name: the firmware that
+    // CI builds (Copter-4.7.2) is older than a developer's, and the files in its ROMFS may differ; the biggest one is used.
     const listed = await client.listDirectory("/@ROMFS")
     let size = -1
+    let file = ""
     for (const e of listed) {
-      if (e.name == "locations.txt") {
+      if (!e.directory && e.size > size) {
         size = e.size
+        file = e.name
       }
     }
-    expect(size > 0).toBe(true)
+    expect(size > 2500).toBe(true)
+    const path = `/@ROMFS/${file}`
     const whole = new CollectSink()
-    const got = await downloadFile(client, "/@ROMFS/locations.txt", whole, 0, 0, size)
-    println(`ArduCopter SITL: /@ROMFS/locations.txt, ${got.size} bytes, our CRC ${got.crc}, checked by the vehicle: ${got.verified} ${got.crcError}`)
+    const got = await downloadFile(client, path, whole, 0, 0, size)
+    println(`ArduCopter SITL: ${path}, ${got.size} bytes, our CRC ${got.crc}, checked by the vehicle: ${got.verified} ${got.crcError}`)
     // The vehicle's CRC-32 is the one `Crc32` computes (no inversion at either end): this is the check that says so.
     expect(got.verified).toBe(true)
     expect(got.size).toBe(size)
@@ -335,7 +339,7 @@ async function downloadsAFileAndMatchesItsCrc(): Promise<void> throws Error {
     const held = whole.bytes().slice(0, 2500)
     part.parts.push(held)
     part.total = held.length
-    const again = await downloadFile(client, "/@ROMFS/locations.txt", part, held.length, crc32Of(held), size)
+    const again = await downloadFile(client, path, part, held.length, crc32Of(held), size)
     expect(again.verified).toBe(true)
     expect(again.crc).toBe(got.crc)
     expect(part.total).toBe(size)
