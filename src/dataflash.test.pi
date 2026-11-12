@@ -1,0 +1,579 @@
+// The DataFlash reader and its test encoder: every field character, chunking, units, damaged and hostile input.
+import { describe, it, expect } from "std/test"
+import { readF64 } from "./bytes"
+import { MemoryStream } from "./stream"
+import {
+  DF_FMT_LENGTH,
+  DF_FMT_TYPE,
+  DataFlashReader,
+  DfDecoder,
+  DfEncoder,
+  DfMessage,
+  PROBLEMS_KEPT,
+  indexLog,
+} from "./dataflash"
+
+const ALL: string = "QbBhHiIfdnNZ"
+const LABELS: string = "TimeUS,A,B,C,D,E,F,G,H,I,J,K"
+const MORE: string = "QcCeELMqQ"
+const MORE_LABELS: string = "TimeUS,L,M,N,O,P,Q,R,S"
+
+function bytesOf(list: int[]): Uint8Array {
+  const out = new Uint8Array(list.length)
+  for (let i = 0; i < list.length; i++) {
+    out.set(i, list[i])
+  }
+  out
+}
+
+function near(a: f64, b: f64): bool {
+  (if (a > b) a - b else b - a) < 0.0000001
+}
+
+/// The messages of a whole log, pushed in chunks of `chunk` bytes.
+function readAll(log: Uint8Array, chunk: int): DfMessage[] {
+  const d = new DfDecoder()
+  const out: DfMessage[] = []
+  let at = 0
+  while (at < log.length) {
+    const end = if (at + chunk < log.length) at + chunk else log.length
+    d.push(log.slice(at, end))
+    at = end
+    while (true) {
+      const m = d.next()
+      if (m == null) {
+        break
+      }
+      out.push(m!)
+    }
+  }
+  d.finish()
+  out
+}
+
+/// Two types that between them have every field character (a format is at most 16 of them).
+function allFieldsEncoder(): DfEncoder {
+  const e = new DfEncoder()
+  expect(e.define(129, "TST", ALL, LABELS)).toBe(true)
+  expect(e.define(130, "TS2", MORE, MORE_LABELS)).toBe(true)
+  e
+}
+
+/// A message of each of the two types: 2 messages.
+function sample(e: DfEncoder, t: f64): void {
+  expect(e.add(129,
+    [t, -5.0, 200.0, -1234.0, 54321.0, -100000.0, 4000000000.0, 1.5, 2.25, 0.0, 0.0, 0.0],
+    ["", "", "", "", "", "", "", "", "", "abc", "sixteen chars...", "a longer text of the 64 that fits"])).toBe(true)
+  expect(e.add(130,
+    [t, -12.34, 123.45, -1000.5, 4000000.25, 47.1234567, 5.0, -9000000000.0, 9000000000.0],
+    ["", "", "", "", "", "", "", "", ""])).toBe(true)
+}
+
+function readsEveryFieldCharacter(): void {
+  const e = allFieldsEncoder()
+  sample(e, 123456789.0)
+  const messages = readAll(e.bytes(), 1000)
+  // The two FMTs it defined, and the two messages.
+  expect(messages.length).toBe(4)
+  expect(messages[0].format.name).toBe("FMT")
+  expect(messages[0].text("Name")).toBe("TST")
+  expect(messages[0].text("Format")).toBe(ALL)
+  expect(messages[1].text("Name")).toBe("TS2")
+  const m = messages[2]
+  expect(m.format.name).toBe("TST")
+  expect(m.nums[0]).toBe(123456789.0)
+  expect(m.nums[1]).toBe(-5.0)
+  expect(m.nums[2]).toBe(200.0)
+  expect(m.nums[3]).toBe(-1234.0)
+  expect(m.nums[4]).toBe(54321.0)
+  expect(m.nums[5]).toBe(-100000.0)
+  expect(m.nums[6]).toBe(4000000000.0)
+  expect(m.nums[7]).toBe(1.5)
+  expect(m.nums[8]).toBe(2.25)
+  expect(m.texts[9]).toBe("abc")
+  expect(m.texts[10]).toBe("sixteen chars...")
+  expect(m.texts[11]).toBe("a longer text of the 64 that fits")
+  // By name.
+  expect(m.num("C")).toBe(-1234.0)
+  expect(m.num("NoSuchField") == null).toBe(true)
+  expect(m.timeUs()).toBe(123456789)
+  // c C e E are 0.01 of the count, L is 1e-7 of it.
+  const n = messages[3]
+  expect(n.format.name).toBe("TS2")
+  expect(near(n.nums[1], -12.34)).toBe(true)
+  expect(near(n.nums[2], 123.45)).toBe(true)
+  expect(near(n.nums[3], -1000.5)).toBe(true)
+  expect(near(n.nums[4], 4000000.25)).toBe(true)
+  expect(near(n.nums[5], 47.1234567)).toBe(true)
+  expect(n.nums[6]).toBe(5.0)
+  expect(n.nums[7]).toBe(-9000000000.0)
+  expect(n.nums[8]).toBe(9000000000.0)
+}
+
+function readsInAnyChunking(): void {
+  const e = allFieldsEncoder()
+  for (let i = 0; i < 20; i++) {
+    sample(e, (i * 1000) as f64)
+  }
+  const log = e.bytes()
+  const whole = readAll(log, log.length)
+  expect(whole.length).toBe(42)
+  for (const chunk of [1, 2, 3, 7, 89, 100, 255, 256]) {
+    const parts = readAll(log, chunk)
+    expect(parts.length).toBe(42)
+    for (let i = 0; i < parts.length; i++) {
+      expect(parts[i].offset).toBe(whole[i].offset)
+      expect(parts[i].timeUs()).toBe(whole[i].timeUs())
+    }
+  }
+  expect(whole[1].offset).toBe(DF_FMT_LENGTH)
+}
+
+function holdsOnlyAMessageNotTheFile(): void {
+  const e = allFieldsEncoder()
+  for (let i = 0; i < 2000; i++) {
+    sample(e, (i * 10) as f64)
+  }
+  const log = e.bytes()
+  const d = new DfDecoder()
+  let most = 0
+  let at = 0
+  while (at < log.length) {
+    const end = if (at + 500 < log.length) at + 500 else log.length
+    d.push(log.slice(at, end))
+    at = end
+    while (d.next() != null) {
+    }
+    if (d.held() > most) {
+      most = d.held()
+    }
+  }
+  d.finish()
+  expect(d.messages).toBe(4002)
+  // What waits is part of one message: less than the longest there can be.
+  expect(most < 255).toBe(true)
+  expect(d.problems.count).toBe(0)
+}
+
+function knowsTheTimeOfAMessage(): void {
+  const e = new DfEncoder()
+  expect(e.define(130, "MS", "IB", "TimeMS,V")).toBe(true)
+  expect(e.define(131, "NOTM", "BB", "A,B")).toBe(true)
+  expect(e.add(130, [1500.0, 3.0], ["", ""])).toBe(true)
+  expect(e.add(131, [1.0, 2.0], ["", ""])).toBe(true)
+  const m = readAll(e.bytes(), 50)
+  expect(m[2].timeUs()).toBe(1500000)
+  expect(m[3].timeUs()).toBe(-1)
+}
+
+function takesNoteOfUnitsAndMultipliers(): void {
+  const e = new DfEncoder()
+  expect(e.define(130, "FMTU", "QBNN", "TimeUS,FmtType,UnitIds,MultIds")).toBe(true)
+  expect(e.define(131, "UNIT", "QbZ", "TimeUS,Id,Label")).toBe(true)
+  expect(e.define(132, "MULT", "Qbd", "TimeUS,Id,Mult")).toBe(true)
+  expect(e.define(133, "ATT", "QcC", "TimeUS,Roll,Yaw")).toBe(true)
+  // 'd' (0x64) is degrees, 's' seconds; '-' no multiplier, 'B' is 0.01.
+  expect(e.add(131, [0.0, 100.0, 0.0], ["", "", "deg"])).toBe(true)
+  expect(e.add(131, [0.0, 115.0, 0.0], ["", "", "s"])).toBe(true)
+  expect(e.add(132, [0.0, 66.0, 0.01], ["", "", ""])).toBe(true)
+  expect(e.add(130, [0.0, 133.0, 0.0, 0.0], ["", "", "sdd", "-BB"])).toBe(true)
+  expect(e.add(133, [10.0, 1.5, 359.0], ["", "", ""])).toBe(true)
+  const d = new DfDecoder()
+  d.push(e.bytes())
+  while (d.next() != null) {
+  }
+  const att = d.formats[133]!
+  expect(d.tables.unitOf(att.fields[0])).toBe("s")
+  expect(d.tables.unitOf(att.fields[1])).toBe("deg")
+  expect(near(d.tables.multOf(att.fields[1]), 0.01)).toBe(true)
+  // No multiplier ('-') is 1.
+  expect(near(d.tables.multOf(att.fields[0]), 1.0)).toBe(true)
+  expect(d.problems.count).toBe(0)
+}
+
+/// The definitions ArduPilot (Copter-4.7.2 SITL) wrote in a real log, the ones the screens read: the format and labels as the log
+/// has them, the lengths as the log has them.
+function readsTheDefinitionsArduPilotWrites(): void {
+  const e = new DfEncoder()
+  expect(e.define(72, "ATT", "QffffffB", "TimeUS,DesRoll,Roll,DesPitch,Pitch,DesYaw,Yaw,AEKF")).toBe(true)
+  expect(e.define(94, "GPS", "QBBIHBcLLeffffB", "TimeUS,I,Status,GMS,GWk,NSats,HDop,Lat,Lng,Alt,Spd,GCrs,VZ,Yaw,U")).toBe(true)
+  expect(e.define(44, "XKF1", "QBccCfffffffccce", "TimeUS,C,Roll,Pitch,Yaw,VN,VE,VD,dPD,PN,PE,PD,GX,GY,GZ,OH")).toBe(true)
+  expect(e.define(121, "MODE", "QMBB", "TimeUS,Mode,ModeNum,Rsn")).toBe(true)
+  expect(e.formats[72]!.length).toBe(36)
+  expect(e.formats[94]!.length).toBe(51)
+  expect(e.formats[44]!.length).toBe(56)
+  expect(e.formats[121]!.length).toBe(14)
+  expect(e.add(94, [7000000.0, 0.0, 3.0, 123456.0, 2400.0, 10.0, 1.2, -35.3632621, 149.1652374, 584.17, 0.5, 90.0, 0.1, 0.0, 1.0],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""])).toBe(true)
+  expect(e.add(121, [8000000.0, 4.0, 4.0, 1.0], ["", "", "", ""])).toBe(true)
+  const m = readAll(e.bytes(), 33)
+  expect(m.length).toBe(6)
+  const gps = m[4]
+  expect(gps.format.name).toBe("GPS")
+  expect(near(gps.num("Lat")!, -35.3632621)).toBe(true)
+  expect(near(gps.num("Lng")!, 149.1652374)).toBe(true)
+  expect(near(gps.num("Alt")!, 584.17)).toBe(true)
+  expect(near(gps.num("HDop")!, 1.2)).toBe(true)
+  expect(gps.num("NSats")).toBe(10.0)
+  expect(gps.timeUs()).toBe(7000000)
+  expect(m[5].num("Mode")).toBe(4.0)
+  expect(m[5].timeUs()).toBe(8000000)
+}
+
+function skipsGarbageAndGoesOnWithWhatItCanRead(): void {
+  const e = allFieldsEncoder()
+  sample(e, 1000.0)
+  e.raw(bytesOf([1, 2, 3, 0xA3, 0x95, 0xFE, 0xA3]))
+  sample(e, 2000.0)
+  e.raw(bytesOf([0xA3]))
+  const log = e.bytes()
+  const d = new DfDecoder()
+  d.push(log)
+  const times: int[] = []
+  while (true) {
+    const m = d.next()
+    if (m == null) {
+      break
+    }
+    if (m!.format.name == "TST") {
+      times.push(m!.timeUs())
+    }
+  }
+  d.finish()
+  expect(times.join(",")).toBe("1000,2000")
+  expect(d.problems.unknownTypes).toBe(1)
+  expect(d.problems.skipped > 0).toBe(true)
+  // Every byte is a message or a skipped byte.
+  let inMessages = 0
+  for (const m of readAll(log, 7)) {
+    inMessages += m.format.length
+  }
+  expect(inMessages + d.problems.skipped).toBe(log.length)
+}
+
+function refusesFormatsThatDoNotAddUp(): void {
+  const e = new DfEncoder()
+  expect(e.define(130, "OK", "QB", "TimeUS,A")).toBe(true)
+  // A field character that is not known, a length that is not the fields', FMT redefined.
+  const payload = new Uint8Array(86)
+  payload.set(0, 131)
+  payload.set(1, 12)
+  payload.set(2, 0x42)
+  payload.set(6, 0x51)
+  payload.set(7, 0x24)
+  const bad = new Uint8Array(3 + 86)
+  bad.set(0, 0xA3)
+  bad.set(1, 0x95)
+  bad.set(2, 128)
+  for (let i = 0; i < 86; i++) {
+    bad.set(3 + i, payload[i])
+  }
+  e.raw(bad)
+  const wrongLength = bad.slice(0, bad.length)
+  wrongLength.set(3, 132)
+  wrongLength.set(4, 99)
+  wrongLength.set(9, 0x42)
+  wrongLength.set(10, 0)
+  e.raw(wrongLength)
+  const redefined = bad.slice(0, bad.length)
+  redefined.set(3, 128)
+  redefined.set(4, 12)
+  redefined.set(9, 0x42)
+  redefined.set(10, 0)
+  e.raw(redefined)
+  const d = new DfDecoder()
+  d.push(e.bytes())
+  while (d.next() != null) {
+  }
+  expect(d.problems.badFormats).toBe(3)
+  expect(d.formats[131] == null).toBe(true)
+  expect(d.formats[132] == null).toBe(true)
+  expect(d.formats[DF_FMT_TYPE]!.length).toBe(DF_FMT_LENGTH)
+  expect(d.problems.notes.length).toBe(3)
+}
+
+/// Not-a-number, infinity and a number no int holds, as a log can say them in an f64.
+function oddNumbers(): f64[] {
+  const nan = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF8, 0x7F]), 0)
+  const inf = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF0, 0x7F]), 0)
+  const negInf = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF0, 0xFF]), 0)
+  [nan, inf, negInf, 1.0e300, -1.0e300, 9.3e18, 1000.0]
+}
+
+function doesNotStopOnATimeThatIsNotAnInt(): void {
+  const e = new DfEncoder()
+  expect(e.define(130, "BIG", "Q", "TimeUS")).toBe(true)
+  expect(e.define(131, "MS", "IB", "TimeMS,V")).toBe(true)
+  expect(e.add(130, [0.0], [""])).toBe(true)
+  expect(e.add(131, [4294967295.0, 0.0], ["", ""])).toBe(true)
+  const log = e.bytes()
+  // The Q is 2^63, then all ones: not an int in either case.
+  const first = log.slice(0, log.length - 11 - 4)
+  const patched = log.slice(0, log.length)
+  const at = 2 * DF_FMT_LENGTH + 3
+  for (const value of [[0, 0, 0, 0, 0, 0, 0, 0x80], [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]]) {
+    for (let i = 0; i < 8; i++) {
+      patched.set(at + i, value[i])
+    }
+    const m = readAll(patched, 50)
+    expect(m.length).toBe(4)
+    expect(m[2].timeUs()).toBe(-1)
+    // A time in milliseconds that fits is still a time.
+    expect(m[3].timeUs()).toBe(4294967295000)
+  }
+  expect(first.length > 0).toBe(true)
+}
+
+function doesNotStopOnNumbersInUnitsAndMultipliers(): void {
+  for (const odd of oddNumbers()) {
+    const e = new DfEncoder()
+    // The fields that should be bytes are f64 here, as a log can make them.
+    expect(e.define(130, "FMTU", "QddNN", "TimeUS,FmtType,Ignore,UnitIds,MultIds")).toBe(true)
+    expect(e.define(131, "UNIT", "QdZ", "TimeUS,Id,Label")).toBe(true)
+    expect(e.define(132, "MULT", "Qdd", "TimeUS,Id,Mult")).toBe(true)
+    expect(e.define(133, "ATT", "QB", "TimeUS,V")).toBe(true)
+    expect(e.add(131, [0.0, odd, 0.0], ["", "", "deg"])).toBe(true)
+    expect(e.add(132, [0.0, odd, 0.01], ["", "", ""])).toBe(true)
+    expect(e.add(132, [0.0, 66.0, odd], ["", "", ""])).toBe(true)
+    expect(e.add(130, [0.0, odd, 0.0, 0.0, 0.0], ["", "", "", "d", "B"])).toBe(true)
+    expect(e.add(130, [0.0, 133.0, 0.0, 0.0, 0.0], ["", "", "", "d", "B"])).toBe(true)
+    expect(e.add(133, [1.0, 2.0], ["", ""])).toBe(true)
+    const d = new DfDecoder()
+    d.push(e.bytes())
+    let n = 0
+    while (d.next() != null) {
+      n += 1
+    }
+    d.finish()
+    // Every message was read; the ones with numbers that mean nothing were noted and did not change the tables.
+    expect(n).toBe(4 + 6)
+    expect(d.problems.count > 0 || odd == 1000.0).toBe(true)
+    const f = d.formats[133]!
+    expect(d.tables.multOf(f.fields[0]) == d.tables.multOf(f.fields[0])).toBe(true)
+    expect(d.tables.unitOf(f.fields[0]).length < 4).toBe(true)
+  }
+}
+
+function keepsTheFirstDefinitionOfAType(): void {
+  const e = new DfEncoder()
+  expect(e.define(130, "AAA", "QB", "TimeUS,V")).toBe(true)
+  e.raw(fmtBytes(130, 12, "BBB", "QB", "TimeUS,W"))
+  // The same again is harmless; another layout of the same type is not taken, and later messages are of the first.
+  e.raw(fmtBytes(130, 12, "AAA", "QB", "TimeUS,V"))
+  e.raw(fmtBytes(130, 20, "AAA", "QQ", "TimeUS,V"))
+  expect(e.add(130, [5.0, 6.0], ["", ""])).toBe(true)
+  const d = new DfDecoder()
+  d.push(e.bytes())
+  let last: DfMessage? = null
+  while (true) {
+    const m = d.next()
+    if (m == null) {
+      break
+    }
+    last = m
+  }
+  expect(d.problems.badFormats).toBe(2)
+  expect(d.formats[130]!.name).toBe("AAA")
+  expect(d.formats[130]!.length).toBe(12)
+  expect(last!.num("V")).toBe(6.0)
+  // After the four FMTs, whatever became of them.
+  expect(last!.offset).toBe(4 * DF_FMT_LENGTH)
+}
+
+function neverTakesAFmtForFmt(): void {
+  // Type 128 with length 89 and a format that adds up to 86 bytes: the layout of FMT stays as it is.
+  const e = new DfEncoder()
+  // The FMT of FMT that every log begins with is not a problem; another one is.
+  e.raw(fmtBytes(128, 89, "FMT", "BBnNZ", "Type,Length,Name,Format,Labels"))
+  e.raw(fmtBytes(128, 89, "FMT", "QQQQQQQQQQc", "A,B,C,D,E,F,G,H,I,J,K"))
+  expect(e.define(130, "AAA", "QB", "TimeUS,V")).toBe(true)
+  const d = new DfDecoder()
+  d.push(e.bytes())
+  let names = ""
+  while (true) {
+    const m = d.next()
+    if (m == null) {
+      break
+    }
+    names += `${m!.format.name} `
+  }
+  expect(d.problems.badFormats).toBe(1)
+  expect(d.formats[DF_FMT_TYPE]!.format).toBe("BBnNZ")
+  expect(d.formats[130]!.name).toBe("AAA")
+  expect(names).toBe("FMT FMT ")
+}
+
+/// A whole FMT message as a log has it: `defines` is the type it defines, `length` what it says the length is.
+function fmtBytes(defines: int, length: int, name: string, format: string, labels: string): Uint8Array {
+  const out = new Uint8Array(DF_FMT_LENGTH)
+  out.set(0, 0xA3)
+  out.set(1, 0x95)
+  out.set(2, DF_FMT_TYPE)
+  out.set(3, defines)
+  out.set(4, length)
+  const text = [name, format, labels]
+  const starts = [5, 9, 25]
+  const widths = [4, 16, 64]
+  for (let k = 0; k < 3; k++) {
+    const bytes = new TextEncoder().encode(text[k])
+    for (let i = 0; i < bytes.length && i < widths[k]; i++) {
+      out.set(starts[k] + i, bytes[i])
+    }
+  }
+  out
+}
+
+function countsATruncatedEnd(): void {
+  const e = allFieldsEncoder()
+  sample(e, 1.0)
+  const log = e.bytes()
+  const cut = log.slice(0, log.length - 10)
+  const d = new DfDecoder()
+  d.push(cut)
+  let n = 0
+  while (d.next() != null) {
+    n += 1
+  }
+  d.finish()
+  // The two FMTs and the first message (121 bytes); the second is cut.
+  expect(n).toBe(3)
+  expect(d.problems.truncated).toBe(true)
+  expect(d.problems.skipped).toBe(cut.length - (2 * DF_FMT_LENGTH + 121))
+}
+
+/// A repeatable stream of bytes.
+function noise(n: int, seed: int): Uint8Array {
+  const out = new Uint8Array(n)
+  let x = seed
+  for (let i = 0; i < n; i++) {
+    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+    out.set(i, (x >> 16) & 0xFF)
+  }
+  out
+}
+
+function survivesHostileInput(): void {
+  // Pure noise; noise dressed as messages (the heads everywhere); a log whose FMTs are redefined over and over.
+  const plain = noise(200000, 7)
+  const heads = noise(200000, 9)
+  for (let i = 0; i + 2 < heads.length; i += 3) {
+    heads.set(i, 0xA3)
+    heads.set(i + 1, 0x95)
+    if (heads[i + 2] >= 128) {
+      heads.set(i + 2, 128)
+    }
+  }
+  for (const log of [plain, heads]) {
+    const d = new DfDecoder()
+    let taken = 0
+    let at = 0
+    while (at < log.length) {
+      const end = if (at + 4096 < log.length) at + 4096 else log.length
+      d.push(log.slice(at, end))
+      at = end
+      while (true) {
+        const m = d.next()
+        if (m == null) {
+          break
+        }
+        taken += m!.format.length
+      }
+      expect(d.held() < 4096 + 255).toBe(true)
+    }
+    d.finish()
+    // Work stayed linear and nothing was lost track of: every byte was in a message, or skipped.
+    expect(taken + d.problems.skipped).toBe(log.length)
+    expect(d.problems.notes.length <= PROBLEMS_KEPT).toBe(true)
+  }
+}
+
+function indexesWithABoundedMemory(): void {
+  const e = allFieldsEncoder()
+  for (let i = 0; i < 100; i++) {
+    sample(e, (i * 10) as f64)
+  }
+  const d = new DfDecoder()
+  d.push(e.bytes())
+  while (d.next() != null) {
+  }
+  expect(d.messages).toBe(202)
+}
+
+async function indexesAStream(): Promise<void> throws Error {
+  const e = allFieldsEncoder()
+  for (let i = 0; i < 100; i++) {
+    sample(e, (i * 10) as f64)
+  }
+  const ends = MemoryStream.pair()
+  const log = e.bytes()
+  let at = 0
+  while (at < log.length) {
+    const end = if (at + 1000 < log.length) at + 1000 else log.length
+    ends[0].write(log.slice(at, end))
+    at = end
+  }
+  ends[0].close()
+  const all = await indexLog(ends[1])
+  expect(all.count(129)).toBe(100)
+  expect(all.count(128)).toBe(2)
+  expect(all.offsetsOf(129).length).toBe(100)
+  expect(all.offsetsOf(129)[0]).toBe(2 * DF_FMT_LENGTH)
+  expect(all.truncated).toBe(false)
+  // With room for 10 offsets: all of them are counted, ten are kept.
+  const again = MemoryStream.pair()
+  again[0].write(log)
+  again[0].close()
+  const few = await indexLog(again[1], 10)
+  expect(few.count(129)).toBe(100)
+  expect(few.kept).toBe(10)
+  expect(few.truncated).toBe(true)
+}
+
+async function readsFromAStream(): Promise<void> throws Error {
+  const e = allFieldsEncoder()
+  sample(e, 5.0)
+  sample(e, 6.0)
+  const ends = MemoryStream.pair()
+  ends[0].write(e.bytes())
+  ends[0].close()
+  const reader = new DataFlashReader(ends[1])
+  const times: int[] = []
+  while (true) {
+    const m = await reader.next()
+    if (m == null) {
+      break
+    }
+    times.push(m!.timeUs())
+  }
+  expect(times.join(",")).toBe("-1,-1,5,5,6,6")
+}
+
+function theEncoderRefusesWhatCannotBeRead(): void {
+  const e = new DfEncoder()
+  expect(e.define(128, "FMT", "B", "A")).toBe(false)
+  expect(e.define(0, "ZERO", "B", "A")).toBe(false)
+  expect(e.define(130, "TOOLONG", "B", "A")).toBe(false)
+  expect(e.define(130, "BIG", "ZZZZZ", "A")).toBe(false)
+  expect(e.add(140, [], [])).toBe(false)
+}
+
+describe("the DataFlash reader", () => {
+  it("reads every field character the encoder writes", readsEveryFieldCharacter)
+  it("reads the same whatever the chunking", readsInAnyChunking)
+  it("holds a message, not the file", holdsOnlyAMessageNotTheFile)
+  it("knows the time of a message: TimeUS, or TimeMS in microseconds, or none", knowsTheTimeOfAMessage)
+  it("takes note of units and multipliers (FMTU, UNIT, MULT)", takesNoteOfUnitsAndMultipliers)
+  it("reads the definitions ArduPilot writes (captured from a real log)", readsTheDefinitionsArduPilotWrites)
+  it("skips garbage and unknown types, and goes on with what it can read", skipsGarbageAndGoesOnWithWhatItCanRead)
+  it("refuses formats that do not add up, and a redefined FMT", refusesFormatsThatDoNotAddUp)
+  it("does not stop on a time that is not an int (2^63 and over)", doesNotStopOnATimeThatIsNotAnInt)
+  it("does not stop on NaN, infinity or 1e300 in UNIT, MULT and FMTU", doesNotStopOnNumbersInUnitsAndMultipliers)
+  it("keeps the first definition of a type", keepsTheFirstDefinitionOfAType)
+  it("never takes an FMT for type 128", neverTakesAFmtForFmt)
+  it("counts a truncated end", countsATruncatedEnd)
+  it("survives noise and heads everywhere, with every byte accounted for", survivesHostileInput)
+  it("counts messages", indexesWithABoundedMemory)
+  it("indexes a stream, keeping at most the offsets it may", indexesAStream)
+  it("reads from a stream", readsFromAStream)
+  it("has an encoder that refuses what the reader could not read", theEncoderRefusesWhatCannotBeRead)
+})
