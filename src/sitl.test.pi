@@ -11,13 +11,17 @@ import { delay } from "std/timers"
 import { connect, listen } from "std/net"
 import { env, Child, Command } from "std/process"
 import { exists, mkdir, remove } from "std/fs"
-import { MavLinkConnection } from "./connection"
+import { MavLinkConnection, Received } from "./connection"
 import { TcpStream } from "./stream"
-import { AutopilotVersionRead, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
+import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
+import { Heartbeat } from "./dialects/minimal"
+import { MavCmd, MavResult } from "./dialects/common"
+import { GlobalPositionInt } from "./dialects/standard"
+import { StatusText } from "./dialects/common"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
-import { FtpClient, FtpEntry } from "./ftp"
-import { crc32Of } from "./crc32"
-import { FileSink, downloadFile } from "./logdownload"
+import { FtpClient, FtpEntry, FtpError } from "./ftp"
+import { Crc32, crc32Of } from "./crc32"
+import { FileDownload, FileSink, downloadFile } from "./logdownload"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
 import { MavParamType } from "./dialects/common"
 
@@ -64,7 +68,7 @@ async function findBinary(): Promise<string?> throws Error {
 }
 
 /// Starts SITL and waits for its first heartbeat; null, with a line printed, when there is no SITL binary to start.
-async function startSitl(): Promise<Sitl?> throws Error {
+async function startSitl(speedup: int = 1): Promise<Sitl?> throws Error {
   const binary = await findBinary()
   if (binary == null) {
     println("SITL tests skipped: no SITL_BINARY, and no arducopter on the PATH")
@@ -73,7 +77,7 @@ async function startSitl(): Promise<Sitl?> throws Error {
   const instance = await freeInstance()
   const dir = `/tmp/pico-mavlink-sitl-${Date.now()}-${instance}`
   await mkdir(dir, true)
-  const args = ["-w", "--model", "quad", "--speedup", "1", "-I", `${instance}`, "--sim-address=127.0.0.1"]
+  const args = ["-w", "--model", "quad", "--speedup", `${speedup}`, "-I", `${instance}`, "--sim-address=127.0.0.1"]
   const child = new Command(binary!, args, dir, null, false, "null", "null", "null").spawn()
   const link: MavLinkConnection[] = []
   try {
@@ -283,10 +287,13 @@ async function listsTheFileSystem(): Promise<void> throws Error {
 class CollectSink implements FileSink {
   public readonly parts: Uint8Array[] = []
   public total: int = 0
+  /// The CRC-32 of what was written.
+  public readonly crc: Crc32 = new Crc32()
 
   public async write(bytes: Uint8Array): Promise<void> throws Error {
     parts.push(bytes)
     total += bytes.length
+    crc.update(bytes)
   }
 
   public bytes(): Uint8Array {
@@ -339,7 +346,145 @@ async function downloadsAFileAndMatchesItsCrc(): Promise<void> throws Error {
   }
 }
 
+/// What the vehicle says while it flies: whether it is armed, its mode, its height above home (mm) and what it says in words.
+class Flight {
+  public armed: bool = false
+  public mode: int = -1
+  public relAltMm: int = 0
+  public texts: string[] = []
+}
+
+function watchFlight(s: Sitl): Flight {
+  const f = new Flight()
+  s.conn.on((r: Received) => {
+    if (r.packet.header.sysid != s.target.system) {
+      return
+    }
+    const m = r.message
+    if (m instanceof Heartbeat && r.packet.header.compid == s.target.component) {
+      f.armed = ((m.baseMode as int) & 128) != 0
+      f.mode = m.customMode as int
+    } else if (m instanceof GlobalPositionInt) {
+      f.relAltMm = m.relativeAlt as int
+    } else if (m instanceof StatusText) {
+      f.texts.push(m.text)
+    }
+  })
+  f
+}
+
+/// The listing of a directory as one line, or why it failed.
+async function showDir(client: FtpClient, path: string): Promise<string> {
+  try {
+    const entries = await client.listDirectory(path)
+    return `${path}: ${if (entries.length == 0) "(empty)" else entries.map((e) => showEntry(e)).join("; ")}`
+  } catch (e: FtpError) {
+    return `${path}: ${e.code} ${e.message}`
+  }
+}
+
+/// Waits until `done()`, at most `seconds`; true when it came.
+async function until(done: () => bool, seconds: int): Promise<bool> throws AbortError {
+  for (let i = 0; i < seconds * 4 && !done(); i++) {
+    await delay(250)
+  }
+  done()
+}
+
+/// THE SPIKE (a test, not a feature): arm, take off in GUIDED, land, and see where ArduCopter SITL writes its log and when, over
+/// MAVLink FTP. What it finds is printed; it fails if no log file is to be found in the end.
+async function writesALogWhereFtpCanSeeIt(): Promise<void> throws Error {
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    const f = watchFlight(s)
+    const client = new FtpClient(s.conn, s.target, { timeoutMs: 1000, retries: 3 })
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    await client.reset()
+    println(`SPIKE before arming: ${await showDir(client, "/")}`)
+    println(`SPIKE before arming: ${await showDir(client, "/logs")}`)
+    println(`SPIKE before arming: ${await showDir(client, "/APM/LOGS")}`)
+    // GUIDED, then arm: the vehicle needs its position first, so it is asked until it agrees.
+    let armed = false
+    for (let i = 0; i < 90 && !armed; i++) {
+      const mode = await cmd.run(MavCmd.DO_SET_MODE, [1.0, 4.0])
+      const res = if (mode == MavResult.ACCEPTED) await cmd.run(MavCmd.COMPONENT_ARM_DISARM, [1.0]) else mode
+      armed = res == MavResult.ACCEPTED && await until(() => f.armed, 3)
+      if (!armed) {
+        await delay(1000)
+      }
+    }
+    println(`SPIKE vehicle says: ${f.texts.join(" | ")}`)
+    expect(armed).toBe(true)
+    println(`SPIKE just armed: ${await showDir(client, "/")}`)
+    println(`SPIKE just armed: ${await showDir(client, "/logs")}`)
+    // GLOBAL_POSITION_INT at 5 Hz, so that the height is known.
+    println(`SPIKE position interval: ${await cmd.setMessageInterval(33, 200_000)}`)
+    const takeoff = await cmd.run(MavCmd.NAV_TAKEOFF, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0])
+    const high = await until(() => f.relAltMm > 8000, 60)
+    println(`SPIKE takeoff result ${takeoff}, reached 8 m: ${high}, now ${f.relAltMm} mm, mode ${f.mode}, armed ${f.armed}`)
+    println(`SPIKE at ${f.relAltMm} mm: ${await showDir(client, "/logs")}`)
+    // The log while it is still being written: its size, and whether a CRC can be had (and is it the file's at that moment?).
+    const during = await client.listDirectory("/logs")
+    for (const e of during) {
+      if (e.name.endsWith(".BIN")) {
+        println(`SPIKE while flying: ${e.name} is ${e.size} bytes, time ${if (e.time == null) "none" else `${e.time!}`}`)
+      }
+    }
+    const land = await cmd.run(MavCmd.DO_SET_MODE, [1.0, 9.0])
+    const down = await until(() => !f.armed, 90)
+    println(`SPIKE land result ${land}, disarmed: ${down}, mode ${f.mode}, height ${f.relAltMm} mm`)
+    // Does the log go on growing after the disarm? Its size, every 5 s.
+    for (let k = 0; k < 5; k++) {
+      const now = await client.listDirectory("/logs")
+      for (const e of now) {
+        if (e.name.endsWith(".BIN")) {
+          println(`SPIKE ${k * 5} s after the disarm: ${e.name} ${e.size} bytes, time ${if (e.time == null) "none" else `${e.time!}`}`)
+        }
+      }
+      await delay(5000)
+    }
+    println(`SPIKE after landing and disarm: ${await showDir(client, "/")}`)
+    println(`SPIKE after landing and disarm: ${await showDir(client, "/logs")}`)
+    const after = await client.listDirectory("/logs")
+    let found = ""
+    let size = -1
+    for (const e of after) {
+      if (e.name.endsWith(".BIN") && found == "") {
+        found = e.name
+        size = e.size
+      }
+    }
+    expect(found != "").toBe(true)
+    // The log of a flight that ended is still being appended to for a while (a few bytes), so its size is not final, and a download
+    // does not ask for a size: it is chased. A download whose CRC differs from the vehicle's, while the file has grown, goes on from
+    // what it has (the CRC is carried on) until the vehicle's CRC is ours.
+    const sink = new CollectSink()
+    let got: FileDownload? = null
+    for (let attempt = 0; attempt < 4 && got == null; attempt++) {
+      try {
+        got = await downloadFile(client, `/logs/${found}`, sink, sink.total, sink.crc.crc, -1)
+      } catch (e: FtpError) {
+        println(`SPIKE attempt ${attempt + 1}: ${e.code} ${e.message} (the sink holds ${sink.total} bytes)`)
+        if (e.code != "FTP_CRC") {
+          throw e
+        }
+      }
+    }
+    expect(got != null).toBe(true)
+    println(`SPIKE downloaded /logs/${found}: ${got!.size} bytes (the listing said ${size}), checked by the vehicle: ${got!.verified}, ${got!.elapsedMs} ms`)
+    expect(got!.verified).toBe(true)
+    expect(got!.size >= size).toBe(true)
+  } finally {
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
+  it("writes a log that FTP can see: where, when, and what it looks like (the spike)", writesALogWhereFtpCanSeeIt)
   it("downloads a file by FTP, in order, and the vehicle's CRC-32 is ours; going on from the middle gives the same file", downloadsAFileAndMatchesItsCrc)
   it("lists its file system, with a time where it has one", listsTheFileSystem)
   it("gives the whole parameter list by file transfer in under 2 s, the same as the list", ftpGivesTheListFastAndTheSame)
