@@ -68,6 +68,8 @@ export class ReadState {
   public failure: FtpError? = null
   /// The most a file may hold (bytes): a vehicle that goes on past it is refused, not stored.
   public max: int
+  /// The error code for a file that goes past `max` (`FTP_PROTOCOL`; a download that knows the size to expect says `FTP_SIZE`).
+  public maxCode: string = "FTP_PROTOCOL"
   /// When the read has taken too long (ms since 1970; 0: no limit).
   public deadline: int = 0
 
@@ -76,11 +78,15 @@ export class ReadState {
     deadline > 0 && (Date.now() as int) >= deadline
   }
 
-  constructor(size: int, session: int, target: Target, max: int = MAX_FILE_BYTES) {
+  /// `start` is where the read begins (a multiple of `size`): a file that is read from the middle, to go on with a download. What is
+  /// before it is not wanted, and not kept if it arrives.
+  constructor(size: int, session: int, target: Target, max: int = MAX_FILE_BYTES, start: int = 0) {
     this.size = size
     this.session = session
     this.target = target
     this.max = max
+    this.front = start
+    this.top = start
   }
 
   public complete(): bool {
@@ -104,7 +110,7 @@ export class ReadState {
       return
     }
     if (at > max) {
-      fail("FTP_PROTOCOL", `the file ends at ${at}: more than the ${max} bytes a file may hold`)
+      fail(maxCode, `the file ends at ${at}: more than the ${max} bytes a file may hold`)
       return
     }
     if (end < 0) {
@@ -116,7 +122,8 @@ export class ReadState {
   /// Keeps the chunk at `offset`. Chunks are all at multiples of the read size, and only the last is shorter.
   public accept(offset: int, data: Uint8Array): void {
     packets += 1
-    if (data.length == 0 || chunks.has(offset)) {
+    // A chunk before the front is one that is held (or, in a download, was passed on and let go): a repeat.
+    if (data.length == 0 || offset < front || chunks.has(offset)) {
       return
     }
     if (offset % size != 0) {
@@ -128,7 +135,7 @@ export class ReadState {
       return
     }
     if (offset + data.length > max) {
-      fail("FTP_PROTOCOL", `data up to ${offset + data.length}: more than the ${max} bytes a file may hold`)
+      fail(maxCode, `data up to ${offset + data.length}: more than the ${max} bytes a file may hold`)
       return
     }
     chunks.set(offset, data)
@@ -208,13 +215,13 @@ export class ReadState {
   }
 }
 
-function cancelled(): FtpError {
+export function cancelled(): FtpError {
   new FtpError("FTP_ABORTED", "reading the file: cancelled")
 }
 
 /// Asks for a burst at `from` and waits for it to end: `burst_complete`, the whole file there, silence of `silenceMs`, a
 /// failure or a cancel.
-async function burst(client: FtpClient, s: ReadState, from: int, silenceMs: int, progress: (bytes: int, estimate: int) => void throws Error, estimate: int): Promise<void> throws FtpError {
+export async function burst(client: FtpClient, s: ReadState, from: int, silenceMs: int, progress: (bytes: int, estimate: int) => void throws Error, estimate: int): Promise<void> throws FtpError {
   const p = new FtpPacket()
   p.seq = client.nextSeq()
   p.session = s.session
@@ -262,7 +269,7 @@ function report(s: ReadState, progress: (bytes: int, estimate: int) => void thro
 
 /// Reads the chunk at `at` with a ReadFile. A vehicle that does not answer is no failure here: the caller counts it as a round
 /// that brought nothing.
-async function fill(client: FtpClient, s: ReadState, at: int): Promise<void> throws FtpError {
+export async function fill(client: FtpClient, s: ReadState, at: int): Promise<void> throws FtpError {
   try {
     const r = await client.call(FtpOpcode.READ_FILE, s.session, at, new Uint8Array(0), s.size)
     if (r.opcode == FtpOpcode.NACK) {

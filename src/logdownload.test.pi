@@ -1,0 +1,490 @@
+// Downloading a log over FTP into a sink: in order, from where an earlier try left off, with the size and the vehicle's CRC checked.
+import { describe, it, expect } from "std/test"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { Target } from "./operations"
+import { SimulatedAutopilot } from "./simulator"
+import { Crc32, crc32Of } from "./crc32"
+import { FtpClient, FtpError, FtpOptions } from "./ftp"
+import { FileSink, downloadFile } from "./logdownload"
+
+const VEHICLE: Target = { system: 1, component: 1 }
+const FAST: FtpOptions = { timeoutMs: 150, retries: 3, session: 7 }
+const LOG = "/APM/LOGS/00000001.BIN"
+
+class Rig {
+  public readonly gcs: MavLinkConnection
+  public readonly sim: SimulatedAutopilot
+
+  constructor(gcs: MavLinkConnection, sim: SimulatedAutopilot) {
+    this.gcs = gcs
+    this.sim = sim
+  }
+}
+
+function rig(): Rig {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const sim = new SimulatedAutopilot(ends[1])
+  gcs.run()
+  sim.conn.run()
+  new Rig(gcs, sim)
+}
+
+/// A sink in memory: the bytes in the order they were written, and a way to fail.
+class MemorySink implements FileSink {
+  public readonly parts: Uint8Array[] = []
+  public total: int = 0
+  /// The write that fails (counting from 1), or 0 for none.
+  public failAt: int = 0
+  public writes: int = 0
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    writes += 1
+    if (failAt > 0 && writes == failAt) {
+      throw new Error("no space left on device")
+    }
+    parts.push(bytes)
+    total += bytes.length
+  }
+
+  /// The first `n` bytes written, as one array (all by default).
+  public bytes(n: int = -1): Uint8Array {
+    const want = if (n < 0 || n > total) total else n
+    const out = new Uint8Array(want)
+    let at = 0
+    for (const part of parts) {
+      for (let i = 0; i < part.length && at < want; i++) {
+        out.set(at, part[i])
+        at += 1
+      }
+    }
+    out
+  }
+}
+
+/// `n` bytes that look like data and are the same on every run.
+function content(n: int): Uint8Array {
+  const out = new Uint8Array(n)
+  let x = 12345
+  for (let i = 0; i < n; i++) {
+    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+    out.set(i, (x >> 16) & 0xFF)
+  }
+  out
+}
+
+function same(a: Uint8Array, b: Uint8Array): bool {
+  if (a.length != b.length) {
+    return false
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false
+    }
+  }
+  true
+}
+
+/// A vehicle with a log of `n` bytes.
+function withLog(n: int): Rig {
+  const r = rig()
+  r.sim.fsFiles.set(LOG, content(n))
+  r
+}
+
+function crcMatchesTheBitByBitDefinition(): void {
+  // CRC-32 as ArduPilot computes it: polynomial 0xEDB88320 reflected, no inversion at either end.
+  const data = content(1000)
+  let c = 0
+  for (let i = 0; i < data.length; i++) {
+    c = c ^ (data[i] as int)
+    for (let k = 0; k < 8; k++) {
+      c = if ((c & 1) != 0) 0xEDB88320 ^ (c >> 1) else c >> 1
+    }
+  }
+  expect(crc32Of(data)).toBe(c)
+  // The usual CRC-32 of "123456789" is 0xCBF43926 with both inversions; with none at the start, it is the CRC of the inverted
+  // start state carried on: both ways of the same check, with the known value.
+  const check = new Uint8Array(9)
+  for (let i = 0; i < 9; i++) {
+    check.set(i, 0x31 + i)
+  }
+  const usual = new Crc32(0xFFFFFFFF)
+  usual.update(check)
+  expect(usual.crc ^ 0xFFFFFFFF).toBe(0xCBF43926)
+}
+
+function crcCarriesOn(): void {
+  const data = content(5000)
+  const first = new Crc32()
+  first.update(data.slice(0, 1234))
+  const more = new Crc32(first.crc)
+  more.update(data.slice(1234, 5000))
+  expect(more.crc).toBe(crc32Of(data))
+}
+
+async function downloadsAFileInOrderAndChecksIt(): Promise<void> throws Error {
+  const r = withLog(300_000)
+  const sink = new MemorySink()
+  let last = 0
+  const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 300_000, (bytes: int, _estimate: int) => {
+    expect(bytes >= last).toBe(true)
+    last = bytes
+  })
+  r.gcs.close()
+  expect(same(sink.bytes(), r.sim.fsFiles.get(LOG)!)).toBe(true)
+  expect(got.size).toBe(300_000)
+  expect(got.resumedFrom).toBe(0)
+  expect(got.verified).toBe(true)
+  expect(got.crc).toBe(crc32Of(r.sim.fsFiles.get(LOG)!))
+  expect(got.estimate).toBe(300_000)
+  expect(last).toBe(300_000)
+  // The session is closed again.
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function goesOnFromWhatTheSinkHolds(): Promise<void> throws Error {
+  // From a multiple of the read size (239), from the middle of a chunk, from nothing, and from the whole file.
+  const starts = [0, 239 * 100, 239 * 100 + 17, 1, 238, 239, 239 * 1255]
+  for (const startAt of starts) {
+    const r = withLog(300_000)
+    const file = r.sim.fsFiles.get(LOG)!
+    const sink = new MemorySink()
+    sink.parts.push(file.slice(0, startAt))
+    sink.total = startAt
+    const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, startAt, crc32Of(file.slice(0, startAt)), 300_000)
+    r.gcs.close()
+    expect(same(sink.bytes(), file)).toBe(true)
+    expect(got.resumedFrom).toBe(startAt)
+    expect(got.verified).toBe(true)
+    // The first burst began at the chunk that holds the byte after the ones held, not at the start of the file.
+    const bursts = r.sim.ftpLog.filter((line) => line.startsWith("15 "))
+    expect(bursts[0].includes(`o${startAt - startAt % 239}`)).toBe(true)
+  }
+}
+
+async function goesOnFromTheEndOfTheFile(): Promise<void> throws Error {
+  const r = withLog(2390)
+  const file = r.sim.fsFiles.get(LOG)!
+  const sink = new MemorySink()
+  sink.parts.push(file)
+  sink.total = file.length
+  const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, file.length, crc32Of(file), 2390)
+  r.gcs.close()
+  // Nothing more is written; the file is whole and checked.
+  expect(sink.writes).toBe(0)
+  expect(got.size).toBe(2390)
+  expect(got.verified).toBe(true)
+}
+
+async function cancelledThenResumedGivesTheSameBytes(): Promise<void> throws Error {
+  const r = withLog(150_000)
+  // Bursts of 100 packets, so that the file does not arrive in one go, and the cancel finds it part way.
+  r.sim.ftpStallAfter = 100
+  const file = r.sim.fsFiles.get(LOG)!
+  const sink = new MemorySink()
+  const stop = new AbortController()
+  const first = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 150, retries: 3, session: 7, signal: stop.signal })
+  try {
+    await downloadFile(first, LOG, sink, 0, 0, 150_000, (bytes: int, _estimate: int) => {
+      if (bytes > 40_000) {
+        stop.abort()
+      }
+    })
+    expect("downloaded").toBe("cancelled")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ABORTED")
+  }
+  expect(r.sim.openFtpSessions()).toBe(0)
+  // The sink holds a prefix of the file, no more than what arrived.
+  expect(sink.total > 0 && sink.total < 150_000).toBe(true)
+  expect(same(sink.bytes(), file.slice(0, sink.total))).toBe(true)
+  const held = sink.total
+  const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, held, crc32Of(sink.bytes()), 150_000)
+  r.gcs.close()
+  expect(same(sink.bytes(), file)).toBe(true)
+  expect(got.resumedFrom).toBe(held)
+  expect(got.verified).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function survivesALossyLink(): Promise<void> throws Error {
+  const r = withLog(100_000)
+  r.sim.ftpLoss = 5
+  const sink = new MemorySink()
+  const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 100, retries: 20, session: 7 }), LOG, sink, 0, 0, 100_000)
+  r.gcs.close()
+  expect(same(sink.bytes(), r.sim.fsFiles.get(LOG)!)).toBe(true)
+  expect(got.verified).toBe(true)
+  expect(got.reads + got.bursts > 1).toBe(true)
+}
+
+async function resumesOnALossyLinkToo(): Promise<void> throws Error {
+  const r = withLog(200_000)
+  r.sim.ftpLoss = 15
+  const file = r.sim.fsFiles.get(LOG)!
+  const sink = new MemorySink()
+  sink.parts.push(file.slice(0, 77_777))
+  sink.total = 77_777
+  await downloadFile(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 100, retries: 20, session: 7 }), LOG, sink, 77_777, crc32Of(file.slice(0, 77_777)), 200_000)
+  r.gcs.close()
+  expect(same(sink.bytes(), file)).toBe(true)
+}
+
+async function refusesAFileOfAnotherSize(): Promise<void> throws Error {
+  const r = withLog(5000)
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, new MemorySink(), 0, 0, 4000)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SIZE")
+  }
+  r.gcs.close()
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAWrongCrc(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpMode = "badcrc"
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, new MemorySink(), 0, 0, 5000)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_CRC")
+  }
+  r.gcs.close()
+}
+
+async function refusesAWrongCrcOfWhatWasHeldBefore(): Promise<void> throws Error {
+  // A resume whose CRC of the held part is wrong (the sink holds something else than the file's start) is caught at the end.
+  const r = withLog(5000)
+  const sink = new MemorySink()
+  const wrong = new Uint8Array(1000)
+  sink.parts.push(wrong)
+  sink.total = 1000
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 1000, crc32Of(wrong), 5000)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_CRC")
+  }
+  r.gcs.close()
+}
+
+async function isNotVerifiedWhenTheVehicleCannotGiveTheCrc(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpMode = "nocrc"
+  const sink = new MemorySink()
+  const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 5000)
+  r.gcs.close()
+  expect(same(sink.bytes(), r.sim.fsFiles.get(LOG)!)).toBe(true)
+  expect(got.verified).toBe(false)
+  expect(got.crcError.startsWith("FTP_UNKNOWN_COMMAND")).toBe(true)
+}
+
+async function doesNotAskForTheCrcWhenToldNot(): Promise<void> throws Error {
+  const r = withLog(5000)
+  const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, new MemorySink(), 0, 0, 5000, (_b: int, _e: int) => {}, 250, 0, 2_000_000_000, false)
+  r.gcs.close()
+  expect(got.verified).toBe(false)
+  expect(r.sim.ftpLog.filter((line) => line.startsWith("14 ")).length).toBe(0)
+}
+
+async function endsAsFtpSinkWhenTheSinkFails(): Promise<void> throws Error {
+  const r = withLog(100_000)
+  const sink = new MemorySink()
+  sink.failAt = 3
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 100_000)
+    expect("downloaded").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SINK")
+    expect(e.message.includes("no space left")).toBe(true)
+  }
+  r.gcs.close()
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileShorterThanWhatIsHeld(): Promise<void> throws Error {
+  const r = withLog(1000)
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 5000, 0, -1)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_PROTOCOL")
+  }
+  r.gcs.close()
+  expect(sink.writes).toBe(0)
+}
+
+async function failsForAFileThatIsNotThere(): Promise<void> throws Error {
+  const r = rig()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), "/APM/LOGS/NOPE.BIN", new MemorySink())
+    expect("downloaded").toBe("failed")
+  } catch (e: FtpError) {
+    expect(`${e.code} ${e.errno}`).toBe("FTP_ERRNO 2")
+  }
+  r.gcs.close()
+}
+
+async function givesUpOnAVehicleThatGoesQuiet(): Promise<void> throws Error {
+  const r = withLog(100_000)
+  r.sim.ftpMode = "silent"
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 50, retries: 1, session: 7 }), LOG, new MemorySink(), 0, 0, 100_000)
+    expect("downloaded").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+  }
+  r.gcs.close()
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function stopsWhenAPieceNeverArrives(): Promise<void> throws Error {
+  const r = withLog(400_000)
+  const file = r.sim.fsFiles.get(LOG)!
+  // The piece at 23900 is never sent; all the others arrive, again and again, burst after burst: that is no progress.
+  r.sim.ftpDrop = 239 * 100
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 60, retries: 2, session: 7 }), LOG, sink, 0, 0, 400_000)
+    expect("downloaded").toBe("stopped")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+  }
+  r.gcs.close()
+  // The file in order up to the missing piece is in the sink, and only that.
+  expect(sink.total).toBe(239 * 100)
+  expect(same(sink.bytes(), file.slice(0, 239 * 100))).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+  // Three bursts, not one for every chunk that arrived.
+  expect(r.sim.ftpBursts <= 4).toBe(true)
+}
+
+async function boundsWhatIsHeldAheadOfAMissingPiece(): Promise<void> throws Error {
+  const r = withLog(400_000)
+  r.sim.ftpDrop = 239 * 10
+  const sink = new MemorySink()
+  try {
+    // 20 000 bytes may be held ahead of the front; the burst brings far more.
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 60, retries: 5, session: 7 }), LOG, sink, 0, 0, -1, (_b: int, _e: int) => {}, 250, 0, 2_000_000_000, true, 30_000, 20_000)
+    expect("downloaded").toBe("stopped")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+    expect(e.message.includes("held beyond")).toBe(true)
+  }
+  r.gcs.close()
+  expect(sink.total).toBe(239 * 10)
+}
+
+async function refusesMoreDataThanExpectedAtOnce(): Promise<void> throws Error {
+  const r = withLog(2_000_000)
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 1000)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SIZE")
+  }
+  r.gcs.close()
+  // Nothing past the size expected reached the sink; the chunk that goes past it is refused whole.
+  expect(sink.total <= 1000).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileJustLongerThanExpected(): Promise<void> throws Error {
+  const r = withLog(5000)
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 4990)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SIZE")
+  }
+  r.gcs.close()
+  expect(sink.total <= 4990).toBe(true)
+}
+
+async function refusesAnEndlessVehicleWithTheSizeKnown(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpMode = "endless"
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 5000)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SIZE")
+  }
+  r.gcs.close()
+  expect(sink.total <= 5000).toBe(true)
+}
+
+async function endsTheSessionOfTheVehicleCrc(): Promise<void> throws Error {
+  const r = withLog(5000)
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const crc = await client.calcCrc32(LOG)
+  expect(crc).toBe(crc32Of(r.sim.fsFiles.get(LOG)!))
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
+  try {
+    await client.calcCrc32("/APM/LOGS/NOPE.BIN")
+    expect("asked").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ERRNO")
+  }
+  r.gcs.close()
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
+}
+
+async function asksForTheCrcOnce(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpMode = "silent"
+  try {
+    await new FtpClient(r.gcs, VEHICLE, { timeoutMs: 50, retries: 3, session: 7 }).calcCrc32(LOG, 120)
+    expect("asked").toBe("timed out")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+  }
+  r.gcs.close()
+  expect(r.sim.ftpLog.filter((line) => line.startsWith("14 ")).length).toBe(1)
+}
+
+async function takesAnEmptyFile(): Promise<void> throws Error {
+  const r = withLog(0)
+  const sink = new MemorySink()
+  const got = await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 0)
+  r.gcs.close()
+  expect(got.size).toBe(0)
+  expect(sink.total).toBe(0)
+  expect(got.verified).toBe(true)
+}
+
+describe("downloading a log over FTP", () => {
+  it("computes the CRC-32 ArduPilot gives (no inversion at either end)", crcMatchesTheBitByBitDefinition)
+  it("carries a CRC on over more bytes", crcCarriesOn)
+  it("downloads a file into the sink in order, and checks its size and the vehicle's CRC", downloadsAFileInOrderAndChecksIt)
+  it("goes on from what the sink holds: from a chunk border, the middle of a chunk, and the end of the file", goesOnFromWhatTheSinkHolds)
+  it("goes on from a sink that holds the whole file, and writes nothing", goesOnFromTheEndOfTheFile)
+  it("gives the same bytes when cancelled and resumed, and leaves no session open", cancelledThenResumedGivesTheSameBytes)
+  it("downloads on a link that loses packets", survivesALossyLink)
+  it("resumes on a link that loses packets", resumesOnALossyLinkToo)
+  it("refuses a file of another size than the one expected", refusesAFileOfAnotherSize)
+  it("refuses a CRC that is not the bytes' (FTP_CRC)", refusesAWrongCrc)
+  it("catches a resume whose held part is not the file's start", refusesAWrongCrcOfWhatWasHeldBefore)
+  it("is not verified when the vehicle cannot give the CRC, and says why", isNotVerifiedWhenTheVehicleCannotGiveTheCrc)
+  it("does not ask for the CRC when told not to", doesNotAskForTheCrcWhenToldNot)
+  it("ends as FTP_SINK when the sink fails, and closes the session", endsAsFtpSinkWhenTheSinkFails)
+  it("refuses a file shorter than what the sink holds, and writes nothing", refusesAFileShorterThanWhatIsHeld)
+  it("fails for a file that is not there", failsForAFileThatIsNotThere)
+  it("gives up on a vehicle that goes quiet, and closes the session", givesUpOnAVehicleThatGoesQuiet)
+  it("stops after a few bursts when one piece never arrives, keeping the file in order up to it", stopsWhenAPieceNeverArrives)
+  it("bounds what is held ahead of a piece that never arrives", boundsWhatIsHeldAheadOfAMissingPiece)
+  it("refuses a file longer than expected as the data arrives, writing nothing past the size", refusesMoreDataThanExpectedAtOnce)
+  it("refuses a file just longer than expected", refusesAFileJustLongerThanExpected)
+  it("refuses a vehicle that sends data without end when the size is known", refusesAnEndlessVehicleWithTheSizeKnown)
+  it("ends the vehicle's session after asking for a CRC, also when that fails", endsTheSessionOfTheVehicleCrc)
+  it("asks for the CRC once, so that the wait is bounded", asksForTheCrcOnce)
+  it("takes an empty file", takesAnEmptyFile)
+})

@@ -1,0 +1,248 @@
+// Downloading a big file (a flight log) over MAVLink FTP into a sink, in order, without holding it in memory, and going on from what
+// an earlier try left in the sink.
+//
+// It uses the same burst reads as `readFile` (ftpread.pi), but a chunk is passed to the sink as soon as it and everything before it
+// have arrived, and then let go: memory holds only the chunks that arrived ahead of a gap (a burst has at most a few thousand). The
+// sink is written strictly in order, so what it holds at any moment is a prefix of the file; after a cancel, a failure or a lost
+// link the caller starts again with `startAt` = the bytes the sink holds, and the download goes on from there.
+//
+// Checks: the size at the end is the one the caller expected (the listing's), and the CRC-32 the vehicle computes for the file
+// (CalcFileCRC32) is the one computed over the bytes written. A vehicle that cannot compute it gives a download that is not
+// `verified`: the caller must not take it for a log that is known to be whole (and must not erase the log on the vehicle).
+//
+// Never download while the vehicle is armed: that is the caller's rule (the vehicle's FTP and its logging compete for the card).
+import { Crc32 } from "./crc32"
+import { FtpClient, FtpError } from "./ftp"
+import { ReadState, burst, cancelled, fill } from "./ftpread"
+
+/// Where the bytes of a download go, in order.
+export interface FileSink {
+  /// Takes the next bytes of the file. What it throws (a full disk) ends the download as `FTP_SINK`.
+  write(bytes: Uint8Array): Promise<void, Error>
+}
+
+/// A download, and how it went.
+export class FileDownload {
+  /// The size of the file now in the sink (bytes).
+  public readonly size: int
+  /// Where this download began: the bytes the sink held before it.
+  public readonly resumedFrom: int
+  /// The CRC-32 of the whole file (see `Crc32`).
+  public readonly crc: int
+  /// Whether the vehicle's own CRC-32 of the file was asked for and is `crc`. False when the vehicle could not give it (see
+  /// `crcError`): the file is whole by its size, and not checked.
+  public readonly verified: bool
+  /// Why the CRC could not be checked, or "".
+  public readonly crcError: string
+  /// The size the vehicle gave on opening.
+  public readonly estimate: int
+  public readonly bursts: int
+  public readonly reads: int
+  public readonly packets: int
+  public readonly elapsedMs: int
+
+  constructor(
+    size: int, resumedFrom: int, crc: int, verified: bool, crcError: string, estimate: int,
+    bursts: int, reads: int, packets: int, elapsedMs: int,
+  ) {
+    this.size = size
+    this.resumedFrom = resumedFrom
+    this.crc = crc
+    this.verified = verified
+    this.crcError = crcError
+    this.estimate = estimate
+    this.bursts = bursts
+    this.reads = reads
+    this.packets = packets
+    this.elapsedMs = elapsedMs
+  }
+}
+
+/// Passes on what has arrived in order, and keeps the CRC of it.
+class Flusher {
+  public readonly sink: FileSink
+  public readonly crc: Crc32
+  /// How many bytes of the file the sink holds.
+  public pos: int
+
+  constructor(sink: FileSink, crc: Crc32, pos: int) {
+    this.sink = sink
+    this.crc = crc
+    this.pos = pos
+  }
+
+  /// Writes every chunk that is next in order, and lets it go.
+  public async flush(s: ReadState): Promise<void> throws FtpError {
+    while (true) {
+      const key = pos - pos % s.size
+      const chunk = s.chunks.get(key)
+      if (chunk == null) {
+        return
+      }
+      // The first chunk of a download that goes on may begin before what the sink holds.
+      const skip = pos - key
+      if (skip > chunk!.length) {
+        throw new FtpError("FTP_PROTOCOL", `the chunk at ${key} has ${chunk!.length} bytes, and ${pos - key} of it are already held`)
+      }
+      const part = if (skip == 0) chunk! else chunk!.slice(skip, chunk!.length)
+      if (part.length > 0) {
+        try {
+          await sink.write(part)
+        } catch (e: Error) {
+          throw new FtpError("FTP_SINK", `writing the file: ${e.message}`)
+        }
+        crc.update(part)
+        pos += part.length
+      }
+      s.chunks.delete(key)
+      if (chunk!.length < s.size) {
+        return
+      }
+    }
+  }
+}
+
+/// Rounds of bursts and gap-filling, passing the data on after each, until the file is whole.
+async function rounds(client: FtpClient, s: ReadState, f: Flusher, estimate: int, silenceMs: int, maxAhead: int, progress: (bytes: int, estimate: int) => void throws Error, counts: int[]): Promise<void> throws FtpError {
+  let stalls = 0
+  while (!s.complete()) {
+    if (client.aborted()) {
+      throw cancelled()
+    }
+    // Progress is the FRONT moving (the file in order), not chunks arriving ahead of a gap that never closes.
+    const before = s.front
+    counts[0] += 1
+    await burst(client, s, s.front, silenceMs, progress, estimate)
+    if (s.failure != null) {
+      throw s.failure!
+    }
+    if (client.aborted()) {
+      throw cancelled()
+    }
+    if (s.late() && !s.complete()) {
+      throw new FtpError("FTP_TIMEOUT", `the file is not whole after the time given for it (${s.bytes} bytes so far)`)
+    }
+    const holes = s.holes(4)
+    if (!s.complete() && holes.length > 0 && holes.length <= 4) {
+      for (const at of holes) {
+        counts[1] += 1
+        await fill(client, s, at)
+      }
+      if (s.failure != null) {
+        throw s.failure!
+      }
+    }
+    await f.flush(s)
+    stalls = if (s.front == before) stalls + 1 else 0
+    if (stalls > client.retries) {
+      throw new FtpError("FTP_TIMEOUT", `no progress reading the file at ${s.front} after ${stalls} bursts`)
+    }
+    // What is held ahead of the front is bounded: a piece that never arrives must not make the rest pile up in memory.
+    if (s.chunks.size * s.size > maxAhead) {
+      throw new FtpError("FTP_TIMEOUT", `the chunk at ${s.front} does not arrive, and ${s.chunks.size * s.size} bytes are held beyond it`)
+    }
+  }
+  await f.flush(s)
+}
+
+/// A download that is cancelled or runs out of time keeps what has arrived in order: it goes to the sink, so that the next try
+/// goes on from there. (After any other failure the chunks are not trusted, and the sink keeps what it has.)
+async function keepWhatArrived(f: Flusher, s: ReadState, e: Error): Promise<void> {
+  if (e instanceof FtpError && (e.code == "FTP_ABORTED" || e.code == "FTP_TIMEOUT")) {
+    try {
+      await f.flush(s)
+    } catch (x: FtpError) {
+    }
+  }
+}
+
+/// Downloads `path` into `sink`, in order, from the byte `startAt` on (the bytes the sink holds already, 0 for a new file).
+///   - `crcAtStart` is the CRC-32 (see `Crc32`) of those first `startAt` bytes: the caller computes it from what it holds;
+///   - `expectedSize` is the size the file should have (the listing's), or -1 for no check: a file of another size ends the
+///     download as `FTP_SIZE`, the bytes already written stay in the sink and are not to be trusted as that log;
+///   - `progress(bytes, estimate)` is told how many bytes of the file have arrived, `estimate` being the size the vehicle gave on
+///     opening;
+///   - `silenceMs`, `retries` of the client and `deadlineMs` bound a vehicle that goes quiet or does not stop. The deadline is for
+///     the whole download: 0 (the default) is none, so that a big log has the time it needs (`readFile` has 120 s);
+///   - `maxBytes` bounds the file (default 2 GB; offsets in FTP are 32 bits), `checkCrc` asks the vehicle for its CRC at the end
+///     (waiting `crcWaitMs` for it, as it reads the whole file to compute it, asked once);
+///   - progress is the file coming in ORDER: a link that sends pieces ahead of one that never arrives stops the download after
+///     `retries + 1` bursts, and what is held ahead of that piece is bounded by `maxAheadBytes` (16 MB), both as `FTP_TIMEOUT`;
+///   - `expectedSize` also bounds the data: a file longer than expected is refused as it arrives (`FTP_SIZE`), never written to the
+///     sink past it.
+/// The bytes of the first chunk that the sink holds already (a resume does not start at a chunk border) are skipped, NOT compared
+/// with what the sink holds: a file that changed on the vehicle since the earlier try is caught by the CRC at the end, after the
+/// rest was downloaded. Callers that can read the sink back may compare those bytes themselves before they go on.
+/// Failures: `FTP_ABORTED` (the client's signal; the sink holds a prefix, and `startAt` can go on from it), `FTP_TIMEOUT`,
+/// `FTP_PROTOCOL` (a vehicle that contradicts itself, or a file shorter than what is held), `FTP_SIZE`, `FTP_CRC` (the vehicle's CRC
+/// is not the one of the bytes written: the file is bad, start it again from 0), `FTP_SINK` (the sink failed), `FTP_CALLBACK`, and
+/// whatever a Nack says (`FTP_NOT_FOUND` ...). The session is terminated whatever ends the download.
+export async function downloadFile(
+  client: FtpClient,
+  path: string,
+  sink: FileSink,
+  startAt: int = 0,
+  crcAtStart: int = 0,
+  expectedSize: int = -1,
+  progress: (bytes: int, estimate: int) => void throws Error = (_bytes: int, _estimate: int) => {},
+  silenceMs: int = 250,
+  deadlineMs: int = 0,
+  maxBytes: int = 2_000_000_000,
+  checkCrc: bool = true,
+  crcWaitMs: int = 30_000,
+  maxAheadBytes: int = 16_777_216,
+): Promise<FileDownload> throws FtpError {
+  const started = Date.now() as int
+  if (startAt < 0) {
+    throw new FtpError("FTP_PROTOCOL", `a download cannot start at ${startAt}`)
+  }
+  const from = startAt - startAt % client.readSize
+  const s = new ReadState(client.readSize, client.session, client.target, maxBytes, from)
+  // A file that is longer than the size expected is refused as the data arrives, not after it was all written.
+  if (expectedSize >= 0 && expectedSize < maxBytes) {
+    s.max = expectedSize
+    s.maxCode = "FTP_SIZE"
+  }
+  s.deadline = if (deadlineMs > 0) started + deadlineMs else 0
+  const f = new Flusher(sink, new Crc32(crcAtStart), startAt)
+  const counts: int[] = [0, 0]
+  let estimate = 0
+  try {
+    await client.reset()
+    estimate = await client.open(path)
+    await rounds(client, s, f, estimate, silenceMs, maxAheadBytes, (bytes: int, est: int) => progress(from + bytes, est), counts)
+  } catch (e: Error) {
+    await keepWhatArrived(f, s, e)
+    await client.terminate()
+    if (e instanceof FtpError) {
+      throw e
+    }
+    throw new FtpError("FTP_PROTOCOL", `downloading ${path}: ${e.message}`)
+  }
+  await client.terminate()
+  if (s.end < startAt) {
+    throw new FtpError("FTP_PROTOCOL", `${path} has ${s.end} bytes, and the sink holds ${startAt} of it`)
+  }
+  if (expectedSize >= 0 && s.end != expectedSize) {
+    throw new FtpError("FTP_SIZE", `${path} has ${s.end} bytes, not the ${expectedSize} that were expected`)
+  }
+  let verified = false
+  let crcError = ""
+  if (checkCrc) {
+    try {
+      const theirs = await client.calcCrc32(path, crcWaitMs)
+      if (theirs != f.crc.crc) {
+        throw new FtpError("FTP_CRC", `${path}: the vehicle's CRC is ${theirs}, the bytes written have ${f.crc.crc}`)
+      }
+      verified = true
+    } catch (e: FtpError) {
+      if (e.code == "FTP_CRC" || e.code == "FTP_ABORTED") {
+        throw e
+      }
+      crcError = `${e.code}: ${e.message}`
+    }
+  } else {
+    crcError = "not asked for"
+  }
+  new FileDownload(s.end, startAt, f.crc.crc, verified, crcError, estimate, counts[0], counts[1], s.packets, (Date.now() as int) - started)
+}
