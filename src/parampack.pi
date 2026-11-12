@@ -342,7 +342,8 @@ function writeHeader(out: int[], magic: int, count: int, total: int): void {
 }
 
 /// Whether the `values` values of `size` bytes, starting `valueFrom` bytes into an entry that starts at `start`, cross a multiple
-/// of `readSize`.
+/// of `readSize`. (Only the values count, not the whole entry: in ArduCopter's own file no value crosses an edge of a 239 byte
+/// read, and a name does in some tens of its entries, with the padding no more than the few bytes that keep a value whole.)
 function crosses(start: int, valueFrom: int, size: int, values: int, readSize: int): bool {
   if (size < 2) {
     return false
