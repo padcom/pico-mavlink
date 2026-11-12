@@ -1,0 +1,38 @@
+// The CRC-32 that ArduPilot gives for a file (MAVLink FTP CalcFileCRC32): the usual polynomial (0xEDB88320, reflected) but with
+// no inversion at the start and none at the end, as ArduPilot's `crc_crc32` computes it. It is a running value: the CRC of a
+// file is the CRC of its first part carried on over the rest, so a download that goes on from what an earlier try fetched
+// continues from the CRC of what it holds.
+
+/// A running CRC-32.
+export class Crc32 {
+  readonly table: int[] = []
+  /// The CRC of the bytes given so far (32 bits); `initial` is the CRC of the bytes before them.
+  public crc: int
+
+  constructor(initial: int = 0) {
+    this.crc = initial & 0xFFFFFFFF
+    for (let i = 0; i < 256; i++) {
+      let c = i
+      for (let k = 0; k < 8; k++) {
+        c = if ((c & 1) != 0) 0xEDB88320 ^ (c >> 1) else c >> 1
+      }
+      table.push(c)
+    }
+  }
+
+  /// Takes more bytes into the CRC.
+  public update(b: Uint8Array): void {
+    let c = crc
+    for (let i = 0; i < b.length; i++) {
+      c = table[(c ^ (b[i] as int)) & 0xFF] ^ (c >> 8)
+    }
+    crc = c & 0xFFFFFFFF
+  }
+}
+
+/// The CRC of `b` in one go.
+export function crc32Of(b: Uint8Array): int {
+  const c = new Crc32()
+  c.update(b)
+  c.crc
+}

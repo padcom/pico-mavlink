@@ -427,11 +427,12 @@ export class FtpClient {
   /// Nack; what a Nack means is for the caller. `FTP_TIMEOUT` when nothing answers, `FTP_ABORTED` when cancelled. A `quiet` call
   /// is what runs after a cancel, to leave the vehicle's session closed: it ignores the cancel, asks once, and waits only
   /// briefly.
-  public async call(opcode: int, session: int, offset: int, data: Uint8Array, size: int, quiet: bool = false): Promise<FtpPacket> throws FtpError {
+  public async call(opcode: int, session: int, offset: int, data: Uint8Array, size: int, quiet: bool = false, waitMs: int = 0): Promise<FtpPacket> throws FtpError {
     const mine = nextSeq()
     const message = ftpMessage(target, request(mine, session, opcode, offset, data, size))
     const tries = if (quiet) 0 else retries
-    const wait = if (quiet && timeoutMs > 500) 500 else timeoutMs
+    // `waitMs` is for a request the vehicle takes long to answer (the CRC of a big file); a quiet call is always brief.
+    const wait = if (quiet && timeoutMs > 500) 500 else if (waitMs > 0 && !quiet) waitMs else timeoutMs
     const ignoreAbort = quiet
     for (let attempt = 0; attempt <= tries; attempt++) {
       if (!ignoreAbort && aborted()) {
@@ -592,6 +593,25 @@ export class FtpClient {
       }
     }
     all
+  }
+
+  /// The CRC-32 of the file `path`, computed by the vehicle (CalcFileCRC32; see `Crc32` for which CRC-32 it is). The vehicle reads the
+  /// whole file to compute it, so a big one takes a while: `waitMs` is how long to wait for the answer (default 30 s), and it is
+  /// asked again after that, up to the client's retries. `FTP_UNKNOWN_COMMAND` from a vehicle that cannot do it; `FTP_NOT_FOUND` or
+  /// `FTP_ERRNO` for a file that is not there. No session is needed.
+  public async calcCrc32(path: string, waitMs: int = 30_000): Promise<int> throws FtpError {
+    const name = new TextEncoder().encode(path)
+    if (name.length > FTP_MAX_DATA) {
+      throw new FtpError("FTP_PROTOCOL", `the path is ${name.length} bytes: at most ${FTP_MAX_DATA}`)
+    }
+    const r = await call(FtpOpcode.CALC_FILE_CRC32, 0, 0, name, name.length, false, waitMs)
+    if (r.opcode == FtpOpcode.NACK) {
+      throw errorOfNack(`the CRC of ${path}`, r)
+    }
+    if (r.data.length < 4) {
+      throw new FtpError("FTP_PROTOCOL", `the CRC of ${path}: the reply has ${r.data.length} bytes, the CRC needs 4`)
+    }
+    readUint(r.data, 0, 4)
   }
 
   /// Ends this client's session on the vehicle. Always call it when done, also after an error or a cancel (it is sent after a

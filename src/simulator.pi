@@ -13,6 +13,7 @@ import { Target } from "./operations"
 import { MavLinkProtocolV2 } from "./protocol"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam } from "./params"
 import { PackedParam, ParamPackError, encodeParamPack } from "./parampack"
+import { Crc32 } from "./crc32"
 import { FTP_MAX_DATA, FtpError, FtpNack, FtpOpcode, FtpPacket, ftpMessage, ftpPacketOf } from "./ftp"
 import { ByteStream } from "./stream"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
@@ -157,7 +158,7 @@ export class SimulatedAutopilot {
   /// How the FTP server misbehaves, for tests: `ok`; `unsupported` (every open fails with ENOENT, though the capability is set);
   /// `silent` (it never answers an FTP request); `corrupt` (the file has a wrong magic); `incomplete` (the file says the vehicle
   /// has more parameters than it holds); `busy` (every open: no session free); `einval` (every read: EINVAL); `repeat` and `endless` (a burst that sends the first chunk again and again, or chunks at
-  /// ever higher offsets with no end, until the mode is changed); `oldlist` (firmware without ListDirectoryWithTime: UNKNOWN_COMMAND), `relist` and `emptylist` (a listing that repeats its first page, or answers with
+  /// ever higher offsets with no end, until the mode is changed); `oldlist` (firmware without ListDirectoryWithTime: UNKNOWN_COMMAND), `nocrc` (no CalcFileCRC32) and `badcrc` (a wrong CRC), `relist` and `emptylist` (a listing that repeats its first page, or answers with
   /// nothing and no end).
   public ftpMode: string = "ok"
   /// The share of FTP packets it drops on their way out, in percent (a lossy link), from a seeded sequence.
@@ -512,6 +513,8 @@ export class SimulatedAutopilot {
     } else if (req.opcode == FtpOpcode.LIST_DIRECTORY_WITH_TIME && ftpMode != "oldlist") {
       // Firmware from before ListDirectoryWithTime (mode `oldlist`) does not know the opcode.
       ftpList(ask, true)
+    } else if (req.opcode == FtpOpcode.CALC_FILE_CRC32) {
+      ftpCrc(ask)
     } else if (req.opcode == FtpOpcode.READ_FILE) {
       ftpRead(ask)
     } else if (req.opcode == FtpOpcode.BURST_READ_FILE) {
@@ -640,6 +643,33 @@ export class SimulatedAutopilot {
     ftpReply(ask, FtpOpcode.ACK, data, req.seq + 1, req.offset, false)
   }
 
+  /// CalcFileCRC32 of a file of the file system: the Ack carries the CRC-32 (see `Crc32`) of its bytes in 4 bytes. ENOENT for a
+  /// file that is not there; UNKNOWN_COMMAND in the mode `nocrc` (firmware without it); a wrong CRC in the mode `badcrc`.
+  ftpCrc(ask: FtpAsk): void {
+    if (ftpMode == "nocrc") {
+      ftpNack(ask, FtpNack.UNKNOWN_COMMAND)
+      return
+    }
+    let name = ""
+    try {
+      name = new TextDecoder().decode(ask.req.data)
+    } catch (e: TypeError) {
+    }
+    const file = fsFiles.get(name)
+    if (file == null) {
+      ftpNack(ask, FtpNack.FAIL_ERRNO, 2)
+      return
+    }
+    const c = new Crc32()
+    c.update(file!)
+    const crc = if (ftpMode == "badcrc") c.crc ^ 1 else c.crc
+    const data = new Uint8Array(4)
+    for (let i = 0; i < 4; i++) {
+      data.set(i, (crc >> (8 * i)) & 0xFF)
+    }
+    ftpReply(ask, FtpOpcode.ACK, data, ask.req.seq + 1, 0, false)
+  }
+
   /// OpenFileRO of "@PARAM/param.pck" (with the query `?start=N&count=C&withdefaults=1`, all optional): the Ack carries the
   /// file's size, which is an estimate (12 bytes a parameter), as the vehicle's is. A path that is not that file is ENOENT
   /// (FailErrno), a session that has a file open and was used in the last 3 s is `Fail` (one file per session).
@@ -679,6 +709,17 @@ export class SimulatedAutopilot {
     } catch (e: TypeError) {
     }
     const parts = name.split("?")
+    // A file of the file system: its real size, and its bytes as they are.
+    const stored = fsFiles.get(name)
+    if (stored != null) {
+      ftpSessions.set(req.session, new FtpSession(req.session, stored!))
+      const real = new Uint8Array(4)
+      for (let i = 0; i < 4; i++) {
+        real.set(i, (stored!.length >> (8 * i)) & 0xFF)
+      }
+      ftpReply(ask, FtpOpcode.ACK, real, req.seq + 1, 0, false)
+      return
+    }
     if (parts[0] != "@PARAM/param.pck") {
       // ENOENT, as the vehicle's filesystem says it.
       ftpNack(ask, FtpNack.FAIL_ERRNO, 2)
