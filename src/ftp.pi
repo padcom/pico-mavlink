@@ -521,11 +521,16 @@ export class FtpClient {
   /// (a page that repeats), a name that is not UTF-8, or a listing longer than `FTP_MAX_ENTRIES` is `FTP_PROTOCOL`.
   ///
   /// Times: ArduPilot gives them to its own ListDirectoryWithTime (opcode 16) only, never to ListDirectory (3). So that is asked
-  /// first; a vehicle that does not know it (a Nack UNKNOWN_COMMAND) is asked with the plain one, and the client remembers that.
-  /// An entry has a time only when the vehicle gave one (a 0 is no time).
+  /// first; a vehicle that does not take it is asked with the plain one, and the client remembers that. "Does not take it" is a
+  /// Nack UNKNOWN_COMMAND, and also a Nack FAIL: the firmware that CI builds (Copter-4.7.2) answers the opcode it has no code
+  /// for with Fail. An entry has a time only when the vehicle gave one (a 0 is no time).
   ///
-  /// The server keeps a listing open (a slot with the session number 0) for about 20 s: it is ended with a terminate after the
-  /// last page, and also after a failure or a cancel.
+  /// A listing begins with a ResetSessions (every session this client has on the vehicle is closed: a parameter download or an
+  /// earlier listing may have left one), and a plain listing that is answered with Fail is asked once more after another reset.
+  /// An error names the opcode that was used.
+  ///
+  /// The server keeps a listing open (a slot with the session number 0) for a while: it is ended with a terminate after the last
+  /// page, and also after a failure or a cancel.
   public async listDirectory(path: string): Promise<FtpEntry[]> throws FtpError {
     const name = new TextEncoder().encode(path)
     if (name.length > FTP_MAX_DATA) {
@@ -533,6 +538,7 @@ export class FtpClient {
     }
     let entries: FtpEntry[] = []
     try {
+      await resetQuietly()
       entries = await listWithOrWithoutTime(path, name)
     } catch (e: FtpError) {
       await endSession(0)
@@ -545,6 +551,18 @@ export class FtpClient {
   /// 0: it is not known yet whether the vehicle has ListDirectoryWithTime; 1: it has; 2: it has not (the plain one is used).
   public listMode: int = 0
 
+  /// Closes the sessions this client has on the vehicle; a vehicle that does not answer is left to the listing to say so (only a
+  /// cancel is passed on).
+  async resetQuietly(): Promise<void> throws FtpError {
+    try {
+      await reset()
+    } catch (e: FtpError) {
+      if (e.code == "FTP_ABORTED") {
+        throw e
+      }
+    }
+  }
+
   async listWithOrWithoutTime(path: string, name: Uint8Array): Promise<FtpEntry[]> throws FtpError {
     if (listMode != 2) {
       try {
@@ -552,25 +570,41 @@ export class FtpClient {
         listMode = 1
         return entries
       } catch (e: FtpError) {
-        if (e.code != "FTP_UNKNOWN_COMMAND") {
+        // An opcode the firmware has no code for: Nack UNKNOWN_COMMAND, or Fail (Copter-4.7.2 answers that way).
+        if (e.code != "FTP_UNKNOWN_COMMAND" && e.code != "FTP_FAILED") {
           throw e
         }
         listMode = 2
+        await resetQuietly()
       }
     }
+    await listPlain(path, name)
+  }
+
+  /// The plain listing; a Fail is asked again once, after a reset of the sessions.
+  async listPlain(path: string, name: Uint8Array): Promise<FtpEntry[]> throws FtpError {
+    try {
+      return await listPages(path, name, FtpOpcode.LIST_DIRECTORY)
+    } catch (e: FtpError) {
+      if (e.code != "FTP_FAILED") {
+        throw e
+      }
+    }
+    await resetQuietly()
     await listPages(path, name, FtpOpcode.LIST_DIRECTORY)
   }
 
   /// All the pages of a listing, asked with `opcode` (ListDirectory or ListDirectoryWithTime).
   async listPages(path: string, name: Uint8Array, opcode: int): Promise<FtpEntry[]> throws FtpError {
     const withTime = opcode == FtpOpcode.LIST_DIRECTORY_WITH_TIME
+    const what = if (withTime) "ListDirectoryWithTime" else "ListDirectory"
     const all: FtpEntry[] = []
     const seen = new Set<string>()
     let skip = 0
     while (true) {
       const r = await call(opcode, 0, skip, name, name.length)
       if (r.opcode == FtpOpcode.NACK) {
-        const e = errorOfNack(`listing ${path}`, r)
+        const e = errorOfNack(`listing ${path} with ${what}`, r)
         if (e.code == "FTP_EOF") {
           break
         }
@@ -610,6 +644,11 @@ export class FtpClient {
     let r: FtpPacket
     try {
       r = await call(FtpOpcode.CALC_FILE_CRC32, 0, 0, name, name.length, false, waitMs)
+      // A Fail is asked once more after a reset of the sessions (one this client left may be what the vehicle objects to).
+      if (r.opcode == FtpOpcode.NACK && byteAt(r.data, 0) == FtpNack.FAIL) {
+        await resetQuietly()
+        r = await call(FtpOpcode.CALC_FILE_CRC32, 0, 0, name, name.length, false, waitMs)
+      }
     } catch (e: FtpError) {
       await endSession(0)
       throw e

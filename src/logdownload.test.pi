@@ -451,6 +451,32 @@ async function asksForTheCrcOnce(): Promise<void> throws Error {
   expect(r.sim.ftpLog.filter((line) => line.startsWith("14 ")).length).toBe(1)
 }
 
+async function asksForTheCrcAgainOnFailAfterAReset(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpFailCrcs = 1
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const crc = await client.calcCrc32(LOG)
+  r.gcs.close()
+  expect(crc).toBe(crc32Of(r.sim.fsFiles.get(LOG)!))
+  // Asked, refused, a reset, asked again; the session is ended.
+  const lines = r.sim.ftpLog.filter((line) => line.startsWith("14 ") || line.startsWith("2 "))
+  expect(lines.map((line) => line.split(" ")[0]).join(",")).toBe("14,2,14")
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
+}
+
+async function failsWhenTheCrcStaysRefused(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpFailCrcs = 5
+  try {
+    await new FtpClient(r.gcs, VEHICLE, FAST).calcCrc32(LOG)
+    expect("asked").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_FAILED")
+  }
+  r.gcs.close()
+  expect(r.sim.ftpLog.filter((line) => line.startsWith("14 ")).length).toBe(2)
+}
+
 async function takesAnEmptyFile(): Promise<void> throws Error {
   const r = withLog(0)
   const sink = new MemorySink()
@@ -486,5 +512,7 @@ describe("downloading a log over FTP", () => {
   it("refuses a vehicle that sends data without end when the size is known", refusesAnEndlessVehicleWithTheSizeKnown)
   it("ends the vehicle's session after asking for a CRC, also when that fails", endsTheSessionOfTheVehicleCrc)
   it("asks for the CRC once, so that the wait is bounded", asksForTheCrcOnce)
+  it("asks for the CRC again once when it is answered with Fail, after a reset of the sessions", asksForTheCrcAgainOnFailAfterAReset)
+  it("fails when the CRC stays refused with Fail, after two asks", failsWhenTheCrcStaysRefused)
   it("takes an empty file", takesAnEmptyFile)
 })
