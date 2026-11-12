@@ -1,0 +1,340 @@
+// The tlog reader and its writer: a recording round-trips at any chunk size; garbage in the middle costs the garbage; a frame with a
+// wrong CRC, an unknown message, a signed frame, a step in time and a date that cannot be real are counted as what they are; a file
+// cut at any byte is `cutEnd`, not damage; and hostile files (huge length fields, one repeated byte, random bytes) end, keep every
+// byte accounted for and hold no more than a record.
+import { describe, it, expect } from "std/test"
+import { Heartbeat, MavType } from "./dialects/minimal"
+import { ParamValue, SysStatus } from "./dialects/common"
+import { TLOG_MAX_FRAME, TLOG_TIMESTAMP_LENGTH, TlogReader, TlogRecord, TlogWriter, signedCopy } from "./tlog"
+import { MavLinkProtocolV2 } from "./protocol"
+
+/// 2026-11-12 in microseconds since 1970, and a second.
+const T0: int = 1794500000000000
+const SECOND: int = 1000000
+
+function heartbeat(): Heartbeat {
+  const h = new Heartbeat()
+  h.type = MavType.QUADROTOR as u8
+  h.mavlinkVersion = 3
+  h
+}
+
+/// The bytes of a list of numbers.
+function bytesOf(list: int[]): Uint8Array {
+  const out = new Uint8Array(list.length)
+  for (let i = 0; i < list.length; i++) {
+    out.set(i, list[i])
+  }
+  out
+}
+
+/// What a reader found of a file fed in chunks.
+class Read {
+  public readonly records: TlogRecord[] = []
+  public readonly reader: TlogReader
+
+  constructor(reader: TlogReader) {
+    this.reader = reader
+  }
+}
+
+/// Reads the file `chunk` bytes at a time, taking every record out before the next chunk is fed, then finishes.
+function readAll(bytes: Uint8Array, chunk: int): Read {
+  const out = new Read(new TlogReader({ nowUs: T0 + 400 * SECOND }))
+  let at = 0
+  while (at < bytes.length) {
+    const end = if (at + chunk < bytes.length) at + chunk else bytes.length
+    out.reader.push(bytes.slice(at, end))
+    at = end
+    while (true) {
+      const r = out.reader.next()
+      if (r == null) {
+        break
+      }
+      out.records.push(r!)
+    }
+  }
+  out.reader.finish()
+  out
+}
+
+/// Every byte fed is in a record, in a skipped unknown frame, skipped as no record, or cut off at the end.
+function accounted(r: TlogReader): bool {
+  const p = r.report
+  p.bytesFed == p.bytesInRecords + p.bytesUnknown + p.bytesSkipped + p.bytesCut + r.waiting
+}
+
+/// A recording of three messages a second apart, as MAVLink 2 and then MAVLink 1.
+function smallRecording(): TlogWriter {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1, true, 1, 1)
+  w.addMessage(T0 + SECOND, new SysStatus(), 2, true, 1, 1)
+  w.addMessage(T0 + 2 * SECOND, new ParamValue(), 3, false, 1, 1)
+  w
+}
+
+function roundTripsAtAnyChunkSize(): void {
+  const bytes = smallRecording().bytes()
+  for (const chunk of [1, 5, 17, 1000000]) {
+    const got = readAll(bytes, chunk)
+    expect(got.records.length).toBe(3)
+    expect(got.records.map((r) => `${r.timeUs - T0}/${r.msgid}/${r.seq}/${if (r.v2) 2 else 1}`).join(" ")).toBe("0/0/1/2 1000000/1/2/2 2000000/22/3/1")
+    expect(got.reader.report.records).toBe(3)
+    expect(got.reader.report.v1).toBe(1)
+    expect(got.reader.report.v2).toBe(2)
+    expect(got.reader.report.signed).toBe(0)
+    expect(got.reader.report.segments).toBe(1)
+    expect(got.reader.report.dated).toBe(true)
+    expect(got.reader.report.cutEnd).toBe(false)
+    expect(got.reader.report.bytesSkipped).toBe(0)
+    expect(got.reader.report.byId.get(1)).toBe(1)
+    expect(accounted(got.reader)).toBe(true)
+    expect(got.reader.report.firstUs).toBe(T0)
+    expect(got.reader.report.lastUs).toBe(T0 + 2 * SECOND)
+  }
+}
+
+function givesTheFrameAsItWasOnTheWire(): void {
+  const w = new TlogWriter()
+  const proto = new MavLinkProtocolV2(7, 9)
+  const frame = proto.serialize(heartbeat(), 5)
+  w.add(T0, frame)
+  const got = readAll(w.bytes(), 3)
+
+  expect(got.records.length).toBe(1)
+  expect(got.records[0].frame.length).toBe(frame.length)
+  expect(got.records[0].sysid).toBe(7)
+  expect(got.records[0].compid).toBe(9)
+  expect(got.records[0].payload().length).toBe(frame[1] as int)
+  let same = true
+  for (let i = 0; i < frame.length; i++) {
+    same = same && got.records[0].frame[i] == frame[i]
+  }
+  expect(same).toBe(true)
+}
+
+function skipsGarbageInTheMiddleAndFindsTheNextRecord(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1)
+  const noise = new Uint8Array(37)
+  for (let i = 0; i < 37; i++) {
+    noise.set(i, (i * 29 + 3) % 256)
+  }
+  w.raw(noise)
+  w.addMessage(T0 + SECOND, heartbeat(), 2)
+  const got = readAll(w.bytes(), 11)
+
+  expect(got.records.map((r) => r.seq).join(",")).toBe("1,2")
+  expect(got.reader.report.bytesSkipped >= 37).toBe(true)
+  expect(got.reader.report.cutEnd).toBe(false)
+  expect(accounted(got.reader)).toBe(true)
+}
+
+function countsAFrameWithAWrongCrcAndGoesOn(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1)
+  const bad = new MavLinkProtocolV2(1, 1).serialize(heartbeat(), 2)
+  // One byte of the payload is changed: the CRC no longer matches.
+  bad.set(10, bad[10] ^ 255)
+  w.add(T0 + SECOND, bad)
+  w.addMessage(T0 + 2 * SECOND, heartbeat(), 3)
+  const got = readAll(w.bytes(), 1000)
+
+  expect(got.records.map((r) => r.seq).join(",")).toBe("1,3")
+  expect(got.reader.report.crcFailures >= 1).toBe(true)
+  expect(accounted(got.reader)).toBe(true)
+}
+
+function skipsAnUnknownMessageWholeAndCountsIt(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1)
+  // A MAVLink 2 frame of message 16777215, which no dialect has: header, 3 bytes of payload, any checksum.
+  const unknown = bytesOf([0xFD, 3, 0, 0, 9, 1, 1, 255, 255, 255, 1, 2, 3, 0x12, 0x34])
+  w.add(T0 + SECOND, unknown)
+  w.addMessage(T0 + 2 * SECOND, heartbeat(), 3)
+  const got = readAll(w.bytes(), 7)
+
+  expect(got.records.map((r) => r.seq).join(",")).toBe("1,3")
+  expect(got.reader.report.unknown).toBe(1)
+  expect(got.reader.report.bytesUnknown).toBe(TLOG_TIMESTAMP_LENGTH + unknown.length)
+  expect(got.reader.report.bytesSkipped).toBe(0)
+  expect(accounted(got.reader)).toBe(true)
+}
+
+function doesNotTakeNoiseForAnUnknownFrameBeforeTheFirstRecord(): void {
+  const w = new TlogWriter()
+  w.add(T0, bytesOf([0xFD, 3, 0, 0, 9, 1, 1, 255, 255, 255, 1, 2, 3, 0x12, 0x34]))
+  const got = readAll(w.bytes(), 100)
+
+  // Nothing says where the recording is yet: an unknown frame cannot be told from noise, so it is not a record and not "unknown".
+  expect(got.records.length).toBe(0)
+  expect(got.reader.report.unknown).toBe(0)
+  expect(accounted(got.reader)).toBe(true)
+}
+
+function recognisesASignedFrameAndDoesNotVerifyIt(): void {
+  const w = new TlogWriter()
+  const frame = new MavLinkProtocolV2(1, 1).serialize(heartbeat(), 4)
+  w.add(T0, signedCopy(frame, Heartbeat.INFO.magic))
+  w.addMessage(T0 + SECOND, heartbeat(), 5)
+  const got = readAll(w.bytes(), 9)
+
+  expect(got.records.length).toBe(2)
+  expect(got.records[0].signed).toBe(true)
+  expect(got.records[0].frame.length).toBe(frame.length + 13)
+  expect(got.records[1].signed).toBe(false)
+  expect(got.reader.report.signed).toBe(1)
+  expect(accounted(got.reader)).toBe(true)
+}
+
+function startsASegmentAtAStepBackAndAtAJumpButKeepsTheOrder(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0 + 10 * SECOND, heartbeat(), 1)
+  w.addMessage(T0 + 11 * SECOND, heartbeat(), 2)
+  // The clock goes back (a reboot of the recorder), then jumps forward by more than the gap.
+  w.addMessage(T0 + 3 * SECOND, heartbeat(), 3)
+  w.addMessage(T0 + 4 * SECOND, heartbeat(), 4)
+  w.addMessage(T0 + 400 * SECOND, heartbeat(), 5)
+  const got = readAll(w.bytes(), 50)
+
+  // In the order of the file, never sorted; each record says its segment.
+  expect(got.records.map((r) => `${r.seq}:${r.segment}`).join(" ")).toBe("1:0 2:0 3:1 4:1 5:2")
+  expect(got.reader.report.segments).toBe(3)
+  expect(got.reader.report.backwards).toBe(1)
+  expect(got.reader.report.jumps).toBe(1)
+}
+
+function saysADateThatCannotBeRealIsNoDate(): void {
+  const early = new TlogWriter()
+  early.addMessage(5000000, heartbeat(), 1)
+  early.addMessage(6000000, heartbeat(), 2)
+  expect(readAll(early.bytes(), 100).reader.report.dated).toBe(false)
+
+  const far = new TlogWriter()
+  far.addMessage(T0 + 800 * 86400 * SECOND, heartbeat(), 1)
+  expect(readAll(far.bytes(), 100).reader.report.dated).toBe(false)
+
+  expect(readAll(smallRecording().bytes(), 100).reader.report.dated).toBe(true)
+}
+
+function takesNoRecordWhoseTimeHasTheTopBitSet(): void {
+  const w = new TlogWriter()
+  w.addMessage(T0, heartbeat(), 1)
+  const frame = new MavLinkProtocolV2(1, 1).serialize(heartbeat(), 2)
+  const stamped = new Uint8Array(8 + frame.length)
+  stamped.setAll(frame, 8)
+  for (let i = 0; i < 8; i++) {
+    stamped.set(i, 255)
+  }
+  w.raw(stamped)
+  w.addMessage(T0 + SECOND, heartbeat(), 3)
+  const got = readAll(w.bytes(), 100)
+
+  expect(got.records.map((r) => r.seq).join(",")).toBe("1,3")
+  expect(accounted(got.reader)).toBe(true)
+}
+
+function aFileCutAnywhereIsCutEndNotDamage(): void {
+  const w = smallRecording()
+  const bytes = w.bytes()
+  const first = readAll(bytes, 1000)
+  // The offsets where a record ends.
+  const ends: int[] = [0]
+  let at = 0
+  for (const r of first.records) {
+    at += TLOG_TIMESTAMP_LENGTH + r.frame.length
+    ends.push(at)
+  }
+  for (let cut = 0; cut <= bytes.length; cut++) {
+    const got = readAll(bytes.slice(0, cut), 13)
+    let whole = 0
+    for (const e of ends) {
+      if (e > 0 && e <= cut) {
+        whole += 1
+      }
+    }
+    expect(got.records.length).toBe(whole)
+    expect(got.reader.report.cutEnd).toBe(!ends.includes(cut))
+    expect(got.reader.report.bytesSkipped).toBe(0)
+    expect(got.reader.report.crcFailures).toBe(0)
+    expect(accounted(got.reader)).toBe(true)
+  }
+}
+
+function endsOnAFileThatIsOneRepeatedByte(): void {
+  for (const value of [0, 0xFD, 0xFE, 0xFF, 0x80]) {
+    const bytes = new Uint8Array(6000)
+    for (let i = 0; i < bytes.length; i++) {
+      bytes.set(i, value)
+    }
+    const got = readAll(bytes, 997)
+    expect(got.records.length).toBe(0)
+    expect(accounted(got.reader)).toBe(true)
+  }
+}
+
+function endsOnHugeLengthFieldsWithoutKeepingMoreThanARecord(): void {
+  // A record header that says 255 bytes of payload, over and over, with the signed flag: each claims a frame of 288 bytes.
+  const bytes = new Uint8Array(20000)
+  for (let i = 0; i < bytes.length; i++) {
+    bytes.set(i, [0, 0, 0, 0, 0, 0, 0, 0, 0xFD, 255, 1, 0][i % 12])
+  }
+  const reader = new TlogReader()
+  let most = 0
+  for (let at = 0; at < bytes.length; at += 100) {
+    reader.push(bytes.slice(at, at + 100))
+    while (reader.next() != null) {
+    }
+    if (reader.waiting > most) {
+      most = reader.waiting
+    }
+  }
+  reader.finish()
+  expect(most <= TLOG_TIMESTAMP_LENGTH + TLOG_MAX_FRAME).toBe(true)
+  expect(reader.report.records).toBe(0)
+  expect(accounted(reader)).toBe(true)
+}
+
+function endsOnRandomBytesAndKeepsEveryByteAccountedFor(): void {
+  let x = 12345
+  const bytes = new Uint8Array(30000)
+  for (let i = 0; i < bytes.length; i++) {
+    x = (x * 1103515245 + 12345) % 2147483648
+    bytes.set(i, (x / 65536) % 256)
+  }
+  for (const chunk of [1, 64, 4096]) {
+    const got = readAll(bytes.slice(0, if (chunk == 1) 3000 else 30000), chunk)
+    expect(accounted(got.reader)).toBe(true)
+    expect(got.reader.report.bytesInRecords + got.reader.report.bytesUnknown <= 3000 * 10).toBe(true)
+  }
+}
+
+function holdsNoMoreThanARecordWhateverTheChunk(): void {
+  const w = new TlogWriter()
+  for (let i = 0; i < 300; i++) {
+    w.addMessage(T0 + i * 1000, heartbeat(), i % 256)
+  }
+  const got = readAll(w.bytes(), 1)
+
+  expect(got.records.length).toBe(300)
+  expect(got.reader.capacity <= 8192).toBe(true)
+  expect(accounted(got.reader)).toBe(true)
+}
+
+describe("the tlog reader", () => {
+  it("reads back what the writer wrote, at any chunk size, with the report", roundTripsAtAnyChunkSize)
+  it("gives the frame as it was on the wire", givesTheFrameAsItWasOnTheWire)
+  it("skips garbage in the middle and finds the next record", skipsGarbageInTheMiddleAndFindsTheNextRecord)
+  it("counts a frame with a wrong CRC and goes on", countsAFrameWithAWrongCrcAndGoesOn)
+  it("skips an unknown message whole and counts it", skipsAnUnknownMessageWholeAndCountsIt)
+  it("does not take noise for an unknown frame before the recording has begun", doesNotTakeNoiseForAnUnknownFrameBeforeTheFirstRecord)
+  it("recognises a signed frame and does not verify it", recognisesASignedFrameAndDoesNotVerifyIt)
+  it("starts a segment at a step back and at a jump, and keeps the order of the file", startsASegmentAtAStepBackAndAtAJumpButKeepsTheOrder)
+  it("says a date that cannot be real is no date", saysADateThatCannotBeRealIsNoDate)
+  it("takes no record whose time has the top bit set", takesNoRecordWhoseTimeHasTheTopBitSet)
+  it("treats a file cut at any byte as cutEnd, not damage", aFileCutAnywhereIsCutEndNotDamage)
+  it("ends on a file of one repeated byte", endsOnAFileThatIsOneRepeatedByte)
+  it("ends on huge length fields without keeping more than a record", endsOnHugeLengthFieldsWithoutKeepingMoreThanARecord)
+  it("ends on random bytes with every byte accounted for", endsOnRandomBytesAndKeepsEveryByteAccountedFor)
+  it("holds no more than a record whatever the chunk", holdsNoMoreThanARecordWhateverTheChunk)
+})
