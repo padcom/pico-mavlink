@@ -1,5 +1,6 @@
 // The DataFlash reader and its test encoder: every field character, chunking, units, damaged and hostile input.
 import { describe, it, expect } from "std/test"
+import { readF64 } from "./bytes"
 import { MemoryStream } from "./stream"
 import {
   DF_FMT_LENGTH,
@@ -291,6 +292,137 @@ function refusesFormatsThatDoNotAddUp(): void {
   expect(d.problems.notes.length).toBe(3)
 }
 
+/// Not-a-number, infinity and a number no int holds, as a log can say them in an f64.
+function oddNumbers(): f64[] {
+  const nan = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF8, 0x7F]), 0)
+  const inf = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF0, 0x7F]), 0)
+  const negInf = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF0, 0xFF]), 0)
+  [nan, inf, negInf, 1.0e300, -1.0e300, 9.3e18, 1000.0]
+}
+
+function doesNotStopOnATimeThatIsNotAnInt(): void {
+  const e = new DfEncoder()
+  expect(e.define(130, "BIG", "Q", "TimeUS")).toBe(true)
+  expect(e.define(131, "MS", "IB", "TimeMS,V")).toBe(true)
+  expect(e.add(130, [0.0], [""])).toBe(true)
+  expect(e.add(131, [4294967295.0, 0.0], ["", ""])).toBe(true)
+  const log = e.bytes()
+  // The Q is 2^63, then all ones: not an int in either case.
+  const first = log.slice(0, log.length - 11 - 4)
+  const patched = log.slice(0, log.length)
+  const at = 2 * DF_FMT_LENGTH + 3
+  for (const value of [[0, 0, 0, 0, 0, 0, 0, 0x80], [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]]) {
+    for (let i = 0; i < 8; i++) {
+      patched.set(at + i, value[i])
+    }
+    const m = readAll(patched, 50)
+    expect(m.length).toBe(4)
+    expect(m[2].timeUs()).toBe(-1)
+    // A time in milliseconds that fits is still a time.
+    expect(m[3].timeUs()).toBe(4294967295000)
+  }
+  expect(first.length > 0).toBe(true)
+}
+
+function doesNotStopOnNumbersInUnitsAndMultipliers(): void {
+  for (const odd of oddNumbers()) {
+    const e = new DfEncoder()
+    // The fields that should be bytes are f64 here, as a log can make them.
+    expect(e.define(130, "FMTU", "QddNN", "TimeUS,FmtType,Ignore,UnitIds,MultIds")).toBe(true)
+    expect(e.define(131, "UNIT", "QdZ", "TimeUS,Id,Label")).toBe(true)
+    expect(e.define(132, "MULT", "Qdd", "TimeUS,Id,Mult")).toBe(true)
+    expect(e.define(133, "ATT", "QB", "TimeUS,V")).toBe(true)
+    expect(e.add(131, [0.0, odd, 0.0], ["", "", "deg"])).toBe(true)
+    expect(e.add(132, [0.0, odd, 0.01], ["", "", ""])).toBe(true)
+    expect(e.add(132, [0.0, 66.0, odd], ["", "", ""])).toBe(true)
+    expect(e.add(130, [0.0, odd, 0.0, 0.0, 0.0], ["", "", "", "d", "B"])).toBe(true)
+    expect(e.add(130, [0.0, 133.0, 0.0, 0.0, 0.0], ["", "", "", "d", "B"])).toBe(true)
+    expect(e.add(133, [1.0, 2.0], ["", ""])).toBe(true)
+    const d = new DfDecoder()
+    d.push(e.bytes())
+    let n = 0
+    while (d.next() != null) {
+      n += 1
+    }
+    d.finish()
+    // Every message was read; the ones with numbers that mean nothing were noted and did not change the tables.
+    expect(n).toBe(4 + 6)
+    expect(d.problems.count > 0 || odd == 1000.0).toBe(true)
+    const f = d.formats[133]!
+    expect(d.tables.multOf(f.fields[0]) == d.tables.multOf(f.fields[0])).toBe(true)
+    expect(d.tables.unitOf(f.fields[0]).length < 4).toBe(true)
+  }
+}
+
+function keepsTheFirstDefinitionOfAType(): void {
+  const e = new DfEncoder()
+  expect(e.define(130, "AAA", "QB", "TimeUS,V")).toBe(true)
+  e.raw(fmtBytes(130, 12, "BBB", "QB", "TimeUS,W"))
+  // The same again is harmless; another layout of the same type is not taken, and later messages are of the first.
+  e.raw(fmtBytes(130, 12, "AAA", "QB", "TimeUS,V"))
+  e.raw(fmtBytes(130, 20, "AAA", "QQ", "TimeUS,V"))
+  expect(e.add(130, [5.0, 6.0], ["", ""])).toBe(true)
+  const d = new DfDecoder()
+  d.push(e.bytes())
+  let last: DfMessage? = null
+  while (true) {
+    const m = d.next()
+    if (m == null) {
+      break
+    }
+    last = m
+  }
+  expect(d.problems.badFormats).toBe(2)
+  expect(d.formats[130]!.name).toBe("AAA")
+  expect(d.formats[130]!.length).toBe(12)
+  expect(last!.num("V")).toBe(6.0)
+  // After the four FMTs, whatever became of them.
+  expect(last!.offset).toBe(4 * DF_FMT_LENGTH)
+}
+
+function neverTakesAFmtForFmt(): void {
+  // Type 128 with length 89 and a format that adds up to 86 bytes: the layout of FMT stays as it is.
+  const e = new DfEncoder()
+  // The FMT of FMT that every log begins with is not a problem; another one is.
+  e.raw(fmtBytes(128, 89, "FMT", "BBnNZ", "Type,Length,Name,Format,Labels"))
+  e.raw(fmtBytes(128, 89, "FMT", "QQQQQQQQQQc", "A,B,C,D,E,F,G,H,I,J,K"))
+  expect(e.define(130, "AAA", "QB", "TimeUS,V")).toBe(true)
+  const d = new DfDecoder()
+  d.push(e.bytes())
+  let names = ""
+  while (true) {
+    const m = d.next()
+    if (m == null) {
+      break
+    }
+    names += `${m!.format.name} `
+  }
+  expect(d.problems.badFormats).toBe(1)
+  expect(d.formats[DF_FMT_TYPE]!.format).toBe("BBnNZ")
+  expect(d.formats[130]!.name).toBe("AAA")
+  expect(names).toBe("FMT FMT ")
+}
+
+/// A whole FMT message as a log has it: `defines` is the type it defines, `length` what it says the length is.
+function fmtBytes(defines: int, length: int, name: string, format: string, labels: string): Uint8Array {
+  const out = new Uint8Array(DF_FMT_LENGTH)
+  out.set(0, 0xA3)
+  out.set(1, 0x95)
+  out.set(2, DF_FMT_TYPE)
+  out.set(3, defines)
+  out.set(4, length)
+  const text = [name, format, labels]
+  const starts = [5, 9, 25]
+  const widths = [4, 16, 64]
+  for (let k = 0; k < 3; k++) {
+    const bytes = new TextEncoder().encode(text[k])
+    for (let i = 0; i < bytes.length && i < widths[k]; i++) {
+      out.set(starts[k] + i, bytes[i])
+    }
+  }
+  out
+}
+
 function countsATruncatedEnd(): void {
   const e = allFieldsEncoder()
   sample(e, 1.0)
@@ -434,6 +566,10 @@ describe("the DataFlash reader", () => {
   it("reads the definitions ArduPilot writes (captured from a real log)", readsTheDefinitionsArduPilotWrites)
   it("skips garbage and unknown types, and goes on with what it can read", skipsGarbageAndGoesOnWithWhatItCanRead)
   it("refuses formats that do not add up, and a redefined FMT", refusesFormatsThatDoNotAddUp)
+  it("does not stop on a time that is not an int (2^63 and over)", doesNotStopOnATimeThatIsNotAnInt)
+  it("does not stop on NaN, infinity or 1e300 in UNIT, MULT and FMTU", doesNotStopOnNumbersInUnitsAndMultipliers)
+  it("keeps the first definition of a type", keepsTheFirstDefinitionOfAType)
+  it("never takes an FMT for type 128", neverTakesAFmtForFmt)
   it("counts a truncated end", countsATruncatedEnd)
   it("survives noise and heads everywhere, with every byte accounted for", survivesHostileInput)
   it("counts messages", indexesWithABoundedMemory)

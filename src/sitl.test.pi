@@ -18,7 +18,7 @@ import { Heartbeat } from "./dialects/minimal"
 import { MavCmd, MavParamType, MavResult, StatusText } from "./dialects/common"
 import { GlobalPositionInt } from "./dialects/standard"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
-import { FtpClient, FtpEntry, FtpError } from "./ftp"
+import { FtpClient, FtpEntry, FtpError, hexOf } from "./ftp"
 import { Crc32, crc32Of } from "./crc32"
 import { FileDownload, FileSink, downloadFile } from "./logdownload"
 import { DfDecoder } from "./dataflash"
@@ -364,6 +364,7 @@ function readsTheRealLog(log: Uint8Array): void {
   }
   println(`SPIKE the log has ${d.messages} messages, ${d.problems.skipped} bytes skipped, ${d.problems.badFormats} bad formats, truncated ${d.problems.truncated}: ${names.join(" ")}`)
   println(`SPIKE problems: ${d.problems.notes.join(" | ")}`)
+  println(`SPIKE first message: ${hexOf(log.slice(0, 89), 89)}`)
   // The definitions of some common messages, as ArduPilot wrote them: units and multipliers too.
   for (const f of d.formats) {
     if (f != null && ["ATT", "GPS", "MODE", "RATE", "BAT", "XKF1", "PARM", "MSG"].includes(f!.name)) {

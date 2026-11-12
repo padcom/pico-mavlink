@@ -73,6 +73,15 @@ export function isTextKind(kind: int): bool {
   kind == 0x6E || kind == 0x4E || kind == 0x5A
 }
 
+/// `v` as an int, or null when it is not a number or is beyond what an int holds. (Pico's `as` stops the program on a value that
+/// does not fit; the numbers of a log are whatever the log says, so they are looked at first.)
+export function intOf(v: f64): int? {
+  if (v != v || v < -9000000000000000000.0 || v > 9000000000000000000.0) {
+    return null
+  }
+  v as int
+}
+
 /// One field of a format.
 export class DfField {
   public readonly name: string
@@ -176,8 +185,8 @@ export class DfMessage {
       return -1
     }
     const t = nums[format.timeField]
-    const us = if (format.timeIsMs) t * 1000.0 else t
-    us as int
+    const us = intOf(if (format.timeIsMs) t * 1000.0 else t)
+    if (us == null) -1 else us!
   }
 }
 
@@ -190,8 +199,11 @@ export class DfTables {
     units.set(id, label)
   }
 
+  /// Notes a multiplier; one that is not a finite number is not taken (it would only make every value that uses it NaN).
   public setMult(id: int, mult: f64): void {
-    mults.set(id, mult)
+    if (mult == mult && mult > -1.0e300 && mult < 1.0e300) {
+      mults.set(id, mult)
+    }
   }
 
   /// The name of the unit of a field ("" when the log has none), as UNIT gave it.
@@ -205,7 +217,7 @@ export class DfTables {
   /// (the time of a message: `TimeUS`, a Q with the multiplier 1e-6 and the unit "s").
   public multOf(field: DfField): f64 {
     const m = mults.get(field.multId) ?? 1.0
-    if (m == 0.0) 1.0 else m
+    if (m == 0.0 || m != m) 1.0 else m
   }
 }
 
@@ -252,8 +264,9 @@ function formatFromFmt(payload: Uint8Array, why: string[]): DfFormat? {
   const name = readChars(payload, 2, 4)
   const format = readChars(payload, 6, 16)
   const labels = readChars(payload, 22, 64)
-  if (type == DF_FMT_TYPE && length != DF_FMT_LENGTH) {
-    why.push("FMT cannot be redefined")
+  if (type == DF_FMT_TYPE) {
+    // The layout of FMT is the one thing the reader needs to know before it reads anything; a log does not get to change it.
+    why.push("FMT cannot be defined by a log")
     return null
   }
   const names = commaSeparated(labels)
@@ -274,6 +287,13 @@ function formatFromFmt(payload: Uint8Array, why: string[]): DfFormat? {
     return null
   }
   new DfFormat(type, length, name, format, labels, fields)
+}
+
+/// Whether an FMT payload is the definition of FMT that the reader has built in (the first message of every log): the type, the
+/// length, the name and the field characters; the names of the columns are ArduPilot's to word ("Columns" in 4.7).
+function isFmtOfFmt(payload: Uint8Array): bool {
+  readU8(payload, 0) as int == DF_FMT_TYPE && readU8(payload, 1) as int == DF_FMT_LENGTH && readChars(payload, 2, 4) == "FMT" &&
+    readChars(payload, 6, 16) == "BBnNZ"
 }
 
 /// The number of the field character `k` at `p` in `b`, before the scale (0 for a character that is not a number: text, an array).
@@ -354,12 +374,12 @@ export class DfDecoder {
     for (let i = 0; i < 256; i++) {
       this.formats.push(null)
     }
-    this.formats[DF_FMT_TYPE] = new DfFormat(DF_FMT_TYPE, DF_FMT_LENGTH, "FMT", "BBnNZ", "Type,Length,Name,Format,Labels", [
+    this.formats[DF_FMT_TYPE] = new DfFormat(DF_FMT_TYPE, DF_FMT_LENGTH, "FMT", "BBnNZ", "Type,Length,Name,Format,Columns", [
       new DfField("Type", 0x42, 0),
       new DfField("Length", 0x42, 1),
       new DfField("Name", 0x6E, 2),
       new DfField("Format", 0x4E, 6),
-      new DfField("Labels", 0x5A, 22),
+      new DfField("Columns", 0x5A, 22),
     ])
   }
 
@@ -445,6 +465,11 @@ export class DfDecoder {
 
   /// An FMT message: defines the format it describes (when it adds up) and is given as a message too.
   fmtMessage(f: DfFormat, payload: Uint8Array, at: int): DfMessage? {
+    if (isFmtOfFmt(payload)) {
+      // Every log begins with the FMT of FMT, as the reader already knows it.
+      const m = decodeFields(f, payload, 0)
+      return new DfMessage(f, base + at, m.nums, m.texts)
+    }
     const why: string[] = []
     const defined = formatFromFmt(payload, why)
     if (defined == null) {
@@ -454,43 +479,81 @@ export class DfDecoder {
       return null
     }
     const d = defined!
-    formats[d.type] = d
-    if (d.name == "FMTU") fmtuType = d.type
-    else if (d.name == "UNIT") unitType = d.type
-    else if (d.name == "MULT") multType = d.type
+    const old = formats[d.type]
+    if (old != null) {
+      // The first definition of a type stays: messages already read, and offsets already indexed, are of that layout. The same
+      // definition again is harmless (logs are joined); another one is refused.
+      if (old!.name != d.name || old!.format != d.format || old!.labels != d.labels || old!.length != d.length) {
+        problems.badFormats += 1
+        problems.skipped += f.length
+        problems.note(`FMT at ${base + at} refused: type ${d.type} is ${old!.name} already, and this one is ${d.name}`)
+        return null
+      }
+    } else {
+      formats[d.type] = d
+      if (d.name == "FMTU" && fmtuType < 0) {
+        fmtuType = d.type
+      } else if (d.name == "UNIT" && unitType < 0) {
+        unitType = d.type
+      } else if (d.name == "MULT" && multType < 0) {
+        multType = d.type
+      }
+    }
     const m = decodeFields(f, payload, 0)
     new DfMessage(f, base + at, m.nums, m.texts)
+  }
+
+  /// The byte-sized id a field holds (a character: -128 to 255), or null when it is not a number or not one of those; the
+  /// problem is noted.
+  idIn(m: DfMessage, name: string): int? {
+    const v = m.num(name)
+    const id = if (v == null) null else intOf(v!)
+    if (id == null || id! < -128 || id! > 255) {
+      problems.note(`${m.format.name} at ${m.offset}: ${name} is not an id`)
+      return null
+    }
+    id
   }
 
   /// Takes note of the messages that carry units and multipliers.
   note(m: DfMessage): void {
     const t = m.format.type
     if (t == unitType) {
-      const id = m.num("Id")
+      const id = idIn(m, "Id")
       const label = m.text("Label")
       if (id != null && label != null) {
-        tables.setUnit(id! as int, label!)
+        tables.setUnit(id!, label!)
       }
     } else if (t == multType) {
-      const id = m.num("Id")
-      const mult = m.num("Mult")
-      if (id != null && mult != null) {
-        tables.setMult(id! as int, mult!)
-      }
+      noteMult(m)
     } else if (t == fmtuType) {
       unitsOfFormat(m)
     }
   }
 
-  /// FMTU: gives the fields of a format their unit and multiplier ids.
-  unitsOfFormat(m: DfMessage): void {
-    const type = m.num("FmtType")
-    const units = m.text("UnitIds")
-    const mults = m.text("MultIds")
-    if (type == null || units == null || mults == null || type! < 0.0 || type! > 255.0) {
+  /// MULT: a multiplier for an id, when both are numbers that mean something.
+  noteMult(m: DfMessage): void {
+    const id = idIn(m, "Id")
+    const mult = m.num("Mult")
+    if (id == null || mult == null) {
       return
     }
-    const f = formats[type! as int]
+    if (mult! != mult! || mult! > 1.0e300 || mult! < -1.0e300) {
+      problems.note(`MULT at ${m.offset}: the multiplier is not a finite number`)
+      return
+    }
+    tables.setMult(id!, mult!)
+  }
+
+  /// FMTU: gives the fields of a format their unit and multiplier ids.
+  unitsOfFormat(m: DfMessage): void {
+    const type = idIn(m, "FmtType")
+    const units = m.text("UnitIds")
+    const mults = m.text("MultIds")
+    if (type == null || units == null || mults == null || type! < 0) {
+      return
+    }
+    const f = formats[type!]
     if (f == null) {
       return
     }
