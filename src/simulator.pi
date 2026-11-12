@@ -165,6 +165,8 @@ export class SimulatedAutopilot {
   public ftpLoss: int = 0
   /// A burst stops after this many packets, with no end (a link that did not drain: the client must ask again). 0: never.
   public ftpStallAfter: int = 0
+  /// The offset of the one chunk the server never sends, in a burst or a read (-1: none).
+  public ftpDrop: int = -1
   /// Serve these bytes as the file instead of the packed parameter file (to test a reader with files of a given length).
   public ftpFile: Uint8Array? = null
   /// The files of the vehicle's file system besides the parameter file, by full path ("/APM/LOGS/00000001.BIN"): what ListDirectory
@@ -781,6 +783,9 @@ export class SimulatedAutopilot {
       ftpNack(ask, FtpNack.EOF)
       return
     }
+    if (req.offset == ftpDrop) {
+      return
+    }
     ftpReply(ask, FtpOpcode.ACK, slice(file, req.offset, req.size), req.seq + 1, req.offset, false)
   }
 
@@ -839,7 +844,10 @@ export class SimulatedAutopilot {
       const chunk = slice(file, offset, size)
       sent += 1
       const last = sent == 2000
-      ftpReply(ask, FtpOpcode.ACK, chunk, seq, offset, last, false)
+      // The chunk at `ftpDrop` is never sent (a link or a card that cannot give that one piece).
+      if (offset != ftpDrop) {
+        ftpReply(ask, FtpOpcode.ACK, chunk, seq, offset, last, false)
+      }
       offset += chunk.length
       seq += 1
       // Let the rest of the link breathe: a long burst is not one tick of the event loop.

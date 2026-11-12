@@ -430,7 +430,8 @@ export class FtpClient {
   public async call(opcode: int, session: int, offset: int, data: Uint8Array, size: int, quiet: bool = false, waitMs: int = 0): Promise<FtpPacket> throws FtpError {
     const mine = nextSeq()
     const message = ftpMessage(target, request(mine, session, opcode, offset, data, size))
-    const tries = if (quiet) 0 else retries
+    // A request with its own wait (`waitMs`) is asked once: the whole wait is bounded, not that many times (retries + 1).
+    const tries = if (quiet || waitMs > 0) 0 else retries
     // `waitMs` is for a request the vehicle takes long to answer (the CRC of a big file); a quiet call is always brief.
     const wait = if (quiet && timeoutMs > 500) 500 else if (waitMs > 0 && !quiet) waitMs else timeoutMs
     const ignoreAbort = quiet
@@ -596,15 +597,24 @@ export class FtpClient {
   }
 
   /// The CRC-32 of the file `path`, computed by the vehicle (CalcFileCRC32; see `Crc32` for which CRC-32 it is). The vehicle reads the
-  /// whole file to compute it, so a big one takes a while: `waitMs` is how long to wait for the answer (default 30 s), and it is
-  /// asked again after that, up to the client's retries. `FTP_UNKNOWN_COMMAND` from a vehicle that cannot do it; `FTP_NOT_FOUND` or
-  /// `FTP_ERRNO` for a file that is not there. No session is needed.
+  /// whole file to compute it, so a big one takes a while: `waitMs` is how long to wait for the answer (default 30 s). It is asked
+  /// ONCE (a request that is asked again after each wait would take (retries + 1) times as long), so a lost request or reply is
+  /// an `FTP_TIMEOUT` after `waitMs`. `FTP_UNKNOWN_COMMAND` from a vehicle that cannot do it; `FTP_NOT_FOUND` or `FTP_ERRNO` for a
+  /// file that is not there. The server keeps a slot (the session number 0) for the request for a while: it is ended with a
+  /// terminate afterwards, also after a failure.
   public async calcCrc32(path: string, waitMs: int = 30_000): Promise<int> throws FtpError {
     const name = new TextEncoder().encode(path)
     if (name.length > FTP_MAX_DATA) {
       throw new FtpError("FTP_PROTOCOL", `the path is ${name.length} bytes: at most ${FTP_MAX_DATA}`)
     }
-    const r = await call(FtpOpcode.CALC_FILE_CRC32, 0, 0, name, name.length, false, waitMs)
+    let r: FtpPacket
+    try {
+      r = await call(FtpOpcode.CALC_FILE_CRC32, 0, 0, name, name.length, false, waitMs)
+    } catch (e: FtpError) {
+      await endSession(0)
+      throw e
+    }
+    await endSession(0)
     if (r.opcode == FtpOpcode.NACK) {
       throw errorOfNack(`the CRC of ${path}`, r)
     }

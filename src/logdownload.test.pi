@@ -343,6 +343,114 @@ async function givesUpOnAVehicleThatGoesQuiet(): Promise<void> throws Error {
   expect(r.sim.openFtpSessions()).toBe(0)
 }
 
+async function stopsWhenAPieceNeverArrives(): Promise<void> throws Error {
+  const r = withLog(400_000)
+  const file = r.sim.fsFiles.get(LOG)!
+  // The piece at 23900 is never sent; all the others arrive, again and again, burst after burst: that is no progress.
+  r.sim.ftpDrop = 239 * 100
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 60, retries: 2, session: 7 }), LOG, sink, 0, 0, 400_000)
+    expect("downloaded").toBe("stopped")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+  }
+  r.gcs.close()
+  // The file in order up to the missing piece is in the sink, and only that.
+  expect(sink.total).toBe(239 * 100)
+  expect(same(sink.bytes(), file.slice(0, 239 * 100))).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+  // Three bursts, not one for every chunk that arrived.
+  expect(r.sim.ftpBursts <= 4).toBe(true)
+}
+
+async function boundsWhatIsHeldAheadOfAMissingPiece(): Promise<void> throws Error {
+  const r = withLog(400_000)
+  r.sim.ftpDrop = 239 * 10
+  const sink = new MemorySink()
+  try {
+    // 20 000 bytes may be held ahead of the front; the burst brings far more.
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, { timeoutMs: 60, retries: 5, session: 7 }), LOG, sink, 0, 0, -1, (_b: int, _e: int) => {}, 250, 0, 2_000_000_000, true, 30_000, 20_000)
+    expect("downloaded").toBe("stopped")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+    expect(e.message.includes("held beyond")).toBe(true)
+  }
+  r.gcs.close()
+  expect(sink.total).toBe(239 * 10)
+}
+
+async function refusesMoreDataThanExpectedAtOnce(): Promise<void> throws Error {
+  const r = withLog(2_000_000)
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 1000)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SIZE")
+  }
+  r.gcs.close()
+  // Nothing past the size expected reached the sink; the chunk that goes past it is refused whole.
+  expect(sink.total <= 1000).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileJustLongerThanExpected(): Promise<void> throws Error {
+  const r = withLog(5000)
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 4990)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SIZE")
+  }
+  r.gcs.close()
+  expect(sink.total <= 4990).toBe(true)
+}
+
+async function refusesAnEndlessVehicleWithTheSizeKnown(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpMode = "endless"
+  const sink = new MemorySink()
+  try {
+    await downloadFile(new FtpClient(r.gcs, VEHICLE, FAST), LOG, sink, 0, 0, 5000)
+    expect("downloaded").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_SIZE")
+  }
+  r.gcs.close()
+  expect(sink.total <= 5000).toBe(true)
+}
+
+async function endsTheSessionOfTheVehicleCrc(): Promise<void> throws Error {
+  const r = withLog(5000)
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const crc = await client.calcCrc32(LOG)
+  expect(crc).toBe(crc32Of(r.sim.fsFiles.get(LOG)!))
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
+  try {
+    await client.calcCrc32("/APM/LOGS/NOPE.BIN")
+    expect("asked").toBe("failed")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ERRNO")
+  }
+  r.gcs.close()
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
+}
+
+async function asksForTheCrcOnce(): Promise<void> throws Error {
+  const r = withLog(5000)
+  r.sim.ftpMode = "silent"
+  try {
+    await new FtpClient(r.gcs, VEHICLE, { timeoutMs: 50, retries: 3, session: 7 }).calcCrc32(LOG, 120)
+    expect("asked").toBe("timed out")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_TIMEOUT")
+  }
+  r.gcs.close()
+  expect(r.sim.ftpLog.filter((line) => line.startsWith("14 ")).length).toBe(1)
+}
+
 async function takesAnEmptyFile(): Promise<void> throws Error {
   const r = withLog(0)
   const sink = new MemorySink()
@@ -371,5 +479,12 @@ describe("downloading a log over FTP", () => {
   it("refuses a file shorter than what the sink holds, and writes nothing", refusesAFileShorterThanWhatIsHeld)
   it("fails for a file that is not there", failsForAFileThatIsNotThere)
   it("gives up on a vehicle that goes quiet, and closes the session", givesUpOnAVehicleThatGoesQuiet)
+  it("stops after a few bursts when one piece never arrives, keeping the file in order up to it", stopsWhenAPieceNeverArrives)
+  it("bounds what is held ahead of a piece that never arrives", boundsWhatIsHeldAheadOfAMissingPiece)
+  it("refuses a file longer than expected as the data arrives, writing nothing past the size", refusesMoreDataThanExpectedAtOnce)
+  it("refuses a file just longer than expected", refusesAFileJustLongerThanExpected)
+  it("refuses a vehicle that sends data without end when the size is known", refusesAnEndlessVehicleWithTheSizeKnown)
+  it("ends the vehicle's session after asking for a CRC, also when that fails", endsTheSessionOfTheVehicleCrc)
+  it("asks for the CRC once, so that the wait is bounded", asksForTheCrcOnce)
   it("takes an empty file", takesAnEmptyFile)
 })

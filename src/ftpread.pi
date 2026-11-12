@@ -68,6 +68,8 @@ export class ReadState {
   public failure: FtpError? = null
   /// The most a file may hold (bytes): a vehicle that goes on past it is refused, not stored.
   public max: int
+  /// The error code for a file that goes past `max` (`FTP_PROTOCOL`; a download that knows the size to expect says `FTP_SIZE`).
+  public maxCode: string = "FTP_PROTOCOL"
   /// When the read has taken too long (ms since 1970; 0: no limit).
   public deadline: int = 0
 
@@ -108,7 +110,7 @@ export class ReadState {
       return
     }
     if (at > max) {
-      fail("FTP_PROTOCOL", `the file ends at ${at}: more than the ${max} bytes a file may hold`)
+      fail(maxCode, `the file ends at ${at}: more than the ${max} bytes a file may hold`)
       return
     }
     if (end < 0) {
@@ -133,7 +135,7 @@ export class ReadState {
       return
     }
     if (offset + data.length > max) {
-      fail("FTP_PROTOCOL", `data up to ${offset + data.length}: more than the ${max} bytes a file may hold`)
+      fail(maxCode, `data up to ${offset + data.length}: more than the ${max} bytes a file may hold`)
       return
     }
     chunks.set(offset, data)
