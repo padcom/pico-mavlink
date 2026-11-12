@@ -1,13 +1,15 @@
 // The reader on a recording that ANOTHER program wrote, with no SITL and no MAVProxy needed: `fixtures/mavproxy.tlog` is the
 // `mav.tlog` that MAVProxy 1.8.75 (pymavlink 2.4.50) wrote for 25 s while connected to the second serial port of an ArduCopter SITL
 // (the CI firmware, Copter-4.7.2, `-w --model quad --speedup 1 --defaults copter.parm`). It is the whole file as MAVProxy left it
-// (105916 bytes; it was ended with SIGKILL and happened to end at a record boundary), made with
+// (105916 bytes; it was ended with SIGKILL and happened to end at a record boundary), made in a temporary directory of the test (it holds
+// no path, host name or user name, which the last test checks), with
 //   env SITL_BINARY=<arducopter> MAVPROXY=<mavproxy.py> TLOG_KEEP=src/fixtures/mavproxy.tlog pico test src/sitl.test.pi -t "another program"
 // (`keepIfAsked` in sitl.test.pi; it cuts at a record boundary if the file is longer than 140000 bytes). The numbers below are what
 // the reader found in it the day it was made; they are exact because the file is. Run from the repository root.
 import { describe, it, expect } from "std/test"
 import { readBytes } from "std/fs"
-import { Attitude } from "./dialects/common"
+import { Attitude, GpsRawInt, StatusText } from "./dialects/common"
+import { GlobalPositionInt } from "./dialects/standard"
 import { Heartbeat, MavAutopilot, MavType } from "./dialects/minimal"
 import { TlogReader, TlogRecord } from "./tlog"
 
@@ -114,7 +116,68 @@ async function decodesWhatTheVehicleSent(): Promise<void> throws Error {
   expect(others > 0).toBe(true)
 }
 
+/// The texts the vehicle sent (STATUSTEXT, 17 of them): its start-up lines, all of them. A text outside this list fails the test, so that
+/// nothing identifying (a path, a host name, a user name: SITL prints its working directory in some versions) can be in the fixture.
+const TEXTS: string[] = [
+  "Barometer 1 calibration complete",
+  "Barometer 2 calibration complete",
+  "ArduPilot Ready",
+  "AHRS: DCM active",
+  "RC7: SaveWaypoint LOW",
+  "EKF3 IMU0 initialised",
+  "EKF3 IMU1 initialised",
+  "AHRS: EKF3 active",
+  "EKF3 IMU0 tilt alignment complete",
+  "EKF3 IMU1 tilt alignment complete",
+  "EKF3 IMU0 MAG0 initial yaw alignment complete",
+  "EKF3 IMU1 MAG0 initial yaw alignment complete",
+  "GPS 1: probing for u-blox at 230400 baud",
+  "GPS 1: detected u-blox",
+  "EKF3 IMU0 origin set",
+  "Field Elevation Set: 584m",
+  "EKF3 IMU1 origin set",
+]
+
+/// Whether a position (degrees) is "no position" (0, 0: the receiver has no fix yet) or within a degree of SITL's default home
+/// (-35.36, 149.16, near Canberra): a position anywhere else would be where somebody really was.
+function isSitlHomeOrNone(lat: f64, lon: f64): bool {
+  (lat == 0.0 && lon == 0.0) || (lat > -36.36 && lat < -34.36 && lon > 148.16 && lon < 150.16)
+}
+
+async function containsNothingThatIdentifiesAnybody(): Promise<void> throws Error {
+  const got = await readFixture(65536)
+  let texts = 0
+  let positions = 0
+  let unexpected = ""
+  for (const r of got.records) {
+    if (r.msgid == 253) {
+      const text = StatusText.decode(r.payload()).text
+      texts += 1
+      if (!TEXTS.includes(text)) {
+        unexpected = `text: ${text}`
+      }
+    } else if (r.msgid == 24) {
+      const g = GpsRawInt.decode(r.payload())
+      positions += 1
+      if (!isSitlHomeOrNone(g.lat / 1.0e7, g.lon / 1.0e7)) {
+        unexpected = `GPS_RAW_INT at ${g.lat}, ${g.lon}`
+      }
+    } else if (r.msgid == 33) {
+      const g = GlobalPositionInt.decode(r.payload())
+      positions += 1
+      if (!isSitlHomeOrNone(g.lat / 1.0e7, g.lon / 1.0e7)) {
+        unexpected = `GLOBAL_POSITION_INT at ${g.lat}, ${g.lon}`
+      }
+    }
+  }
+
+  expect(unexpected).toBe("")
+  expect(texts).toBe(17)
+  expect(positions).toBe(94 + 95)
+}
+
 describe("a recording MAVProxy wrote (fixture)", () => {
   it("reads it whole: every record, no damage, one segment, dated, at any chunk size", readsTheRecordingMavproxyWrote)
   it("decodes what the vehicle sent: its heartbeat and its attitude", decodesWhatTheVehicleSent)
+  it("holds no text and no position that could identify anybody: only the start-up lines and SITL's default home", containsNothingThatIdentifiesAnybody)
 })
