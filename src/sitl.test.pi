@@ -21,6 +21,7 @@ import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
 import { FtpClient, FtpEntry, FtpError } from "./ftp"
 import { Crc32, crc32Of } from "./crc32"
 import { FileDownload, FileSink, downloadFile } from "./logdownload"
+import { DfDecoder } from "./dataflash"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
 
 /// A running SITL and the connection to it.
@@ -332,6 +333,56 @@ class CollectSink implements FileSink {
   }
 }
 
+/// The log SITL wrote, read by the DataFlash reader: what is in it, and that it is read whole and in order.
+function readsTheRealLog(log: Uint8Array): void {
+  const d = new DfDecoder()
+  const counts = new Map<string, int>()
+  let backwards = 0
+  let last = 0
+  let at = 0
+  while (at < log.length) {
+    const end = if (at + 4096 < log.length) at + 4096 else log.length
+    d.push(log.slice(at, end))
+    at = end
+    while (true) {
+      const m = d.next()
+      if (m == null) {
+        break
+      }
+      counts.set(m!.format.name, (counts.get(m!.format.name) ?? 0) + 1)
+      if (m!.format.name == "ATT") {
+        const t = m!.timeUs()
+        backwards += if (t < last) 1 else 0
+        last = t
+      }
+    }
+  }
+  d.finish()
+  const names: string[] = []
+  for (const name of counts.keys()) {
+    names.push(`${name}:${counts.get(name) ?? 0}`)
+  }
+  println(`SPIKE the log has ${d.messages} messages, ${d.problems.skipped} bytes skipped, ${d.problems.badFormats} bad formats, truncated ${d.problems.truncated}: ${names.join(" ")}`)
+  println(`SPIKE problems: ${d.problems.notes.join(" | ")}`)
+  // The definitions of some common messages, as ArduPilot wrote them: units and multipliers too.
+  for (const f of d.formats) {
+    if (f != null && ["ATT", "GPS", "MODE", "RATE", "BAT", "XKF1", "PARM", "MSG"].includes(f!.name)) {
+      const units: string[] = []
+      for (const field of f!.fields) {
+        units.push(`${field.name}[${d.tables.unitOf(field)}*${d.tables.multOf(field)}]`)
+      }
+      println(`SPIKE format ${f!.type} ${f!.name} ${f!.length} "${f!.format}" "${f!.labels}": ${units.join(" ")}`)
+    }
+  }
+  expect(d.problems.badFormats).toBe(0)
+  expect(d.problems.unknownTypes).toBe(0)
+  // At most a message cut by the time the download ended.
+  expect(d.problems.skipped < 256).toBe(true)
+  expect((counts.get("FMT") ?? 0) > 20).toBe(true)
+  expect((counts.get("ATT") ?? 0) > 10).toBe(true)
+  expect(backwards).toBe(0)
+}
+
 async function downloadsAFileAndMatchesItsCrc(): Promise<void> throws Error {
   const sitl = await startSitl()
   if (sitl == null) {
@@ -551,6 +602,7 @@ async function writesALogWhereFtpCanSeeIt(): Promise<void> throws Error {
     println(`SPIKE downloaded /logs/${found}: ${got!.size} bytes (the listing said ${size}), checked by the vehicle: ${got!.verified}, ${got!.elapsedMs} ms`)
     expect(got!.verified).toBe(true)
     expect(got!.size >= size).toBe(true)
+    readsTheRealLog(sink.bytes())
   } finally {
     await s.stop()
   }

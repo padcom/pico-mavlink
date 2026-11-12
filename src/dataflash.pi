@@ -1,0 +1,699 @@
+// ArduPilot DataFlash logs (the `.BIN` files of /logs on the vehicle): a reader and an encoder for tests.
+//
+// A log is a stream of messages, each `0xA3 0x95 <type> <payload>`. The payload's length and fields come from the format of that
+// type, which the log itself defines with FMT messages (type 128, the only one known beforehand: `type` u8, `length` u8 with the
+// 3 bytes of the header, `name` char[4], `format` char[16], `labels` char[64]). FMTU (units of the fields), UNIT (the name of a
+// unit) and MULT (the value of a multiplier) are ordinary messages that the reader also takes note of.
+//
+// The reader is for files of any size and for files that are not to be trusted:
+//   - it holds at most one chunk and one message (255 bytes) of the file, and never the file;
+//   - bytes that do not start a message are skipped one at a time and counted (`skipped`), so a damaged log yields what can be
+//     read, and every byte is looked at once: the work is linear in the size of the file;
+//   - a format that does not add up (an unknown field character, a length that is not the one of the fields) is refused and counted;
+//   - at most 256 formats exist (the type is a byte), and at most `PROBLEMS_KEPT` problems are described, however many happen.
+//
+// Field characters: b B (i8, u8), h H (i16, u16), i I (i32, u32), q Q (i64, u64), f d (f32, f64), n N Z (text of 4, 16, 64
+// bytes), c C (i16, u16 times 0.01), e E (i32, u32 times 0.01), L (i32 times 1e-7: latitude, longitude), M (u8: the flight mode),
+// a (int16[32]: skipped). A 64-bit value is held as an f64: exact up to 2^53, which holds microseconds for 285 years.
+import { readChars, readF32, readF64, readI16, readI32, readI64, readI8, readU16, readU32, readU64, readU8, writeF32, writeF64, writeUint } from "./bytes"
+import { ByteStream } from "./stream"
+
+/// The first two bytes of every message.
+export const DF_HEAD1: int = 0xA3
+export const DF_HEAD2: int = 0x95
+/// The type of the FMT message, and its length (header included).
+export const DF_FMT_TYPE: int = 128
+export const DF_FMT_LENGTH: int = 89
+/// The longest a message can be (the length is a byte).
+export const DF_MAX_MESSAGE: int = 255
+/// How many problems are described (the rest are only counted).
+export const PROBLEMS_KEPT: int = 16
+
+/// How big a field is, and what its value is multiplied by, for a field character; 0 for a size when it is not one.
+function sizeOfKind(kind: int): int {
+  // b B M
+  if (kind == 0x62 || kind == 0x42 || kind == 0x4D) {
+    return 1
+  }
+  // h H c C
+  if (kind == 0x68 || kind == 0x48 || kind == 0x63 || kind == 0x43) {
+    return 2
+  }
+  // i I f e E L, and n (4 characters)
+  if (kind == 0x69 || kind == 0x49 || kind == 0x66 || kind == 0x65 || kind == 0x45 || kind == 0x4C || kind == 0x6E) {
+    return 4
+  }
+  // q Q d
+  if (kind == 0x71 || kind == 0x51 || kind == 0x64) {
+    return 8
+  }
+  if (kind == 0x4E) {
+    return 16
+  }
+  // Z (64 characters), a (32 int16)
+  if (kind == 0x5A || kind == 0x61) {
+    return 64
+  }
+  0
+}
+
+/// The factor a field character puts on its value: 0.01 for c C e E, 1e-7 for L, else 1.
+function scaleOfKind(kind: int): f64 {
+  if (kind == 0x63 || kind == 0x43 || kind == 0x65 || kind == 0x45) {
+    return 0.01
+  }
+  if (kind == 0x4C) {
+    return 0.0000001
+  }
+  1.0
+}
+
+/// Whether the field holds text (n N Z).
+export function isTextKind(kind: int): bool {
+  kind == 0x6E || kind == 0x4E || kind == 0x5A
+}
+
+/// One field of a format.
+export class DfField {
+  public readonly name: string
+  /// The field character, as its byte (b, B, h, ... ).
+  public readonly kind: int
+  /// Where the field starts in the payload, and how long it is.
+  public readonly offset: int
+  public readonly size: int
+  /// The factor the field character puts on the value.
+  public readonly scale: f64
+  /// The unit and multiplier ids from FMTU (the byte of the character; 0 when the log gave none).
+  public unitId: int = 0
+  public multId: int = 0
+
+  constructor(name: string, kind: int, offset: int) {
+    this.name = name
+    this.kind = kind
+    this.offset = offset
+    this.size = sizeOfKind(kind)
+    this.scale = scaleOfKind(kind)
+  }
+}
+
+/// The format of one type of message, as an FMT message defines it.
+export class DfFormat {
+  public readonly type: int
+  /// The length of a whole message of this type, header included.
+  public readonly length: int
+  public readonly name: string
+  /// The field characters as written, and the labels as written (separated by commas).
+  public readonly format: string
+  public readonly labels: string
+  public readonly fields: DfField[]
+  /// The index of the first field called TimeUS (a Q) or TimeMS (an I), and which of them it is; -1 when there is none.
+  public readonly timeField: int
+  public readonly timeIsMs: bool
+
+  constructor(type: int, length: int, name: string, format: string, labels: string, fields: DfField[]) {
+    this.type = type
+    this.length = length
+    this.name = name
+    this.format = format
+    this.labels = labels
+    this.fields = fields
+    let at = -1
+    let ms = false
+    for (let i = 0; i < fields.length && at < 0; i++) {
+      if (fields[i].name == "TimeUS" && fields[i].kind == 0x51) {
+        at = i
+      } else if (fields[i].name == "TimeMS" && fields[i].kind == 0x49) {
+        at = i
+        ms = true
+      }
+    }
+    this.timeField = at
+    this.timeIsMs = ms
+  }
+
+  /// The index of the field called `name`, or -1.
+  public indexOf(name: string): int {
+    for (let i = 0; i < fields.length; i++) {
+      if (fields[i].name == name) {
+        return i
+      }
+    }
+    -1
+  }
+}
+
+/// A message read from the log, its fields by position (as many as the format has): the numbers (scaled by the field character;
+/// 0 for a text), and the texts ("" for a number).
+export class DfMessage {
+  public readonly format: DfFormat
+  /// Where the message starts in the log.
+  public readonly offset: int
+  public readonly nums: f64[]
+  public readonly texts: string[]
+
+  constructor(format: DfFormat, offset: int, nums: f64[], texts: string[]) {
+    this.format = format
+    this.offset = offset
+    this.nums = nums
+    this.texts = texts
+  }
+
+  /// The number of the field called `name`, or null when there is no such field.
+  public num(name: string): f64? {
+    const i = format.indexOf(name)
+    if (i < 0) null else nums[i]
+  }
+
+  /// The text of the field called `name`, or null when there is no such field.
+  public text(name: string): string? {
+    const i = format.indexOf(name)
+    if (i < 0) null else texts[i]
+  }
+
+  /// The time of the message in microseconds since the vehicle's boot, or -1 when its format has no TimeUS or TimeMS.
+  public timeUs(): int {
+    if (format.timeField < 0) {
+      return -1
+    }
+    const t = nums[format.timeField]
+    const us = if (format.timeIsMs) t * 1000.0 else t
+    us as int
+  }
+}
+
+/// The units and multipliers the log names, by the byte of the character that stands for them.
+export class DfTables {
+  public readonly units: Map<int, string> = new Map<int, string>()
+  public readonly mults: Map<int, f64> = new Map<int, f64>()
+
+  public setUnit(id: int, label: string): void {
+    units.set(id, label)
+  }
+
+  public setMult(id: int, mult: f64): void {
+    mults.set(id, mult)
+  }
+
+  /// The name of the unit of a field ("" when the log has none), as UNIT gave it.
+  public unitOf(field: DfField): string {
+    units.get(field.unitId) ?? ""
+  }
+
+  /// The multiplier of a field from MULT: 1 when there is none or it is not known (a log gives 0 for the id '-', "no multiplier").
+  /// It is NOT applied to the values: a field whose character scales it already (c C e E L) states the same factor (ArduPilot 4.7:
+  /// `Roll` of XKF1 is a `c` with the multiplier 0.01), and for the others this is the factor that takes the raw count to the unit
+  /// (the time of a message: `TimeUS`, a Q with the multiplier 1e-6 and the unit "s").
+  public multOf(field: DfField): f64 {
+    const m = mults.get(field.multId) ?? 1.0
+    if (m == 0.0) 1.0 else m
+  }
+}
+
+/// What went wrong while reading, counted, and the first few in words.
+export class DfProblems {
+  /// Bytes that were not part of any message and were skipped (the bytes of an FMT that was refused too): what was read plus this is
+  /// all the bytes there were.
+  public skipped: int = 0
+  /// FMT messages that were refused, and messages of a type no FMT defined.
+  public badFormats: int = 0
+  public unknownTypes: int = 0
+  /// Whether the file ended in the middle of a message.
+  public truncated: bool = false
+  /// How many problems there were in all, and the first `PROBLEMS_KEPT` of them in words.
+  public count: int = 0
+  public readonly notes: string[] = []
+
+  public note(text: string): void {
+    count += 1
+    if (notes.length < PROBLEMS_KEPT) {
+      notes.push(text)
+    }
+  }
+}
+
+/// Splits a text at commas (empty pieces count).
+function commaSeparated(text: string): string[] {
+  const out: string[] = []
+  let from = 0
+  for (let i = 0; i < text.length; i++) {
+    if (text.slice(i, i + 1) == ",") {
+      out.push(text.slice(from, i))
+      from = i + 1
+    }
+  }
+  out.push(text.slice(from, text.length))
+  out
+}
+
+/// The format an FMT payload defines, or null (with the reason in `why`) when it does not add up.
+function formatFromFmt(payload: Uint8Array, why: string[]): DfFormat? {
+  const type = readU8(payload, 0) as int
+  const length = readU8(payload, 1) as int
+  const name = readChars(payload, 2, 4)
+  const format = readChars(payload, 6, 16)
+  const labels = readChars(payload, 22, 64)
+  if (type == DF_FMT_TYPE && length != DF_FMT_LENGTH) {
+    why.push("FMT cannot be redefined")
+    return null
+  }
+  const names = commaSeparated(labels)
+  const kinds = new TextEncoder().encode(format)
+  const fields: DfField[] = []
+  let at = 0
+  for (let i = 0; i < kinds.length; i++) {
+    const kind = kinds[i] as int
+    if (sizeOfKind(kind) == 0) {
+      why.push(`${name}: the field character ${kind} is not known`)
+      return null
+    }
+    fields.push(new DfField(if (i < names.length && names[i] != "") names[i] else `field${i}`, kind, at))
+    at += sizeOfKind(kind)
+  }
+  if (at + 3 != length) {
+    why.push(`${name}: the fields take ${at + 3} bytes, the length says ${length}`)
+    return null
+  }
+  new DfFormat(type, length, name, format, labels, fields)
+}
+
+/// The number of the field character `k` at `p` in `b`, before the scale (0 for a character that is not a number: text, an array).
+function numberAt(b: Uint8Array, p: int, k: int): f64 {
+  if (k == 0x62) {
+    return readI8(b, p) as f64
+  }
+  if (k == 0x42 || k == 0x4D) {
+    return readU8(b, p) as f64
+  }
+  if (k == 0x68 || k == 0x63) {
+    return readI16(b, p) as f64
+  }
+  if (k == 0x48 || k == 0x43) {
+    return readU16(b, p) as f64
+  }
+  if (k == 0x69 || k == 0x65 || k == 0x4C) {
+    return readI32(b, p) as f64
+  }
+  if (k == 0x49 || k == 0x45) {
+    return readU32(b, p) as f64
+  }
+  if (k == 0x66) {
+    return readF32(b, p) as f64
+  }
+  if (k == 0x64) {
+    return readF64(b, p)
+  }
+  if (k == 0x71) {
+    return readI64(b, p) as f64
+  }
+  if (k == 0x51) {
+    return readU64(b, p) as f64
+  }
+  0.0
+}
+
+/// Decodes the fields of a message of format `f` out of `b`, whose payload starts at `at`.
+function decodeFields(f: DfFormat, b: Uint8Array, at: int): DfMessage {
+  const nums: f64[] = []
+  const texts: string[] = []
+  for (const field of f.fields) {
+    const p = at + field.offset
+    const k = field.kind
+    let v = 0.0
+    let s = ""
+    if (isTextKind(k)) {
+      s = readChars(b, p, field.size)
+    } else {
+      v = numberAt(b, p, k) * field.scale
+    }
+    nums.push(v)
+    texts.push(s)
+  }
+  new DfMessage(f, 0, nums, texts)
+}
+
+/// Reads messages from chunks of a log, fed with `push`, and gives them with `next`. Holds only what has not been given yet (a
+/// chunk and part of a message).
+export class DfDecoder {
+  /// The formats by type (a byte), the ones defined so far.
+  public readonly formats: (DfFormat | null)[] = []
+  public readonly tables: DfTables = new DfTables()
+  public readonly problems: DfProblems = new DfProblems()
+  /// Messages given, by now.
+  public messages: int = 0
+  /// Bytes taken in so far, and the offset in the log of the first byte of `buf`.
+  public fed: int = 0
+  buf: Uint8Array = new Uint8Array(0)
+  start: int = 0
+  base: int = 0
+  /// FMTU, UNIT and MULT have no fixed type: the type that FMT gave to those names.
+  fmtuType: int = -1
+  unitType: int = -1
+  multType: int = -1
+
+  constructor() {
+    for (let i = 0; i < 256; i++) {
+      this.formats.push(null)
+    }
+    this.formats[DF_FMT_TYPE] = new DfFormat(DF_FMT_TYPE, DF_FMT_LENGTH, "FMT", "BBnNZ", "Type,Length,Name,Format,Labels", [
+      new DfField("Type", 0x42, 0),
+      new DfField("Length", 0x42, 1),
+      new DfField("Name", 0x6E, 2),
+      new DfField("Format", 0x4E, 6),
+      new DfField("Labels", 0x5A, 22),
+    ])
+  }
+
+  /// Takes more bytes of the log. What is not a whole message yet waits for the next push.
+  public push(chunk: Uint8Array): void {
+    const rest = buf.length - start
+    const joined = new Uint8Array(rest + chunk.length)
+    for (let i = 0; i < rest; i++) {
+      joined.set(i, buf[start + i])
+    }
+    for (let i = 0; i < chunk.length; i++) {
+      joined.set(rest + i, chunk[i])
+    }
+    base += start
+    start = 0
+    buf = joined
+    fed += chunk.length
+  }
+
+  /// The next message, or null when what has been pushed has no more whole ones in it (push more, or `finish`).
+  public next(): DfMessage? {
+    while (start < buf.length) {
+      if (buf[start] != DF_HEAD1 || (start + 1 < buf.length && buf[start + 1] != DF_HEAD2)) {
+        skip(1)
+        continue
+      }
+      if (start + 3 > buf.length) {
+        return null
+      }
+      const f = formats[buf[start + 2] as int]
+      if (f == null) {
+        problems.unknownTypes += 1
+        problems.note(`message of type ${buf[start + 2]} at ${base + start} has no format`)
+        skip(1)
+        continue
+      }
+      if (start + f!.length > buf.length) {
+        return null
+      }
+      const at = start
+      start += f!.length
+      const m = taken(f!, at)
+      if (m != null) {
+        messages += 1
+        return m
+      }
+    }
+    null
+  }
+
+  /// How many bytes are held, waiting for the rest of a message (never more than a chunk and a message).
+  public held(): int {
+    buf.length - start
+  }
+
+  /// Ends the log: bytes left over that are not a whole message are a truncated end.
+  public finish(): void {
+    if (start < buf.length) {
+      problems.truncated = true
+      problems.skipped += buf.length - start
+      start = buf.length
+    }
+  }
+
+  /// Drops `n` bytes that belong to no message.
+  skip(n: int): void {
+    problems.skipped += n
+    start += n
+  }
+
+  /// The message at `at` (a whole one, of format `f`), or null for one that only defines something (FMT, UNIT, MULT, FMTU are
+  /// returned too: null is for an FMT that was refused).
+  taken(f: DfFormat, at: int): DfMessage? {
+    const payload = buf.slice(at + 3, at + f.length)
+    if (f.type == DF_FMT_TYPE) {
+      return fmtMessage(f, payload, at)
+    }
+    const m = decodeFields(f, payload, 0)
+    const msg = new DfMessage(f, base + at, m.nums, m.texts)
+    note(msg)
+    msg
+  }
+
+  /// An FMT message: defines the format it describes (when it adds up) and is given as a message too.
+  fmtMessage(f: DfFormat, payload: Uint8Array, at: int): DfMessage? {
+    const why: string[] = []
+    const defined = formatFromFmt(payload, why)
+    if (defined == null) {
+      problems.badFormats += 1
+      problems.skipped += f.length
+      problems.note(`FMT at ${base + at} refused: ${why.join("; ")}`)
+      return null
+    }
+    const d = defined!
+    formats[d.type] = d
+    if (d.name == "FMTU") fmtuType = d.type
+    else if (d.name == "UNIT") unitType = d.type
+    else if (d.name == "MULT") multType = d.type
+    const m = decodeFields(f, payload, 0)
+    new DfMessage(f, base + at, m.nums, m.texts)
+  }
+
+  /// Takes note of the messages that carry units and multipliers.
+  note(m: DfMessage): void {
+    const t = m.format.type
+    if (t == unitType) {
+      const id = m.num("Id")
+      const label = m.text("Label")
+      if (id != null && label != null) {
+        tables.setUnit(id! as int, label!)
+      }
+    } else if (t == multType) {
+      const id = m.num("Id")
+      const mult = m.num("Mult")
+      if (id != null && mult != null) {
+        tables.setMult(id! as int, mult!)
+      }
+    } else if (t == fmtuType) {
+      unitsOfFormat(m)
+    }
+  }
+
+  /// FMTU: gives the fields of a format their unit and multiplier ids.
+  unitsOfFormat(m: DfMessage): void {
+    const type = m.num("FmtType")
+    const units = m.text("UnitIds")
+    const mults = m.text("MultIds")
+    if (type == null || units == null || mults == null || type! < 0.0 || type! > 255.0) {
+      return
+    }
+    const f = formats[type! as int]
+    if (f == null) {
+      return
+    }
+    const u = new TextEncoder().encode(units!)
+    const k = new TextEncoder().encode(mults!)
+    for (let i = 0; i < f!.fields.length; i++) {
+      f!.fields[i].unitId = if (i < u.length) u[i] as int else 0
+      f!.fields[i].multId = if (i < k.length) k[i] as int else 0
+    }
+  }
+}
+
+/// A log read from a stream, one message at a time.
+export class DataFlashReader {
+  public readonly decoder: DfDecoder = new DfDecoder()
+  readonly stream: ByteStream
+  ended: bool = false
+
+  constructor(stream: ByteStream) {
+    this.stream = stream
+  }
+
+  /// The next message, or null at the end of the log.
+  public async next(): Promise<DfMessage?> throws Error {
+    while (true) {
+      const m = decoder.next()
+      if (m != null) {
+        return m
+      }
+      if (ended) {
+        return null
+      }
+      const chunk = await stream.read()
+      if (chunk == null) {
+        ended = true
+        decoder.finish()
+      } else {
+        decoder.push(chunk!)
+      }
+    }
+    null
+  }
+}
+
+/// Where the messages of each type are in a log, for a log that is not held in memory: the offsets of the first `maxOffsets`
+/// messages in all (and how many there are of each type, always).
+export class DfIndex {
+  public readonly offsets: Map<int, int[]> = new Map<int, int[]>()
+  public readonly counts: Map<int, int> = new Map<int, int>()
+  /// The most offsets kept in all; past it the counts go on and the offsets do not.
+  public readonly maxOffsets: int
+  public kept: int = 0
+  public truncated: bool = false
+
+  constructor(maxOffsets: int = 1000000) {
+    this.maxOffsets = maxOffsets
+  }
+
+  public add(type: int, offset: int): void {
+    counts.set(type, (counts.get(type) ?? 0) + 1)
+    if (kept >= maxOffsets) {
+      truncated = true
+      return
+    }
+    let list = offsets.get(type)
+    if (list == null) {
+      list = []
+      offsets.set(type, list!)
+    }
+    list!.push(offset)
+    kept += 1
+  }
+
+  /// How many messages of the type there are.
+  public count(type: int): int {
+    counts.get(type) ?? 0
+  }
+
+  /// The offsets of the messages of the type that were kept (the first ones).
+  public offsetsOf(type: int): int[] {
+    offsets.get(type) ?? []
+  }
+}
+
+/// Reads a whole log from `stream` and indexes it, holding only the index.
+export async function indexLog(stream: ByteStream, maxOffsets: int = 1000000): Promise<DfIndex> throws Error {
+  const reader = new DataFlashReader(stream)
+  const index = new DfIndex(maxOffsets)
+  while (true) {
+    const m = await reader.next()
+    if (m == null) {
+      break
+    }
+    index.add(m!.format.type, m!.offset)
+  }
+  index
+}
+
+/// Writes logs, for tests: the same format the reader reads. Formats are defined with `define` (which writes the FMT message),
+/// messages are added with `add`, and `bytes` gives the log.
+export class DfEncoder {
+  public readonly formats: (DfFormat | null)[] = []
+  parts: Uint8Array[] = []
+  total: int = 0
+
+  constructor() {
+    for (let i = 0; i < 256; i++) {
+      this.formats.push(null)
+    }
+  }
+
+  /// Defines a type (and writes its FMT). Returns false when the format does not add up.
+  public define(type: int, name: string, format: string, labels: string): bool {
+    const kinds = new TextEncoder().encode(format)
+    let size = 3
+    for (let i = 0; i < kinds.length; i++) {
+      size += sizeOfKind(kinds[i] as int)
+    }
+    if (type < 1 || type > 255 || type == DF_FMT_TYPE || size > DF_MAX_MESSAGE || name.length > 4 || format.length > 16 || labels.length > 64) {
+      return false
+    }
+    const payload = new Uint8Array(DF_FMT_LENGTH - 3)
+    payload.set(0, type)
+    payload.set(1, size)
+    putText(payload, 2, 4, name)
+    putText(payload, 6, 16, format)
+    putText(payload, 22, 64, labels)
+    const why: string[] = []
+    const f = formatFromFmt(payload, why)
+    if (f == null) {
+      return false
+    }
+    formats[type] = f
+    write(DF_FMT_TYPE, payload)
+    true
+  }
+
+  /// Writes a message of a defined type: `nums` and `texts` have a value for each field (the unused one 0 or ""). A number is
+  /// the value, not the raw count: it is divided by the field character's scale. Returns false for a type that is not defined.
+  public add(type: int, nums: f64[], texts: string[]): bool {
+    const f = formats[type]
+    if (f == null) {
+      return false
+    }
+    const payload = new Uint8Array(f!.length - 3)
+    for (let i = 0; i < f!.fields.length; i++) {
+      const field = f!.fields[i]
+      const v = if (i < nums.length) nums[i] else 0.0
+      const raw = v / field.scale
+      const k = field.kind
+      if (k == 0x66) {
+        writeF32(payload, field.offset, v as f32)
+      } else if (k == 0x64) {
+        writeF64(payload, field.offset, v)
+      } else if (isTextKind(k)) {
+        putText(payload, field.offset, field.size, if (i < texts.length) texts[i] else "")
+      } else if (k != 0x61) {
+        writeUint(payload, field.offset, field.size, roundOf(raw))
+      }
+    }
+    write(type, payload)
+    true
+  }
+
+  /// Writes bytes as they are (garbage, a cut message): for tests of damaged logs.
+  public raw(b: Uint8Array): void {
+    parts.push(b)
+    total += b.length
+  }
+
+  public bytes(): Uint8Array {
+    const out = new Uint8Array(total)
+    let at = 0
+    for (const part of parts) {
+      for (let i = 0; i < part.length; i++) {
+        out.set(at, part[i])
+        at += 1
+      }
+    }
+    out
+  }
+
+  write(type: int, payload: Uint8Array): void {
+    const m = new Uint8Array(3 + payload.length)
+    m.set(0, DF_HEAD1)
+    m.set(1, DF_HEAD2)
+    m.set(2, type)
+    for (let i = 0; i < payload.length; i++) {
+      m.set(3 + i, payload[i])
+    }
+    raw(m)
+  }
+}
+
+/// The nearest integer to `v` (halves away from zero).
+function roundOf(v: f64): int {
+  (if (v < 0.0) v - 0.5 else v + 0.5) as int
+}
+
+/// Writes `text` into `n` bytes at `at`, cut at `n` and padded with zeros.
+function putText(b: Uint8Array, at: int, n: int, text: string): void {
+  const bytes = new TextEncoder().encode(text)
+  for (let i = 0; i < n; i++) {
+    b.set(at + i, if (i < bytes.length) bytes[i] else 0)
+  }
+}
