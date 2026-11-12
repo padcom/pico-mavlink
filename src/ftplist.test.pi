@@ -69,16 +69,76 @@ function parsesFilesAndDirectories(): void throws FtpError {
   expect(l.entries[0].time == null).toBe(true)
 }
 
-function parsesATimeWhenThereIsOne(): void throws FtpError {
-  const l = parseListing(listing(["Fa.BIN\t1200\t1783000000", "Fb.BIN\t5"]))
+function parsesATimeInAListingWithTime(): void throws FtpError {
+  const l = parseListing(listing(["Fa.BIN\t1200\t1783000000", "Fb.BIN\t5\t0", "Dsub\t0\t1783000001", "S"]), true)
+  expect(l.count).toBe(4)
+  expect(l.entries.length).toBe(3)
   expect(l.entries[0].time!).toBe(1783000000)
+  // A time of 0 is no time (the vehicle has none), not 1970.
   expect(l.entries[1].time == null).toBe(true)
+  expect(l.entries[2].directory).toBe(true)
+  expect(l.entries[2].time!).toBe(1783000001)
+}
+
+function refusesATimeInAPlainListing(): void {
+  // In a plain listing a name with a tab in it arrives as it is: `a<TAB>5` of 100 bytes is `Fa\t5\t100`. It must not be read as the
+  // file `a` of 5 bytes made at time 100.
+  const bad = [["Fa\t5\t100"], ["Dsub\t0\t5"]]
+  for (const entries of bad) {
+    try {
+      parseListing(listing(entries), false)
+      expect(entries[0]).toBe("believed")
+    } catch (e: FtpError) {
+      expect(e.code).toBe("FTP_PROTOCOL")
+    }
+  }
+}
+
+function refusesAnEntryWithoutATimeInAListingWithTime(): void {
+  const bad = [["Fa\t5"], ["Dsub"], ["Fa\t5\tsoon"], ["Fa\t5\t1\t2"]]
+  for (const entries of bad) {
+    try {
+      parseListing(listing(entries), true)
+      expect(entries[0]).toBe("believed")
+    } catch (e: FtpError) {
+      expect(e.code).toBe("FTP_PROTOCOL")
+    }
+  }
+}
+
+function refusesNamesThatAreNotUtf8(): void {
+  // Two different names that a decoder turns into the same text would be taken for one name twice.
+  const bad: int[][] = [[0x46, 0xFF, 0x09, 0x31, 0], [0x46, 0xC3, 0x09, 0x31, 0], [0x46, 0xC0, 0x80, 0x09, 0x31, 0], [0x46, 0xED, 0xA0, 0x80, 0x09, 0x31, 0], [0x46, 0xF4, 0x90, 0x80, 0x80, 0x09, 0x31, 0]]
+  for (const bytes of bad) {
+    const b = new Uint8Array(bytes.length)
+    for (let i = 0; i < bytes.length; i++) {
+      b.set(i, bytes[i])
+    }
+    try {
+      parseListing(b)
+      expect(bytes.join(",")).toBe("refused")
+    } catch (e: FtpError) {
+      expect(e.code).toBe("FTP_PROTOCOL")
+    }
+  }
+}
+
+function acceptsNamesInUtf8(): void throws FtpError {
+  const l = parseListing(listing(["Fżółć.BIN\t5", "Fdata_日本.BIN\t7", "Fsmile_😀\t1"]))
+  expect(l.entries.map((e) => e.name).join(",")).toBe("żółć.BIN,data_日本.BIN,smile_😀")
 }
 
 function skipsSkipEntriesButCountsThem(): void throws FtpError {
   const l = parseListing(listing(["S", "Fa\t1"]))
   expect(l.count).toBe(2)
   expect(l.entries.length).toBe(1)
+}
+
+function leavesOutDotAndDotDot(): void throws FtpError {
+  // A real vehicle (ArduPilot SITL) lists them: they count for the offset and are not returned.
+  const l = parseListing(listing(["D.", "D..", "Feeprom.bin\t16384", "D@ROMFS"]))
+  expect(l.count).toBe(4)
+  expect(l.entries.map((e) => e.name).join(",")).toBe("eeprom.bin,@ROMFS")
 }
 
 function refusesEntriesThatAreNotEntries(): void {
@@ -122,6 +182,9 @@ async function listsALogDirectory(): Promise<void> throws Error {
   expect(entries[0].directory).toBe(false)
   // The vehicle gave no time, so there is none: it is not made up.
   expect(entries[0].time == null).toBe(true)
+  // ListDirectoryWithTime (16) is asked first; the listing is ended with a terminate of session 0.
+  expect(r.sim.ftpLog[0].startsWith("16 s0 o0")).toBe(true)
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
 }
 
 async function listsDirectoriesAndFilesAndTheRoot(): Promise<void> throws Error {
@@ -138,12 +201,63 @@ async function listsDirectoriesAndFilesAndTheRoot(): Promise<void> throws Error 
 
 async function givesTheTimeWhenTheVehicleDoes(): Promise<void> throws Error {
   const r = withLogs()
-  r.sim.listTimes = true
   r.sim.fsTimes.set("/APM/LOGS/00000001.BIN", 1783000000)
   const entries = await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/LOGS")
   r.gcs.close()
   expect(entries[0].time!).toBe(1783000000)
   expect(entries[1].time == null).toBe(true)
+}
+
+async function fallsBackToThePlainListingAndRemembersIt(): Promise<void> throws Error {
+  const r = withLogs()
+  r.sim.fsTimes.set("/APM/LOGS/00000001.BIN", 1783000000)
+  r.sim.ftpMode = "oldlist"
+  const client = new FtpClient(r.gcs, VEHICLE, FAST)
+  const first = await client.listDirectory("/APM/LOGS")
+  const second = await client.listDirectory("/APM/LOGS")
+  r.gcs.close()
+  // The old firmware gives no time, and the client does not make one up.
+  expect(first.map((e) => `${e.name}:${e.size}`).join(",")).toBe("00000001.BIN:1200,00000002.BIN:48,LASTLOG.TXT:2")
+  expect(first[0].time == null).toBe(true)
+  expect(second.length).toBe(3)
+  // 16 once (refused), then only the plain one: a page and the end of the listing, for each of the two listings.
+  const opcodes = r.sim.ftpLog.filter((line) => line.startsWith("16 ") || line.startsWith("3 ")).map((line) => line.split(" ")[0])
+  expect(opcodes.join(",")).toBe("16,3,3,3,3")
+}
+
+async function skipsANameWithATabInAListingWithTime(): Promise<void> throws Error {
+  const r = withLogs()
+  r.sim.fsFiles.set("/APM/LOGS/a\t5", file(100))
+  const entries = await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/LOGS")
+  r.gcs.close()
+  // The vehicle writes `S` for it: it is left out, and the rest is listed.
+  expect(entries.map((e) => e.name).join(",")).toBe("00000001.BIN,00000002.BIN,LASTLOG.TXT")
+}
+
+async function refusesANameWithATabInAPlainListing(): Promise<void> throws Error {
+  const r = withLogs()
+  r.sim.fsFiles.set("/APM/LOGS/a\t5", file(100))
+  r.sim.ftpMode = "oldlist"
+  try {
+    await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/LOGS")
+    expect("listed").toBe("refused")
+  } catch (e: FtpError) {
+    // Not the file `a` of 5 bytes made at time 100.
+    expect(e.code).toBe("FTP_PROTOCOL")
+  }
+  r.gcs.close()
+}
+
+async function endsTheListingAlsoAfterAFailure(): Promise<void> throws Error {
+  const r = withLogs()
+  try {
+    await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/NOPE")
+    expect("listed").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_ERRNO")
+  }
+  r.gcs.close()
+  expect(r.sim.ftpLog[r.sim.ftpLog.length - 1].startsWith("1 s0")).toBe(true)
 }
 
 async function listsAnEmptyDirectoryAsEmpty(): Promise<void> throws Error {
@@ -176,7 +290,7 @@ async function takesManyPagesAndSkipsWhatItHas(): Promise<void> throws Error {
   expect(entries[69].name).toBe("10000069.BIN")
   expect(entries[69].size).toBe(169)
   // More than one request, each skipping the entries already read.
-  const asks = r.sim.ftpLog.filter((line) => line.startsWith("3 "))
+  const asks = r.sim.ftpLog.filter((line) => line.startsWith("16 "))
   expect(asks.length > 2).toBe(true)
   expect(asks[0].includes("o0")).toBe(true)
   expect(asks[1].includes("o0")).toBe(false)
@@ -188,7 +302,7 @@ async function takesPagesOfAGivenSize(): Promise<void> throws Error {
   const entries = await new FtpClient(r.gcs, VEHICLE, FAST).listDirectory("/APM/LOGS")
   r.gcs.close()
   expect(entries.length).toBe(3)
-  const asks = r.sim.ftpLog.filter((line) => line.startsWith("3 "))
+  const asks = r.sim.ftpLog.filter((line) => line.startsWith("16 "))
   expect(asks.map((line) => line.split(" ")[2]).join(",")).toBe("o0,o1,o2,o3")
 }
 
@@ -282,13 +396,22 @@ async function isCancelled(): Promise<void> throws Error {
 
 describe("the directory listing of the FTP client", () => {
   it("parses files (name and size) and directories", parsesFilesAndDirectories)
-  it("parses a time when the entry has one, and has none when it does not", parsesATimeWhenThereIsOne)
+  it("parses a time in a listing with time (0 is none), also for a directory", parsesATimeInAListingWithTime)
+  it("refuses a third field in a plain listing: a name with a tab in it is not a size and a time", refusesATimeInAPlainListing)
+  it("refuses an entry without a time, or with too many fields, in a listing with time", refusesAnEntryWithoutATimeInAListingWithTime)
+  it("refuses names that are not UTF-8, so that none is taken for another", refusesNamesThatAreNotUtf8)
+  it("accepts names in UTF-8", acceptsNamesInUtf8)
   it("counts a skip entry and does not return it", skipsSkipEntriesButCountsThem)
+  it("leaves out \".\" and \"..\", and counts them", leavesOutDotAndDotDot)
   it("refuses entries that are not entries: a size that is not a number, none, no name, an unknown kind, more fields", refusesEntriesThatAreNotEntries)
   it("refuses an entry that is cut off (no NUL)", refusesAnEntryThatIsCutOff)
   it("lists the logs of a directory: names and sizes, no time unless the vehicle gives one", listsALogDirectory)
   it("lists directories and files, the root, and a path with a slash at its end", listsDirectoriesAndFilesAndTheRoot)
   it("gives the time of a file when the vehicle does", givesTheTimeWhenTheVehicleDoes)
+  it("falls back to the plain listing for firmware without ListDirectoryWithTime, and remembers it", fallsBackToThePlainListingAndRemembersIt)
+  it("leaves out a name with a tab in a listing with time (the vehicle writes S)", skipsANameWithATabInAListingWithTime)
+  it("refuses a name with a tab in a plain listing instead of reading it as a size and a time", refusesANameWithATabInAPlainListing)
+  it("ends the listing with a terminate also after a failure", endsTheListingAlsoAfterAFailure)
   it("lists an empty directory as empty", listsAnEmptyDirectoryAsEmpty)
   it("fails as the vehicle says for a directory that is not there", failsForADirectoryThatIsNotThere)
   it("takes a long listing in pages, each skipping the entries already read", takesManyPagesAndSkipsWhatItHas)

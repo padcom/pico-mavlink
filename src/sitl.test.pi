@@ -15,6 +15,7 @@ import { MavLinkConnection } from "./connection"
 import { TcpStream } from "./stream"
 import { AutopilotVersionRead, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
+import { FtpClient, FtpEntry } from "./ftp"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
 import { MavParamType } from "./dialects/common"
 
@@ -240,7 +241,44 @@ async function disabledFtpFallsBackToTheList(): Promise<void> throws Error {
   }
 }
 
+/// One entry as a line: "name (dir|file, size, time)".
+function showEntry(e: FtpEntry): string {
+  `${e.name} (${if (e.directory) "dir" else "file"}, ${e.size}, ${if (e.time == null) "no time" else `${e.time!}`})`
+}
+
+async function listsTheFileSystem(): Promise<void> throws Error {
+  const sitl = await startSitl()
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    const client = new FtpClient(s.conn, s.target, { timeoutMs: 1000, retries: 3 })
+    await client.reset()
+    const root = await client.listDirectory("/")
+    println(`ArduCopter SITL, "/": ${root.map((e) => showEntry(e)).join("; ")}`)
+    // A listing has entries, and not "." or "..": the client leaves them out.
+    expect(root.length > 0).toBe(true)
+    for (const e of root) {
+      expect(e.name != "." && e.name != "..").toBe(true)
+    }
+    // The vehicle knows ListDirectoryWithTime, so a time is there when it has one, else none (never made up).
+    println(`  the listing used ${if (client.listMode == 1) "ListDirectoryWithTime" else "the plain ListDirectory"}`)
+    for (const e of root) {
+      if (e.directory && e.name.startsWith("@")) {
+        const inside = await client.listDirectory(`/${e.name}`)
+        println(`  /${e.name}: ${inside.map((x) => showEntry(x)).join("; ")}`)
+      }
+    }
+    // Nothing is left open on the vehicle: a file can be opened at once.
+    await client.reset()
+  } finally {
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
+  it("lists its file system, with a time where it has one", listsTheFileSystem)
   it("gives the whole parameter list by file transfer in under 2 s, the same as the list", ftpGivesTheListFastAndTheSame)
   it("falls back to the list when FTP is disabled by BRD_OPTIONS", disabledFtpFallsBackToTheList)
 })

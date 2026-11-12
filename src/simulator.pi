@@ -157,7 +157,7 @@ export class SimulatedAutopilot {
   /// How the FTP server misbehaves, for tests: `ok`; `unsupported` (every open fails with ENOENT, though the capability is set);
   /// `silent` (it never answers an FTP request); `corrupt` (the file has a wrong magic); `incomplete` (the file says the vehicle
   /// has more parameters than it holds); `busy` (every open: no session free); `einval` (every read: EINVAL); `repeat` and `endless` (a burst that sends the first chunk again and again, or chunks at
-  /// ever higher offsets with no end, until the mode is changed); `relist` and `emptylist` (a listing that repeats its first page, or answers with
+  /// ever higher offsets with no end, until the mode is changed); `oldlist` (firmware without ListDirectoryWithTime: UNKNOWN_COMMAND), `relist` and `emptylist` (a listing that repeats its first page, or answers with
   /// nothing and no end).
   public ftpMode: string = "ok"
   /// The share of FTP packets it drops on their way out, in percent (a lossy link), from a seeded sequence.
@@ -173,8 +173,6 @@ export class SimulatedAutopilot {
   public readonly fsTimes: Map<string, int> = new Map<string, int>()
   /// Directories that exist with nothing in them.
   public readonly fsDirs: string[] = []
-  /// Whether a file's entry in a listing carries its time (`F<name>\t<size>\t<time>`), as a vehicle may give it.
-  public listTimes: bool = false
   /// The most entries one reply of ListDirectory carries (0: as many as fit in a packet), to make a listing take many pages.
   public ftpListPage: int = 0
   /// What the FTP server was asked, one line each: "<opcode> s<session> o<offset> n<size>".
@@ -510,7 +508,10 @@ export class SimulatedAutopilot {
     } else if (req.opcode == FtpOpcode.OPEN_FILE_RO) {
       ftpOpen(ask)
     } else if (req.opcode == FtpOpcode.LIST_DIRECTORY) {
-      ftpList(ask)
+      ftpList(ask, false)
+    } else if (req.opcode == FtpOpcode.LIST_DIRECTORY_WITH_TIME && ftpMode != "oldlist") {
+      // Firmware from before ListDirectoryWithTime (mode `oldlist`) does not know the opcode.
+      ftpList(ask, true)
     } else if (req.opcode == FtpOpcode.READ_FILE) {
       ftpRead(ask)
     } else if (req.opcode == FtpOpcode.BURST_READ_FILE) {
@@ -540,8 +541,19 @@ export class SimulatedAutopilot {
     if (up.length == 0) "/" else up
   }
 
-  /// The entries of the directory `dir` as the vehicle writes them, or null when there is no such directory.
-  fsEntries(dir: string): string[]? {
+  /// One entry as ListDirectory (`withTime` false) or ListDirectoryWithTime writes it.
+  fsEntry(kind: string, name: string, size: int, mtime: int, withTime: bool): string {
+    if (!withTime) {
+      return if (kind == "D") `D${name}` else `F${name}\t${size}`
+    }
+    if (name.includes("\t")) "S" else `${kind}${name}\t${size}\t${mtime}`
+  }
+
+  /// The entries of the directory `dir` as the vehicle writes them, or null when there is no such directory. ListDirectory writes
+  /// `F<name>\t<size>` and `D<name>` (a name with a tab in it as it is, which a reader cannot tell from a size: ArduPilot does
+  /// that); ListDirectoryWithTime writes `F<name>\t<size>\t<mtime>`, `D<name>\t0\t<mtime>` and `S` for a name with a tab. The
+  /// mtime is 0 where the vehicle has no time for the file.
+  fsEntries(dir: string, withTime: bool): string[]? {
     const names: string[] = []
     const out: string[] = []
     let exists = dir == "/" || fsDirs.includes(dir)
@@ -550,7 +562,7 @@ export class SimulatedAutopilot {
         exists = true
         const time = fsTimes.get(path)
         const name = path.slice(if (dir == "/") 1 else dir.length + 1, path.length)
-        out.push(`F${name}\t${file.length}` + (if (listTimes && time != null) `\t${time!}` else ""))
+        out.push(fsEntry("F", name, file.length, if (time != null) time! else 0, withTime))
       }
     }
     // The directories: those a path runs through, and the empty ones.
@@ -572,7 +584,7 @@ export class SimulatedAutopilot {
           const name = d.slice(if (dir == "/") 1 else dir.length + 1, d.length)
           if (!names.includes(name)) {
             names.push(name)
-            out.push(`D${name}`)
+            out.push(fsEntry("D", name, 0, 0, withTime))
           }
         }
         d = up
@@ -583,14 +595,14 @@ export class SimulatedAutopilot {
 
   /// ListDirectory: the entries of a directory from the offset (the number of entries to skip), as many as fit in a packet (or
   /// `ftpListPage`), each ending in a NUL; EOF at and after the end; ENOENT (FailErrno) for a directory that is not there.
-  ftpList(ask: FtpAsk): void {
+  ftpList(ask: FtpAsk, withTime: bool): void {
     const req = ask.req
     let path = ""
     try {
       path = new TextDecoder().decode(req.data)
     } catch (e: TypeError) {
     }
-    const entries = fsEntries(fsClean(path))
+    const entries = fsEntries(fsClean(path), withTime)
     if (entries == null) {
       ftpNack(ask, FtpNack.FAIL_ERRNO, 2)
       return
