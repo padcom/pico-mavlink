@@ -184,10 +184,11 @@ export class DfMessage {
     if (i < 0 || i >= lists.length || lists[i].length == 0) null else lists[i]
   }
 
-  /// The number of the field called `name`, or null when there is no such field.
+  /// The number of the field called `name`, or null when there is no such field or it is an array (`a`: a batch of samples has no
+  /// single value; use `list`).
   public num(name: string): f64? {
     const i = format.indexOf(name)
-    if (i < 0) null else nums[i]
+    if (i < 0 || format.fields[i].kind == 0x61) null else nums[i]
   }
 
   /// The text of the field called `name`, or null when there is no such field.

@@ -224,12 +224,13 @@ function readsTheDefinitionsArduPilotWrites(): void {
 /// 32 int16 for each axis. The spectrum reads them.
 function readsTheArraysOfABatchOfSamples(): void {
   const e = new DfEncoder()
-  expect(e.define(150, "ISBH", "QHBBHHf", "TimeUS,N,type,instance,mul,smp_cnt,SampleUS")).toBe(true)
+  expect(e.define(150, "ISBH", "QHBBHHQf", "TimeUS,N,type,instance,mul,smp_cnt,SampleUS,smp_rate")).toBe(true)
   expect(e.define(151, "ISBD", "QHHaaa", "TimeUS,N,seqno,x,y,z")).toBe(true)
   expect(e.formats[151]!.length).toBe(3 + 8 + 2 + 2 + 3 * 64)
+  expect(e.formats[150]!.length).toBe(31)
   expect(e.formats[151]!.hasArrays).toBe(true)
   expect(e.formats[150]!.hasArrays).toBe(false)
-  e.add(150, [1000.0, 1.0, 0.0, 0.0, 1.0, 64.0, 1000.0], ["", "", "", "", "", "", ""])
+  e.add(150, [1000.0, 1.0, 0.0, 0.0, 1.0, 64.0, 1000.0, 1000.0], ["", "", "", "", "", "", "", ""])
   const x: f64[] = []
   const y: f64[] = []
   const z: f64[] = []
@@ -259,6 +260,9 @@ function readsTheArraysOfABatchOfSamples(): void {
     expect(next.list("x")![2]).toBe(0.0)
     // Not an array, or not a field: none. The header has no arrays at all.
     expect(batch.list("seqno") == null).toBe(true)
+    // An array has no single value: num() is not found for it (a chart of it would be made-up zeros).
+    expect(batch.num("x") == null).toBe(true)
+    expect(batch.num("seqno")).toBe(0.0)
     expect(batch.list("nothing") == null).toBe(true)
     expect(m[2].list("N") == null).toBe(true)
     expect(m[2].lists.length).toBe(0)
