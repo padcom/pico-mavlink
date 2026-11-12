@@ -25,6 +25,11 @@ Status: **in development (MV1).**
 - **Done:** `SimulatedAutopilot`, an ArduPilot Copter-like vehicle on the far end of any byte
   stream. It sends heartbeats and telemetry and answers parameter requests, with deterministic
   data, for trying an application without hardware or SITL.
+- **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte
+  big-endian microsecond timestamp and one MAVLink 1 or 2 frame per record). Bounded memory (a chunk and a record), CRC-checked
+  against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,
+  segments at a step or a jump in time, 'no date' for timestamps that cannot be real, and a cut end that is not damage; a report
+  accounts for every byte. Checked against a recording of ArduPilot SITL and one that MAVProxy wrote.
 - **Done:** long STATUSTEXT messages: `StatusTextAssembler` joins the chunks (by system, component
   and `id`, in any order, interleaved), and delivers one whose chunks went missing after a timeout,
   marked truncated. `StatusTextReader` does it on a connection.

@@ -10,18 +10,19 @@ import { describe, it, expect } from "std/test"
 import { delay } from "std/timers"
 import { connect, listen } from "std/net"
 import { env, Child, Command } from "std/process"
-import { exists, mkdir, remove } from "std/fs"
+import { exists, mkdir, readBytes, remove, writeBytes } from "std/fs"
 import { MavLinkConnection, Received } from "./connection"
 import { TcpStream } from "./stream"
 import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
 import { Heartbeat } from "./dialects/minimal"
-import { MavCmd, MavParamType, MavResult, StatusText } from "./dialects/common"
+import { MavCmd, MavParamType, MavResult, RequestDataStream, StatusText } from "./dialects/common"
 import { GlobalPositionInt } from "./dialects/standard"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
 import { FtpClient, FtpEntry, FtpError, hexOf } from "./ftp"
 import { Crc32, crc32Of } from "./crc32"
 import { FileDownload, FileSink, downloadFile } from "./logdownload"
 import { DfDecoder } from "./dataflash"
+import { TLOG_TIMESTAMP_LENGTH, TlogReader, TlogWriter } from "./tlog"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
 
 /// A running SITL and the connection to it.
@@ -32,8 +33,11 @@ class Sitl {
   public readonly target: Target
   public readonly encoding: ParamEncoding
   public readonly capabilities: u64
+  /// SERIAL0's TCP port; SERIAL1 is two above it.
+  public readonly port: int
 
-  constructor(child: Child, dir: string, conn: MavLinkConnection, target: Target, encoding: ParamEncoding, capabilities: u64) {
+  constructor(child: Child, dir: string, conn: MavLinkConnection, target: Target, encoding: ParamEncoding, capabilities: u64, port: int) {
+    this.port = port
     this.child = child
     this.dir = dir
     this.conn = conn
@@ -174,7 +178,7 @@ async function connectTo(child: Child, dir: string, port: int, link: MavLinkConn
   if (version == null) {
     throw new Error("SITL did not answer AUTOPILOT_VERSION")
   }
-  new Sitl(child, dir, conn, target!, encodingOf(version!.capabilities) ?? ParamEncoding.CCast, version!.capabilities)
+  new Sitl(child, dir, conn, target!, encodingOf(version!.capabilities) ?? ParamEncoding.CCast, version!.capabilities, port)
 }
 
 /// Whether an FTP value and a list value are the same parameter value: an integer above 2^24 does not travel exactly in a float,
@@ -609,9 +613,150 @@ async function writesALogWhereFtpCanSeeIt(): Promise<void> throws Error {
   }
 }
 
+/// What a tlog holds, as one line: the records by version, the messages by id, and what was skipped or cut.
+function describeTlog(r: TlogReader): string {
+  const p = r.report
+  const ids: string[] = []
+  for (const id of p.byId.keys()) {
+    ids.push(`${id}x${p.byId.get(id)}`)
+  }
+  `${p.records} records (v1 ${p.v1}, v2 ${p.v2}, signed ${p.signed}), ids ${ids.join(" ")}, crc failures ${p.crcFailures}, unknown ${p.unknown}, ` +
+    `skipped ${p.bytesSkipped} bytes, segments ${p.segments}, dated ${p.dated}, cutEnd ${p.cutEnd}`
+}
+
+/// Reads a tlog file a chunk at a time with the reader.
+async function readTlogFile(path: string): Promise<TlogReader> throws Error {
+  const bytes = await readBytes(path)
+  const reader = new TlogReader()
+  let frames: Uint8Array[] = []
+  for (let at = 0; at < bytes.length; at += 65536) {
+    reader.push(bytes.slice(at, if (at + 65536 < bytes.length) at + 65536 else bytes.length))
+    while (true) {
+      const r = reader.next()
+      if (r == null) {
+        break
+      }
+      frames.push(r!.frame)
+    }
+  }
+  reader.finish()
+  reader
+}
+
+/// The link is recorded as a ground station would (a timestamp and the frame as it came), written to a file and read back: every
+/// frame is there, whole and the same, with no CRC failure, nothing unknown and nothing skipped. SITL's own stream is the recording.
+async function recordsTheLinkAndReadsItBack(): Promise<void> throws Error {
+  const s = await startSitl()
+  if (s == null) {
+    return
+  }
+  try {
+    const writer = new TlogWriter()
+    const sent: Uint8Array[] = []
+    s.conn.on((r: Received) => {
+      writer.add((Date.now() as int) * 1000, r.packet.buffer)
+      sent.push(r.packet.buffer)
+    })
+    // Ask for every stream at 4 Hz (a ground station does), so that the recording holds attitude, position, vibration and the rest.
+    const ask = new RequestDataStream()
+    ask.targetSystem = s.target.system as u8
+    ask.targetComponent = s.target.component as u8
+    ask.reqStreamId = 0
+    ask.reqMessageRate = 4
+    ask.startStop = 1
+    await s.conn.send(ask)
+    await delay(15000)
+    const path = `${s.dir}/recording.tlog`
+    await writeBytes(path, writer.bytes())
+    const reader = await readTlogFile(path)
+    println(`sitl tlog: ${describeTlog(reader)}`)
+
+    expect(reader.report.records).toBe(sent.length)
+    expect(sent.length > 40).toBe(true)
+    expect(reader.report.crcFailures).toBe(0)
+    expect(reader.report.unknown).toBe(0)
+    expect(reader.report.bytesSkipped).toBe(0)
+    expect(reader.report.cutEnd).toBe(false)
+    expect(reader.report.segments).toBe(1)
+    expect(reader.report.dated).toBe(true)
+    // The heartbeat of the autopilot is among them.
+    expect((reader.report.byId.get(0) ?? 0) > 5).toBe(true)
+    // And what the Flights view draws from: attitude, position, system status, vibration.
+    for (const id of [30, 33, 1, 241]) {
+      expect((reader.report.byId.get(id) ?? 0) > 5).toBe(true)
+    }
+  } finally {
+    await s.stop()
+  }
+}
+
+/// With `TLOG_KEEP` set to a path, writes the recording there, cut after the last whole record that ends within 140000 bytes: how
+/// `src/fixtures/mavproxy.tlog` (the recording `readsAMavproxyRecordingFromAFile` reads with no SITL and no MAVProxy) was made.
+async function keepIfAsked(path: string): Promise<void> throws Error {
+  const to = env.get("TLOG_KEEP")
+  if (to == null || to! == "") {
+    return
+  }
+  const bytes = await readBytes(path)
+  const reader = new TlogReader()
+  let kept = 0
+  reader.push(bytes)
+  while (true) {
+    const r = reader.next()
+    if (r == null) {
+      break
+    }
+    if (kept + TLOG_TIMESTAMP_LENGTH + r!.frame.length > 140000) {
+      break
+    }
+    kept += TLOG_TIMESTAMP_LENGTH + r!.frame.length
+  }
+  await writeBytes(to!, bytes.slice(0, kept))
+  println(`kept ${kept} of ${bytes.length} bytes in ${to!}`)
+}
+
+/// A recording that another program wrote: MAVProxy (`MAVPROXY`, the path of its `mavproxy.py`, in a Python environment of its own) is
+/// connected to SITL's second serial port, writes `mav.tlog` as it always does, and is killed (so the file may end in the middle of a
+/// record, which is `cutEnd`, not damage). Our reader reads it as it is: the report is printed and what must hold for a recording a
+/// program made without a fault is asserted. Without `MAVPROXY` the test is skipped.
+async function readsARecordingAnotherProgramWrote(): Promise<void> throws Error {
+  const given = env.get("MAVPROXY")
+  if (given == null || given! == "") {
+    println("tlog oracle skipped: no MAVPROXY")
+    return
+  }
+  const s = await startSitl()
+  if (s == null) {
+    return
+  }
+  let proxy: Child? = null
+  try {
+    const args = [`--master=tcp:127.0.0.1:${s.port + 2}`, `--logfile=${s.dir}/mav.tlog`, "--daemon", "--non-interactive", "--default-modules=log"]
+    proxy = new Command(given!, args, s.dir, null, false, "null", "null", "null").spawn()
+    await delay(25000)
+    proxy!.kill("SIGKILL")
+    const reader = await readTlogFile(`${s.dir}/mav.tlog`)
+    println(`oracle tlog: ${describeTlog(reader)}`)
+
+    expect(reader.report.records > 200).toBe(true)
+    expect(reader.report.crcFailures).toBe(0)
+    expect(reader.report.bytesSkipped).toBe(0)
+    expect(reader.report.dated).toBe(true)
+    expect((reader.report.byId.get(30) ?? 0) > 10).toBe(true)
+    await keepIfAsked(`${s.dir}/mav.tlog`)
+  } finally {
+    if (proxy != null) {
+      proxy!.kill("SIGKILL")
+    }
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
   it("writes a log that FTP can see: where, when, and what it looks like (the spike; SITL_FLIGHT=1)", writesALogWhereFtpCanSeeIt)
   it("downloads a file by FTP, in order, and the vehicle's CRC-32 is ours; going on from the middle gives the same file", downloadsAFileAndMatchesItsCrc)
+  it("is recorded as a tlog and read back: every frame, whole and the same", recordsTheLinkAndReadsItBack)
+  it("reads a recording that another program wrote (MAVPROXY)", readsARecordingAnotherProgramWrote)
   it("lists its file system, with a time where it has one", listsTheFileSystem)
   it("gives the whole parameter list by file transfer in under 2 s, the same as the list", ftpGivesTheListFastAndTheSame)
   it("falls back to the list when FTP is disabled by BRD_OPTIONS", disabledFtpFallsBackToTheList)

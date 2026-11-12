@@ -1,0 +1,470 @@
+// A streaming reader for a `.tlog`, the recording a ground station makes of a MAVLink link: for each record an 8-byte big-endian
+// timestamp in microseconds since 1970, then one MAVLink 1 or 2 frame, exactly as it was on the wire. And the writer that makes one
+// (for fixtures and tests, and for a program that records).
+//
+// The reader is for files of any size and any content. It takes the bytes in chunks of the caller's choosing (`push`) and gives
+// the records one at a time (`next`); it holds the chunk and less than a record, never the file. It checks what it can:
+//   - a frame of a message the dialect knows is whole only if its CRC (with the message's CRC-extra) matches; one that does not is
+//     counted (`crcFailures`) and the reader looks again from the next byte, so garbage in the middle costs the garbage;
+//   - a frame of a message it does not know cannot have its CRC checked: it is skipped whole, counted as `unknown` ("unverified
+//     unknown frames"), and only where its timestamp is where the recording is (not before the last record, not far after it), so
+//     that noise is not mistaken for frames;
+//   - a MAVLink 2 frame with the signed flag has its 13-byte signature skipped and counted (`signed`); it is NOT verified (the key
+//     is not known here), and is never given as authentic;
+//   - a timestamp that goes backwards, or jumps by more than `maxGapUs`, starts a new segment (`segment` of the record, `segments`
+//     of the report) so that nothing draws a line across the gap; records stay in the order of the file, never sorted;
+//   - a timestamp the clock of the world cannot have had (before 2000, or beyond a year from now) makes the file `dated: false`:
+//     the times are then relative to the first record;
+//   - bytes that are no record are skipped and counted (`bytesSkipped`); a record cut by the end of the file is `cutEnd`, which is
+//     not damage (a recording cut by a power loss is normal).
+// Every byte fed is accounted for: `bytesFed` = `bytesInRecords` + `bytesUnknown` + `bytesSkipped` + `bytesCut` + `waiting`.
+import { MSG_ID_MAGIC_NUMBER } from "./dialects/magic-numbers"
+import { MavLinkData } from "./data"
+import { readUint } from "./bytes"
+import { x25crc } from "./crc"
+import { CHECKSUM_LENGTH, MavLinkError, MavLinkProtocolV1, MavLinkProtocolV2, SIGNATURE_LENGTH } from "./protocol"
+
+/// The timestamp in front of every frame.
+export const TLOG_TIMESTAMP_LENGTH: int = 8
+
+/// The longest frame: a MAVLink 2 header (10), 255 bytes of payload, the checksum and a signature.
+export const TLOG_MAX_FRAME: int = 10 + 255 + CHECKSUM_LENGTH + SIGNATURE_LENGTH
+
+/// A step of time in a recording above this (microseconds) starts a new segment: 30 s.
+export const TLOG_MAX_GAP_US: int = 30000000
+
+/// A step back in time of up to this (microseconds) is jitter, not a new stretch: 1 s. Real recordings step back a little (frames are
+/// stamped when they are received and written through a queue, several links swap, a clock is set by NTP); only more than this is a
+/// step back that starts a segment.
+export const TLOG_JITTER_US: int = 1000000
+
+/// 2000-01-01 and a year (366 days) in microseconds since 1970.
+const YEAR_2000_US: int = 946684800000000
+const A_YEAR_US: int = 31622400000000
+
+/// The options of a reader.
+export struct TlogOptions {
+  /// The CRC-extra by message id: the messages the recording may carry (default: every generated dialect).
+  magicNumbers?: Map<int, int>
+  /// A step of time above this starts a new segment (default `TLOG_MAX_GAP_US`).
+  maxGapUs?: int
+  /// A step back of up to this is jitter and stays in the segment (default `TLOG_JITTER_US`).
+  jitterUs?: int
+  /// The time now, in microseconds since 1970, for judging whether a timestamp can be real (default: the clock).
+  nowUs?: int
+}
+
+/// One record of a recording: when, and the frame as it was on the wire.
+export class TlogRecord {
+  /// Microseconds since 1970, as recorded (relative to something else if the file is not `dated`).
+  public readonly timeUs: int
+  /// Which stretch of the recording it is in: 0, and one more at every step back in time or jump forward.
+  public readonly segment: int
+  /// The whole frame, a copy.
+  public readonly frame: Uint8Array
+  public readonly v2: bool
+  /// A MAVLink 2 frame that carries a signature: skipped, never verified.
+  public readonly signed: bool
+  public readonly msgid: int
+  public readonly sysid: int
+  public readonly compid: int
+  public readonly seq: int
+
+  constructor(timeUs: int, segment: int, frame: Uint8Array, v2: bool, signed: bool, msgid: int) {
+    this.timeUs = timeUs
+    this.segment = segment
+    this.frame = frame
+    this.v2 = v2
+    this.signed = signed
+    this.msgid = msgid
+    const at = if (v2) 5 else 3
+    this.seq = frame[if (v2) 4 else 2]
+    this.sysid = frame[at]
+    this.compid = frame[at + 1]
+  }
+
+  /// The payload as it was sent (a MAVLink 2 payload may be cut short of its message's length: decoding reads zeros past its end).
+  public payload(): Uint8Array {
+    const from = if (v2) 10 else 6
+    frame.slice(from, from + frame[1])
+  }
+}
+
+/// What a reader found, so far.
+export class TlogReport {
+  /// Records given, by their frame's version, and how many of the MAVLink 2 ones are signed.
+  public records: int = 0
+  public v1: int = 0
+  public v2: int = 0
+  public signed: int = 0
+  /// Records given, by message id.
+  public readonly byId: Map<int, int> = new Map<int, int>()
+  /// Frames of a known message whose CRC was wrong (a false start of a frame counts too).
+  public crcFailures: int = 0
+  /// Frames of messages the dialect does not have, skipped whole (their CRC could not be checked).
+  public unknown: int = 0
+  /// Steps of time backwards (by more than the jitter), and jumps forward of more than the gap: each started a segment.
+  public backwards: int = 0
+  public jumps: int = 0
+  /// Steps back of up to the jitter (records and skipped unknown frames): counted, and no new segment.
+  public jitter: int = 0
+  /// The segments, 1 for a recording that never stepped.
+  public segments: int = 0
+  /// The first and the last time as recorded, in microseconds; both 0 before the first record.
+  public firstUs: int = 0
+  public lastUs: int = 0
+  /// Whether the first timestamp can be a real date (2000 to a year from now). When it cannot, the times are relative.
+  public dated: bool = true
+  /// The bytes fed, in records, in skipped unknown frames, skipped as no record, and cut off at the end.
+  public bytesFed: int = 0
+  public bytesInRecords: int = 0
+  public bytesUnknown: int = 0
+  public bytesSkipped: int = 0
+  public bytesCut: int = 0
+  /// Whether the file ends in the middle of a record (normal for a recording that was cut), after `finish`.
+  public cutEnd: bool = false
+}
+
+/// The reader.
+export class TlogReader {
+  public readonly report: TlogReport = new TlogReport()
+  readonly magicNumbers: Map<int, int>
+  readonly maxGapUs: int
+  readonly jitterUs: int
+  readonly nowUs: int
+  /// Records found in the tail by `finish` (a few at most), given by `next` first.
+  readonly rescued: TlogRecord[] = []
+  /// Set by `finish`: a start of a frame that is not whole is looked at, not waited for.
+  ending: bool = false
+  buffer: Uint8Array = new Uint8Array(4096)
+  start: int = 0
+  end: int = 0
+  /// The time of the last record given (or skipped as an unknown frame), -1 before the first.
+  last: int = -1
+  segment: int = 0
+  done: bool = false
+
+  constructor(options: TlogOptions = {}) {
+    this.magicNumbers = options.magicNumbers ?? MSG_ID_MAGIC_NUMBER
+    this.maxGapUs = options.maxGapUs ?? TLOG_MAX_GAP_US
+    this.jitterUs = options.jitterUs ?? TLOG_JITTER_US
+    this.nowUs = options.nowUs ?? (Date.now() as int) * 1000
+  }
+
+  /// The size of the buffer: a chunk and a record, whatever the file.
+  public get capacity(): int {
+    buffer.length
+  }
+
+  /// The bytes fed that no record has taken yet: less than a record, once `next` has returned null.
+  public get waiting(): int {
+    end - start
+  }
+
+  /// Feeds the next chunk of the file. Call `next` until it gives null before feeding another, so that only a record is ever kept.
+  public push(chunk: Uint8Array): void {
+    if (done) {
+      return
+    }
+    report.bytesFed += chunk.length
+    const waitingNow = end - start
+    if (end + chunk.length > buffer.length) {
+      let size = buffer.length
+      while (waitingNow + chunk.length > size) {
+        size *= 2
+      }
+      const moved = new Uint8Array(size)
+      moved.setAll(buffer.slice(start, end), 0)
+      buffer = moved
+      start = 0
+      end = waitingNow
+    }
+    buffer.setAll(chunk, end)
+    end += chunk.length
+  }
+
+  /// The next record, or null when what is fed holds no more whole record (feed more, or `finish`).
+  public next(): TlogRecord? {
+    if (rescued.length > 0) {
+      const first = rescued[0]
+      rescued.splice(0, 1)
+      return first
+    }
+    scan()
+  }
+
+  /// The next record in what is fed, skipping what is no record.
+  scan(): TlogRecord? {
+    while (true) {
+      if (end - start < TLOG_TIMESTAMP_LENGTH + 2) {
+        return null
+      }
+      const begin = buffer[start + TLOG_TIMESTAMP_LENGTH]
+      if (begin != MavLinkProtocolV1.START_BYTE && begin != MavLinkProtocolV2.START_BYTE) {
+        skip(1)
+        continue
+      }
+      const need = frameLength(start + TLOG_TIMESTAMP_LENGTH)
+      if (need < 0) {
+        skip(1)
+        continue
+      }
+      if (end - start < TLOG_TIMESTAMP_LENGTH + need) {
+        // At the end of the file this may be a false start with good records behind it: then it costs one byte, as in the middle.
+        if (ending && recordBehind()) {
+          skip(1)
+          continue
+        }
+        return null
+      }
+      const record = take(need)
+      if (record != null) {
+        return record
+      }
+    }
+    null
+  }
+
+  /// The length of the frame that starts at `at`, or -1 when its header cannot be a frame's (flags that are not known). The
+  /// bytes of its header must be there: at least two for a MAVLink 1 frame, three for a MAVLink 2 one.
+  frameLength(at: int): int {
+    if (buffer[at] == MavLinkProtocolV1.START_BYTE) {
+      return MavLinkProtocolV1.PAYLOAD_OFFSET + buffer[at + 1] + CHECKSUM_LENGTH
+    }
+    if (end - at < 3) {
+      return TLOG_MAX_FRAME
+    }
+    const flags = buffer[at + 2]
+    if ((flags & 254) != 0) {
+      return -1
+    }
+    const signature = if ((flags & MavLinkProtocolV2.IFLAG_SIGNED) != 0) SIGNATURE_LENGTH else 0
+    MavLinkProtocolV2.PAYLOAD_OFFSET + buffer[at + 1] + CHECKSUM_LENGTH + signature
+  }
+
+  /// Looks at the record at `start`, whose frame is `need` bytes and is all here: a record to give, or null when it was skipped
+  /// (one byte, or a whole frame of an unknown message) and the search goes on.
+  take(need: int): TlogRecord? {
+    const at = start + TLOG_TIMESTAMP_LENGTH
+    const v2 = buffer[at] == MavLinkProtocolV2.START_BYTE
+    const time = timeAt(start)
+    const msgid = if (v2) readUint(buffer, at + 7, 3) else buffer[at + 5]
+    const magic = magicNumbers.get(msgid)
+    if (time < 0) {
+      skip(1)
+      return null
+    }
+    if (magic == null) {
+      return skipUnknown(time, need)
+    }
+    const crcAt = at + need - CHECKSUM_LENGTH - (if (v2 && (buffer[at + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0) SIGNATURE_LENGTH else 0)
+    if (readUint(buffer, crcAt, 2) != x25crc(buffer, at + 1, crcAt, magic!)) {
+      report.crcFailures += 1
+      skip(1)
+      return null
+    }
+    give(time, need, v2, msgid)
+  }
+
+  /// Whether a whole record (a frame that is all here, with a CRC that holds or of a message the dialect lacks, at a time where the
+  /// recording is) starts at `p`, a position after `start`. Changes nothing.
+  validAt(p: int): bool {
+    if (end - p < TLOG_TIMESTAMP_LENGTH + 2 || buffer[p] >= 128) {
+      return false
+    }
+    const at = p + TLOG_TIMESTAMP_LENGTH
+    if (buffer[at] != MavLinkProtocolV1.START_BYTE && buffer[at] != MavLinkProtocolV2.START_BYTE) {
+      return false
+    }
+    const need = frameLength(at)
+    if (need < 0 || end - p < TLOG_TIMESTAMP_LENGTH + need) {
+      return false
+    }
+    const v2 = buffer[at] == MavLinkProtocolV2.START_BYTE
+    const msgid = if (v2) readUint(buffer, at + 7, 3) else buffer[at + 5]
+    const magic = magicNumbers.get(msgid)
+    if (magic == null) {
+      return plausible(timeAt(p))
+    }
+    const crcAt = at + need - CHECKSUM_LENGTH - (if (v2 && (buffer[at + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0) SIGNATURE_LENGTH else 0)
+    readUint(buffer, crcAt, 2) == x25crc(buffer, at + 1, crcAt, magic!)
+  }
+
+  /// Whether a whole record starts anywhere after `start` (at the end of the file: the start at `start` was false).
+  recordBehind(): bool {
+    for (let p = start + 1; p < end; p++) {
+      if (validAt(p)) {
+        return true
+      }
+    }
+    false
+  }
+
+  /// Whether a time is where the recording is: after a first record, not more than the jitter before the last, not more than the gap after.
+  plausible(time: int): bool {
+    last >= 0 && time >= 0 && time + jitterUs >= last && time - last <= maxGapUs
+  }
+
+  /// A frame of a message that is not in the dialect: skipped whole if its time is where the recording is, else it was noise.
+  skipUnknown(time: int, need: int): TlogRecord? {
+    if (!plausible(time)) {
+      skip(1)
+      return null
+    }
+    if (time < last) {
+      report.jitter += 1
+    } else {
+      last = time
+    }
+    report.unknown += 1
+    report.bytesUnknown += TLOG_TIMESTAMP_LENGTH + need
+    start += TLOG_TIMESTAMP_LENGTH + need
+    null
+  }
+
+  /// A whole record: the segment it is in, the counts, and the record itself.
+  give(time: int, need: int, v2: bool, msgid: int): TlogRecord {
+    const at = start + TLOG_TIMESTAMP_LENGTH
+    const signed = v2 && (buffer[at + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0
+    note(time)
+    const frame = buffer.slice(at, at + need)
+    report.records += 1
+    report.bytesInRecords += TLOG_TIMESTAMP_LENGTH + need
+    if (v2) report.v2 += 1 else report.v1 += 1
+    if (signed) {
+      report.signed += 1
+    }
+    report.byId.set(msgid, (report.byId.get(msgid) ?? 0) + 1)
+    start += TLOG_TIMESTAMP_LENGTH + need
+    new TlogRecord(time, segment, frame, v2, signed, msgid)
+  }
+
+  /// Takes the time of a record into the report: the first one, a step back or a jump forward (a new segment), and the last.
+  note(time: int): void {
+    if (report.records == 0) {
+      report.firstUs = time
+      report.segments = 1
+      report.dated = time >= YEAR_2000_US && time <= nowUs + A_YEAR_US
+    } else if (time < last && last - time <= jitterUs) {
+      // A little back: jitter. `last` stays the latest time, so that steps back do not add up to a segment.
+      report.jitter += 1
+      return
+    } else if (time < last) {
+      segment += 1
+      report.segments += 1
+      report.backwards += 1
+    } else if (time - last > maxGapUs) {
+      segment += 1
+      report.segments += 1
+      report.jumps += 1
+    }
+    last = time
+    report.lastUs = time
+  }
+
+  /// The timestamp at `at` as microseconds, or -1 when it is more than an int can hold (the top bit set: no date there).
+  timeAt(at: int): int {
+    if (buffer[at] >= 128) {
+      return -1
+    }
+    let us = 0
+    for (let i = 0; i < 8; i++) {
+      us = us * 256 + buffer[at + i]
+    }
+    us
+  }
+
+  /// Drops `n` bytes that are no record.
+  skip(n: int): void {
+    report.bytesSkipped += n
+    start += n
+  }
+
+  /// The end of the file: what is left is the start of a record that was cut (`cutEnd`, not damage). Call `next` until it gives
+  /// null first. Nothing is read after this.
+  public finish(): void {
+    if (done) {
+      return
+    }
+    // The tail is looked at again, a byte at a time from a false start: only a real, incomplete start of a frame is `cutEnd`.
+    ending = true
+    while (true) {
+      const rest = scan()
+      if (rest == null) {
+        break
+      }
+      rescued.push(rest!)
+    }
+    done = true
+    const left = end - start
+    if (left > 0) {
+      report.cutEnd = true
+      report.bytesCut = left
+      start = end
+    }
+  }
+}
+
+/// A writer of a recording, for fixtures and tests (and for a program that records): a timestamp and a frame for each record.
+export class TlogWriter {
+  buffer: Uint8Array = new Uint8Array(4096)
+  length: int = 0
+
+  /// A record of a frame (as it is on the wire) at a time in microseconds since 1970.
+  public add(timeUs: int, frame: Uint8Array): void {
+    reserve(TLOG_TIMESTAMP_LENGTH + frame.length)
+    let rest = timeUs
+    for (let i = 7; i >= 0; i--) {
+      buffer.set(length + i, rest % 256)
+      rest = rest / 256
+    }
+    buffer.setAll(frame, length + TLOG_TIMESTAMP_LENGTH)
+    length += TLOG_TIMESTAMP_LENGTH + frame.length
+  }
+
+  /// A record of a message, as a MAVLink 2 (or 1) frame from a system and component with a sequence number.
+  public addMessage(timeUs: int, message: MavLinkData, seq: int = 0, v2: bool = true, sysid: int = 1, compid: int = 1): void throws MavLinkError {
+    if (v2) {
+      add(timeUs, new MavLinkProtocolV2(sysid, compid).serialize(message, seq))
+    } else {
+      add(timeUs, new MavLinkProtocolV1(sysid, compid).serialize(message, seq))
+    }
+  }
+
+  /// Bytes that are no record, as they are (garbage in the middle, or the start of a record).
+  public raw(bytes: Uint8Array): void {
+    reserve(bytes.length)
+    buffer.setAll(bytes, length)
+    length += bytes.length
+  }
+
+  /// The recording so far.
+  public bytes(): Uint8Array {
+    buffer.slice(0, length)
+  }
+
+  reserve(more: int): void {
+    if (length + more > buffer.length) {
+      let size = buffer.length
+      while (length + more > size) {
+        size *= 2
+      }
+      const moved = new Uint8Array(size)
+      moved.setAll(buffer.slice(0, length), 0)
+      buffer = moved
+    }
+  }
+}
+
+/// A MAVLink 2 frame made signed: the signed flag set (and the checksum made again, since the flags are in it) and 13 bytes of
+/// signature that are not a signature (a reader does not verify them). For tests.
+export function signedCopy(frame: Uint8Array, magic: int): Uint8Array {
+  const out = new Uint8Array(frame.length + SIGNATURE_LENGTH)
+  out.setAll(frame, 0)
+  out.set(2, out[2] | MavLinkProtocolV2.IFLAG_SIGNED)
+  const crcAt = frame.length - CHECKSUM_LENGTH
+  const crc = x25crc(out, 1, crcAt, magic)
+  out.set(crcAt, crc & 255)
+  out.set(crcAt + 1, (crc >> 8) & 255)
+  out
+}

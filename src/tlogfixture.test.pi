@@ -1,0 +1,183 @@
+// The reader on a recording that ANOTHER program wrote, with no SITL and no MAVProxy needed: `fixtures/mavproxy.tlog` is the
+// `mav.tlog` that MAVProxy 1.8.75 (pymavlink 2.4.50) wrote for 25 s while connected to the second serial port of an ArduCopter SITL
+// (the CI firmware, Copter-4.7.2, `-w --model quad --speedup 1 --defaults copter.parm`). It is the whole file as MAVProxy left it
+// (105916 bytes; it was ended with SIGKILL and happened to end at a record boundary), made in a temporary directory of the test (it holds
+// no path, host name or user name, which the last test checks), with
+//   env SITL_BINARY=<arducopter> MAVPROXY=<mavproxy.py> TLOG_KEEP=src/fixtures/mavproxy.tlog pico test src/sitl.test.pi -t "another program"
+// (`keepIfAsked` in sitl.test.pi; it cuts at a record boundary if the file is longer than 140000 bytes). The numbers below are what
+// the reader found in it the day it was made; they are exact because the file is. Run from the repository root.
+import { describe, it, expect } from "std/test"
+import { readBytes } from "std/fs"
+import { Attitude, GpsRawInt, StatusText } from "./dialects/common"
+import { GlobalPositionInt } from "./dialects/standard"
+import { Heartbeat, MavAutopilot, MavType } from "./dialects/minimal"
+import { TlogReader, TlogRecord } from "./tlog"
+
+const FILE = "src/fixtures/mavproxy.tlog"
+
+class Found {
+  public readonly records: TlogRecord[] = []
+  public readonly reader: TlogReader = new TlogReader()
+}
+
+/// Reads the file a chunk at a time (a size that is not a multiple of anything), keeping the records.
+async function readFixture(chunk: int): Promise<Found> throws Error {
+  const bytes = await readBytes(FILE)
+  const out = new Found()
+  for (let at = 0; at < bytes.length; at += chunk) {
+    out.reader.push(bytes.slice(at, if (at + chunk < bytes.length) at + chunk else bytes.length))
+    while (true) {
+      const r = out.reader.next()
+      if (r == null) {
+        break
+      }
+      out.records.push(r!)
+    }
+  }
+  out.reader.finish()
+  while (true) {
+    const r = out.reader.next()
+    if (r == null) {
+      break
+    }
+    out.records.push(r!)
+  }
+  out
+}
+
+async function readsTheRecordingMavproxyWrote(): Promise<void> throws Error {
+  for (const chunk of [65536, 4099]) {
+    const got = await readFixture(chunk)
+    const p = got.reader.report
+
+    expect(p.records).toBe(2480)
+    expect(got.records.length).toBe(2480)
+    expect(p.v2).toBe(2480)
+    expect(p.v1).toBe(0)
+    expect(p.signed).toBe(0)
+    expect(p.crcFailures).toBe(0)
+    expect(p.unknown).toBe(0)
+    expect(p.bytesSkipped).toBe(0)
+    expect(p.bytesCut).toBe(0)
+    expect(p.cutEnd).toBe(false)
+    expect(p.segments).toBe(1)
+    expect(p.jumps).toBe(0)
+    expect(p.dated).toBe(true)
+    expect(p.bytesFed).toBe(105916)
+    expect(p.bytesInRecords).toBe(105916)
+    expect(p.byId.size).toBe(33)
+    // The messages the Flights view draws from, and the vehicle's and MAVProxy's heartbeats.
+    expect(p.byId.get(0)).toBe(53)
+    expect(p.byId.get(30)).toBe(95)
+    expect(p.byId.get(33)).toBe(95)
+    expect(p.byId.get(1)).toBe(95)
+    expect(p.byId.get(24)).toBe(94)
+    expect(p.byId.get(241)).toBe(94)
+    expect(p.byId.get(253)).toBe(17)
+    // Twenty-five seconds, in the order of the file.
+    const seconds = (p.lastUs - p.firstUs) / 1000000
+    expect(seconds > 20 && seconds < 30).toBe(true)
+    let ordered = true
+    for (let i = 1; i < got.records.length; i++) {
+      ordered = ordered && got.records[i].timeUs + 1000000 >= got.records[i - 1].timeUs
+    }
+    expect(ordered).toBe(true)
+  }
+}
+
+async function decodesWhatTheVehicleSent(): Promise<void> throws Error {
+  const got = await readFixture(65536)
+  let beat: Heartbeat? = null
+  let attitude: Attitude? = null
+  for (const r of got.records) {
+    if (beat == null && r.msgid == 0 && r.sysid == 1) {
+      beat = Heartbeat.decode(r.payload())
+    }
+    if (attitude == null && r.msgid == 30) {
+      attitude = Attitude.decode(r.payload())
+    }
+  }
+
+  expect(beat != null).toBe(true)
+  expect(beat!.type).toBe(MavType.QUADROTOR as u8)
+  expect(beat!.autopilot).toBe(MavAutopilot.ARDUPILOTMEGA as u8)
+  expect(attitude != null).toBe(true)
+  // A vehicle standing still on the ground: angles in radians, within a half turn (a pitch within a quarter).
+  expect(attitude!.roll > -3.2 && attitude!.roll < 3.2).toBe(true)
+  expect(attitude!.pitch > -1.6 && attitude!.pitch < 1.6).toBe(true)
+  expect(attitude!.yaw > -3.2 && attitude!.yaw < 6.4).toBe(true)
+  // MAVProxy's own heartbeat (system 255) is in the recording too: a recording holds every sender.
+  let others = 0
+  for (const r of got.records) {
+    if (r.msgid == 0 && r.sysid != 1) {
+      others += 1
+    }
+  }
+  expect(others > 0).toBe(true)
+}
+
+/// The texts the vehicle sent (STATUSTEXT, 17 of them): its start-up lines, all of them. A text outside this list fails the test, so that
+/// nothing identifying (a path, a host name, a user name: SITL prints its working directory in some versions) can be in the fixture.
+const TEXTS: string[] = [
+  "Barometer 1 calibration complete",
+  "Barometer 2 calibration complete",
+  "ArduPilot Ready",
+  "AHRS: DCM active",
+  "RC7: SaveWaypoint LOW",
+  "EKF3 IMU0 initialised",
+  "EKF3 IMU1 initialised",
+  "AHRS: EKF3 active",
+  "EKF3 IMU0 tilt alignment complete",
+  "EKF3 IMU1 tilt alignment complete",
+  "EKF3 IMU0 MAG0 initial yaw alignment complete",
+  "EKF3 IMU1 MAG0 initial yaw alignment complete",
+  "GPS 1: probing for u-blox at 230400 baud",
+  "GPS 1: detected u-blox",
+  "EKF3 IMU0 origin set",
+  "Field Elevation Set: 584m",
+  "EKF3 IMU1 origin set",
+]
+
+/// Whether a position (degrees) is "no position" (0, 0: the receiver has no fix yet) or within a degree of SITL's default home
+/// (-35.36, 149.16, near Canberra): a position anywhere else would be where somebody really was.
+function isSitlHomeOrNone(lat: f64, lon: f64): bool {
+  (lat == 0.0 && lon == 0.0) || (lat > -36.36 && lat < -34.36 && lon > 148.16 && lon < 150.16)
+}
+
+async function containsNothingThatIdentifiesAnybody(): Promise<void> throws Error {
+  const got = await readFixture(65536)
+  let texts = 0
+  let positions = 0
+  let unexpected = ""
+  for (const r of got.records) {
+    if (r.msgid == 253) {
+      const text = StatusText.decode(r.payload()).text
+      texts += 1
+      if (!TEXTS.includes(text)) {
+        unexpected = `text: ${text}`
+      }
+    } else if (r.msgid == 24) {
+      const g = GpsRawInt.decode(r.payload())
+      positions += 1
+      if (!isSitlHomeOrNone(g.lat / 1.0e7, g.lon / 1.0e7)) {
+        unexpected = `GPS_RAW_INT at ${g.lat}, ${g.lon}`
+      }
+    } else if (r.msgid == 33) {
+      const g = GlobalPositionInt.decode(r.payload())
+      positions += 1
+      if (!isSitlHomeOrNone(g.lat / 1.0e7, g.lon / 1.0e7)) {
+        unexpected = `GLOBAL_POSITION_INT at ${g.lat}, ${g.lon}`
+      }
+    }
+  }
+
+  expect(unexpected).toBe("")
+  expect(texts).toBe(17)
+  expect(positions).toBe(94 + 95)
+}
+
+describe("a recording MAVProxy wrote (fixture)", () => {
+  it("reads it whole: every record, no damage, one segment, dated, at any chunk size", readsTheRecordingMavproxyWrote)
+  it("decodes what the vehicle sent: its heartbeat and its attitude", decodesWhatTheVehicleSent)
+  it("holds no text and no position that could identify anybody: only the start-up lines and SITL's default home", containsNothingThatIdentifiesAnybody)
+})

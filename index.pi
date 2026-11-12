@@ -23,6 +23,18 @@ export {
   protocolOf,
 } from "./src/protocol"
 export { MavLinkPacketSplitter, MavLinkTLogPacketSplitter, RawPacket, SplitterOptions } from "./src/splitter"
+export {
+  TLOG_JITTER_US,
+  TLOG_MAX_FRAME,
+  TLOG_MAX_GAP_US,
+  TLOG_TIMESTAMP_LENGTH,
+  TlogOptions,
+  TlogReader,
+  TlogRecord,
+  TlogReport,
+  TlogWriter,
+  signedCopy,
+} from "./src/tlog"
 export { ByteStream, FileStream, MemoryStream, TcpStream, UdpStream } from "./src/stream"
 export { ConnectionOptions, MavLinkConnection, Received, defaultRegistry, packets } from "./src/connection"
 export { Rejection, SigningPolicy, UnsignedPolicy } from "./src/signing"
