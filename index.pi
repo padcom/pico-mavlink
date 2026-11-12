@@ -39,8 +39,11 @@ export {
 export {
   FTP_HEADER_SIZE,
   FTP_MAX_DATA,
+  FTP_MAX_ENTRIES,
   FtpClient,
+  FtpEntry,
   FtpError,
+  FtpListing,
   FtpNack,
   FtpOpcode,
   FtpOptions,
@@ -48,8 +51,11 @@ export {
   errorOfNack,
   ftpMessage,
   ftpPacketOf,
+  parseListing,
 } from "./src/ftp"
 export { FtpFileResult, readFile } from "./src/ftpread"
+export { Crc32, crc32Of } from "./src/crc32"
+export { FileDownload, FileSink, downloadFile } from "./src/logdownload"
 export {
   PARAM_PACK_PATH,
   ParamDownload,
