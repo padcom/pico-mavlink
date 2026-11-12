@@ -408,6 +408,9 @@ const FLIGHT_BUDGET_MS: int = 420_000
 ///   - after the disarm the file is still appended to: about 1 MB in the next 15 to 20 s, then tens of bytes at a time for 40 s and
 ///     more. So the listing's size is not final; the vehicle's CRC at the end of a download is the check, and a download that
 ///     differs because the file grew goes on from what it has (the CRC carried on) until the CRCs agree;
+///     (That is the newer dev build. Copter-4.7.2, the CI build, answers ListDirectory with every entry followed by a second NUL
+///     byte, see `readsTheBytesCopter472Sends` in ftplist.test.pi; its log did not grow after the disarm in the run that
+///     found this: 7329888 bytes at 0 s and at 20 s. It refused the take-off with "Motors: Check frame class and type".)
 ///   - CalcFileCRC32 works on a log, also while it is written;
 ///   - at `--speedup 5` a burst download fails with FILE_NOT_FOUND after ~11 bursts (the vehicle's session timeouts run on its sped
 ///     up clock): a download test needs speedup 1.
@@ -487,6 +490,21 @@ async function writesALogWhereFtpCanSeeIt(): Promise<void> throws Error {
     // does not ask for a size: it is chased. A download whose CRC differs from the vehicle's, while the file has grown, goes on from
     // what it has (the CRC is carried on) until the vehicle's CRC is ours.
     const sink = new CollectSink()
+    // Cancelled part way (after about a megabyte), as the interface's Cancel does; the chase below then goes on from what the sink
+    // holds, as the next download does.
+    const stop = new AbortController()
+    const first = new FtpClient(s.conn, s.target, { timeoutMs: 1000, retries: 3, signal: stop.signal })
+    try {
+      await downloadFile(first, `/logs/${found}`, sink, 0, 0, -1, (bytes: int, _e: int) => {
+        if (bytes > 1_000_000) {
+          stop.abort()
+        }
+      })
+      println("SPIKE the first download was through before it could be cancelled")
+    } catch (e: FtpError) {
+      println(`SPIKE cancelled: ${e.code}, the sink holds ${sink.total} bytes (${sink.total % 239} past a multiple of 239)`)
+      expect(e.code).toBe("FTP_ABORTED")
+    }
     let got: FileDownload? = null
     for (let attempt = 0; attempt < 4 && got == null && (Date.now() as int) < deadline; attempt++) {
       try {

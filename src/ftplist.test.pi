@@ -5,7 +5,7 @@ import { MavLinkConnection } from "./connection"
 import { MemoryStream } from "./stream"
 import { Target } from "./operations"
 import { SimulatedAutopilot } from "./simulator"
-import { FTP_MAX_ENTRIES, FtpClient, FtpError, FtpOptions, parseListing } from "./ftp"
+import { FTP_MAX_ENTRIES, FtpClient, FtpError, FtpOptions, hexOf, parseListing } from "./ftp"
 
 const VEHICLE: Target = { system: 1, component: 1 }
 const FAST: FtpOptions = { timeoutMs: 150, retries: 2, session: 7 }
@@ -156,37 +156,35 @@ function ignoresZeroPaddingAfterTheLastEntry(): void throws FtpError {
   expect(withTime.entries.length).toBe(1)
 }
 
-function refusesAnEmptyEntryThatIsNotPadding(): void {
-  const bad = [
-    listing(["Fa\t1", "", "Fb\t2"]),
-    padded([], 3),
-  ]
-  // The first has an empty entry between two; the second is nothing but zeros: no entry (the listing refuses a page of it).
-  try {
-    parseListing(bad[0])
-    expect("parsed").toBe("refused")
-  } catch (e: FtpError) {
-    expect(e.code).toBe("FTP_PROTOCOL")
+function skipsEmptyEntriesWhereverTheyAre(): void throws FtpError {
+  // Between entries, at the start, and a page of nothing else: none is an entry, none is counted.
+  const between = parseListing(listing(["Fa\t1", "", "Fb\t2"]))
+  expect(between.entries.map((e) => e.name).join(",")).toBe("a,b")
+  expect(between.count).toBe(2)
+  const lead = new Uint8Array(1 + listing(["Fa\t1"]).length)
+  const body = listing(["Fa\t1"])
+  for (let i = 0; i < body.length; i++) {
+    lead.set(i + 1, body[i])
   }
-  try {
-    expect(parseListing(bad[1]).count).toBe(0)
-  } catch (e: FtpError) {
-    expect(e.code).toBe("FTP_PROTOCOL")
-  }
+  expect(parseListing(lead).count).toBe(1)
+  expect(parseListing(padded([], 3)).count).toBe(0)
 }
 
-function refusesAnEmptyEntryAtTheStart(): void {
-  try {
-    const lead = new Uint8Array(1 + listing(["Fa\t1"]).length)
-    const body = listing(["Fa\t1"])
-    for (let i = 0; i < body.length; i++) {
-      lead.set(i + 1, body[i])
-    }
-    parseListing(lead)
-    expect("parsed").toBe("refused")
-  } catch (e: FtpError) {
-    expect(e.code).toBe("FTP_PROTOCOL")
-  }
+/// Captured from Copter-4.7.2 (ArduPilot SITL, the CI build, fb773567896014da007bca58358704d4a0d8516f) as the hex dump of a
+/// failing parse: ListDirectory of "/logs" after a flight, one page of 48 bytes. Every entry is followed by a second NUL byte, and
+/// the "." and ".." entries come first; the files have a size and no time.
+///   44 2e 00 00 44 2e 2e 00 00 46 4c 41 53 54 4c 4f 47 2e 54 58 54 09 33 00 00
+///   46 30 30 30 30 30 30 30 31 2e 42 49 4e 09 36 33 38 31 35 36 38 00 00
+function readsTheBytesCopter472Sends(): void throws FtpError {
+  const bytes = Uint8Array.from([
+    0x44, 0x2e, 0x00, 0x00, 0x44, 0x2e, 0x2e, 0x00, 0x00, 0x46, 0x4c, 0x41, 0x53, 0x54, 0x4c, 0x4f, 0x47, 0x2e, 0x54, 0x58, 0x54, 0x09,
+    0x33, 0x00, 0x00, 0x46, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x31, 0x2e, 0x42, 0x49, 0x4e, 0x09, 0x36, 0x33, 0x38, 0x31, 0x35,
+    0x36, 0x38, 0x00, 0x00,
+  ])
+  const page = parseListing(bytes)
+  expect(page.entries.map((e) => e.name).join(",")).toBe("LASTLOG.TXT,00000001.BIN")
+  expect(page.count).toBe(4)
+  expect(page.entries[1].size).toBe(6381568)
 }
 
 async function listsFromAServerThatPadsTheReply(): Promise<void> throws Error {
@@ -201,6 +199,25 @@ async function listsFromAServerThatPadsTheReply(): Promise<void> throws Error {
   expect(entries.length).toBe(70)
   expect(entries[0].name).toBe("30000000.BIN")
   expect(entries[69].name).toBe("30000069.BIN")
+}
+
+function carriesTheBytesOfAPageThatCannotBeRead(): void {
+  const page = new Uint8Array(4)
+  page.set(0, 0)
+  page.set(1, 0x46)
+  page.set(2, 0x61)
+  page.set(3, 0)
+  try {
+    parseListing(page)
+    expect("parsed").toBe("refused")
+  } catch (e: FtpError) {
+    expect(e.code).toBe("FTP_PROTOCOL")
+    expect(e.message.includes("[the page, 4 bytes: 00 46 61 00]")).toBe(true)
+  }
+  expect(hexOf(new Uint8Array(0))).toBe("0 bytes: ")
+  // At most 64 bytes are shown, and the length of the whole.
+  expect(hexOf(new Uint8Array(100)).startsWith("100 bytes: 00 00")).toBe(true)
+  expect(hexOf(new Uint8Array(100)).endsWith(" ...")).toBe(true)
 }
 
 function leavesOutDotAndDotDot(): void throws FtpError {
@@ -531,9 +548,10 @@ describe("the directory listing of the FTP client", () => {
   it("accepts names in UTF-8", acceptsNamesInUtf8)
   it("counts a skip entry and does not return it", skipsSkipEntriesButCountsThem)
   it("ignores zero padding after the last entry, and does not count it", ignoresZeroPaddingAfterTheLastEntry)
-  it("refuses an empty entry between entries and one before them", refusesAnEmptyEntryThatIsNotPadding)
-  it("refuses an empty entry at the start", refusesAnEmptyEntryAtTheStart)
+  it("skips empty entries wherever they are, without counting them", skipsEmptyEntriesWhereverTheyAre)
+  it("reads the bytes Copter-4.7.2 sends (captured)", readsTheBytesCopter472Sends)
   it("lists from a server that pads every reply to a full packet", listsFromAServerThatPadsTheReply)
+  it("carries the bytes of a page that cannot be read in the error", carriesTheBytesOfAPageThatCannotBeRead)
   it("leaves out \".\" and \"..\", and counts them", leavesOutDotAndDotDot)
   it("refuses entries that are not entries: a size that is not a number, none, no name, an unknown kind, more fields", refusesEntriesThatAreNotEntries)
   it("refuses an entry that is cut off (no NUL)", refusesAnEntryThatIsCutOff)
