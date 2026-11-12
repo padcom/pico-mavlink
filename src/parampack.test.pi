@@ -168,6 +168,36 @@ function namesOfEveryLength(): void throws ParamPackError {
   expect(pack.params[15].name.length).toBe(16)
 }
 
+function theLengthByteCountsTheBytesThatFollowTheSharedOnes(): void throws ParamPackError {
+  // By hand, as a vehicle lays it out: the high nibble of byte 1 is how many bytes of the name follow the shared ones, minus one.
+  // "PILOT_THR_FILT" (14 bytes, nothing shared: 14 - 1 = 13 in the nibble), then "PILOT_THR_BHV" sharing "PILOT_THR_" (10) and
+  // adding "BHV" (3 - 1 = 2), then "PILOT_THR_BHV2" sharing all 13 of those and adding "2" (1 - 1 = 0).
+  const name = "PILOT_THR_FILT"
+  const bytes: int[] = [0x1b, 0x67, 3, 0, 3, 0, 4, 0xD0]
+  const encoded = new TextEncoder().encode(name)
+  for (let i = 0; i < encoded.length; i++) {
+    bytes.push(encoded[i] as int)
+  }
+  bytes.push(0, 0, 0, 0)
+  bytes.push(2, 0x2A, 66, 72, 86, 5, 0)
+  bytes.push(2, 0x0D, 50, 6, 0)
+  const pack = decodeParamPack(bytesOf(bytes))
+  expect(pack.params.map((p) => p.name).join(",")).toBe("PILOT_THR_FILT,PILOT_THR_BHV,PILOT_THR_BHV2")
+  expect(pack.params.map((p) => showParam(p.value)).join(",")).toBe("0,5,6")
+  // A name that would be over 16 bytes with the shared ones is refused.
+  const long: int[] = [0x1b, 0x67, 2, 0, 2, 0, 2, 0xF0]
+  for (let i = 0; i < 16; i++) {
+    long.push(65)
+  }
+  long.push(0, 0, 2, 0x1F, 66, 67, 0, 0)
+  try {
+    decodeParamPack(bytesOf(long))
+    expect("decoded").toBe("refused")
+  } catch (e: ParamPackError) {
+    expect(e.code).toBe("BAD_ENTRY")
+  }
+}
+
 function aNameThatIsAPrefixOfThePreviousOne(): void throws ParamPackError {
   const params = [int8("ABCDEFGH", 1), int8("ABCD", 2), int8("AB", 3), int8("A", 4)]
   expect(sameAll(decodeParamPack(encodeParamPack(params, 4)).params, params)).toBe(true)
@@ -213,10 +243,9 @@ function valuesCross(b: Uint8Array, readSize: int): bool {
       at += 1
     }
     const type = (b[at] as int) & 0xF
-    const common = (b[at + 1] as int) & 0xF
-    const length = ((b[at + 1] as int) >> 4) + 1
+    const fresh = ((b[at + 1] as int) >> 4) + 1
     const size = if (type == 1) 1 else if (type == 2) 2 else 4
-    const from = at + 2 + (length - common)
+    const from = at + 2 + fresh
     if (size > 1 && from / readSize != (from + size - 1) / readSize) {
       return true
     }
@@ -396,6 +425,7 @@ describe("the packed parameter file", () => {
   it("round-trips thousands of generated names, in all four types", roundTripsThousands)
   it("stores the part of a name it shares with the one before once", sharesPrefixes)
   it("holds names of every length from 1 to 16 characters", namesOfEveryLength)
+  it("reads the length byte as the bytes that follow the shared ones, minus one", theLengthByteCountsTheBytesThatFollowTheSharedOnes)
   it("holds a name that is the start of the one before it", aNameThatIsAPrefixOfThePreviousOne)
   it("carries every type at its extremes, an INT32 with all its bits", allTypesAtTheirExtremes)
   it("pads so that no value crosses a read packet, for several read sizes, and decodes through the padding", padsBeforeValuesAtEveryOffset)

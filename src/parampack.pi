@@ -7,9 +7,9 @@
 //                      total_params u16 (parameters the vehicle has)
 //   each entry:        byte 0: low nibble the type (1 INT8, 2 INT16, 3 INT32, 4 FLOAT), high nibble the flags (bit 0: a default
 //                      follows the value)
-//                      byte 1: low nibble how many leading bytes of the previous name this one shares, high nibble the name's
-//                      length minus one
-//                      then the bytes of the name that are not shared, the value (exactly the type's size), and with the flag
+//                      byte 1: low nibble how many leading bytes of the previous name this one shares, high nibble how many bytes
+//                      of the name follow those, minus one (so at least one follows)
+//                      then those bytes of the name (the ones that are not shared), the value (exactly the type's size), and with the flag
 //                      the default (the same type)
 //   zero bytes may stand before an entry (no type is 0): they keep a multi-byte value from crossing the edge of a read packet,
 //   which is what makes asking for a block again safe.
@@ -187,12 +187,16 @@ export function decodeParamPack(b: Uint8Array): ParamPack throws ParamPackError 
     if (at + 1 >= b.length) {
       throw new ParamPackError("TRUNCATED", `the file ends inside entry ${params.length}`)
     }
+    // (The high nibble is how many bytes of the name follow, minus one: at least one, so a name never rests wholly on the
+    // one before it. A vehicle's own file is read this way: the name is the shared bytes and then those.)
     const common = byteAt(b, at + 1) & 0xF
-    const nameLength = (byteAt(b, at + 1) >> 4) + 1
-    if (common > previous.length || common > nameLength) {
+    const fresh = (byteAt(b, at + 1) >> 4) + 1
+    if (common > previous.length) {
       throw new ParamPackError("BAD_ENTRY", `entry ${params.length} shares ${common} bytes of a name that is ${previous.length} long`)
     }
-    const fresh = nameLength - common
+    if (common + fresh > 16) {
+      throw new ParamPackError("BAD_ENTRY", `entry ${params.length} has a name of ${common + fresh} bytes: at most 16`)
+    }
     const size = sizeOf(type)
     const end = at + 2 + fresh + size + (if (flags == 1) size else 0)
     if (end > b.length) {
@@ -303,7 +307,7 @@ export function encodeParamPack(
     const common = sharedBytes(previous, nameBytes, nameBytes.length - 1)
     const entry: int[] = []
     entry.push(nibble | (if (hasDefault) 0x10 else 0))
-    entry.push(common | ((nameBytes.length - 1) << 4))
+    entry.push(common | ((nameBytes.length - common - 1) << 4))
     for (let i = common; i < nameBytes.length; i++) {
       entry.push(nameBytes[i] as int)
     }
