@@ -157,7 +157,8 @@ export class SimulatedAutopilot {
   /// How the FTP server misbehaves, for tests: `ok`; `unsupported` (every open fails with ENOENT, though the capability is set);
   /// `silent` (it never answers an FTP request); `corrupt` (the file has a wrong magic); `incomplete` (the file says the vehicle
   /// has more parameters than it holds); `busy` (every open: no session free); `einval` (every read: EINVAL); `repeat` and `endless` (a burst that sends the first chunk again and again, or chunks at
-  /// ever higher offsets with no end, until the mode is changed).
+  /// ever higher offsets with no end, until the mode is changed); `relist` and `emptylist` (a listing that repeats its first page, or answers with
+  /// nothing and no end).
   public ftpMode: string = "ok"
   /// The share of FTP packets it drops on their way out, in percent (a lossy link), from a seeded sequence.
   public ftpLoss: int = 0
@@ -165,6 +166,17 @@ export class SimulatedAutopilot {
   public ftpStallAfter: int = 0
   /// Serve these bytes as the file instead of the packed parameter file (to test a reader with files of a given length).
   public ftpFile: Uint8Array? = null
+  /// The files of the vehicle's file system besides the parameter file, by full path ("/APM/LOGS/00000001.BIN"): what ListDirectory
+  /// lists. The directories are the ones the paths run through, and `fsDirs` (empty ones).
+  public readonly fsFiles: Map<string, Uint8Array> = new Map<string, Uint8Array>()
+  /// When a file was made (seconds since 1970), by path; a file with none has none to give.
+  public readonly fsTimes: Map<string, int> = new Map<string, int>()
+  /// Directories that exist with nothing in them.
+  public readonly fsDirs: string[] = []
+  /// Whether a file's entry in a listing carries its time (`F<name>\t<size>\t<time>`), as a vehicle may give it.
+  public listTimes: bool = false
+  /// The most entries one reply of ListDirectory carries (0: as many as fit in a packet), to make a listing take many pages.
+  public ftpListPage: int = 0
   /// What the FTP server was asked, one line each: "<opcode> s<session> o<offset> n<size>".
   public readonly ftpLog: string[] = []
   /// How many bursts it started.
@@ -497,6 +509,8 @@ export class SimulatedAutopilot {
       ftpReply(ask, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, 0, false)
     } else if (req.opcode == FtpOpcode.OPEN_FILE_RO) {
       ftpOpen(ask)
+    } else if (req.opcode == FtpOpcode.LIST_DIRECTORY) {
+      ftpList(ask)
     } else if (req.opcode == FtpOpcode.READ_FILE) {
       ftpRead(ask)
     } else if (req.opcode == FtpOpcode.BURST_READ_FILE) {
@@ -508,6 +522,110 @@ export class SimulatedAutopilot {
     } else {
       ftpNack(ask, FtpNack.UNKNOWN_COMMAND)
     }
+  }
+
+  /// The directory `path` without a trailing slash ("/" for the root).
+  fsClean(path: string): string {
+    let p = path
+    while (p.length > 1 && p.slice(p.length - 1, p.length) == "/") {
+      p = p.slice(0, p.length - 1)
+    }
+    if (p.length == 0) "/" else p
+  }
+
+  /// The directory a path is in ("/" for one in the root).
+  fsParent(path: string): string {
+    const parts = path.split("/")
+    const up = parts.slice(0, parts.length - 1).join("/")
+    if (up.length == 0) "/" else up
+  }
+
+  /// The entries of the directory `dir` as the vehicle writes them, or null when there is no such directory.
+  fsEntries(dir: string): string[]? {
+    const names: string[] = []
+    const out: string[] = []
+    let exists = dir == "/" || fsDirs.includes(dir)
+    for (const [path, file] of fsFiles) {
+      if (fsParent(path) == dir) {
+        exists = true
+        const time = fsTimes.get(path)
+        const name = path.slice(if (dir == "/") 1 else dir.length + 1, path.length)
+        out.push(`F${name}\t${file.length}` + (if (listTimes && time != null) `\t${time!}` else ""))
+      }
+    }
+    // The directories: those a path runs through, and the empty ones.
+    const below: string[] = []
+    for (const path of fsFiles.keys()) {
+      below.push(fsParent(path))
+    }
+    for (const d of fsDirs) {
+      below.push(d)
+    }
+    for (const start of below) {
+      let d = start
+      while (d != "/" && d.length > 0) {
+        const up = fsParent(d)
+        if (d == dir || up == dir) {
+          exists = true
+        }
+        if (up == dir && d != dir) {
+          const name = d.slice(if (dir == "/") 1 else dir.length + 1, d.length)
+          if (!names.includes(name)) {
+            names.push(name)
+            out.push(`D${name}`)
+          }
+        }
+        d = up
+      }
+    }
+    if (exists) out else null
+  }
+
+  /// ListDirectory: the entries of a directory from the offset (the number of entries to skip), as many as fit in a packet (or
+  /// `ftpListPage`), each ending in a NUL; EOF at and after the end; ENOENT (FailErrno) for a directory that is not there.
+  ftpList(ask: FtpAsk): void {
+    const req = ask.req
+    let path = ""
+    try {
+      path = new TextDecoder().decode(req.data)
+    } catch (e: TypeError) {
+    }
+    const entries = fsEntries(fsClean(path))
+    if (entries == null) {
+      ftpNack(ask, FtpNack.FAIL_ERRNO, 2)
+      return
+    }
+    // Hostile listings: `relist` gives the first page whatever the offset (a page that repeats), `emptylist` an Ack with nothing in
+    // it and no end.
+    if (ftpMode == "emptylist") {
+      ftpReply(ask, FtpOpcode.ACK, new Uint8Array(0), req.seq + 1, req.offset, false)
+      return
+    }
+    const from = if (ftpMode == "relist") 0 else req.offset
+    if (from >= entries!.length) {
+      ftpNack(ask, FtpNack.EOF)
+      return
+    }
+    const bytes: int[] = []
+    let n = 0
+    let i = from
+    while (i < entries!.length && (ftpListPage == 0 || n < ftpListPage)) {
+      const enc = new TextEncoder().encode(entries![i])
+      if (bytes.length + enc.length + 1 > FTP_MAX_DATA) {
+        break
+      }
+      for (let k = 0; k < enc.length; k++) {
+        bytes.push(enc[k] as int)
+      }
+      bytes.push(0)
+      n += 1
+      i += 1
+    }
+    const data = new Uint8Array(bytes.length)
+    for (let k = 0; k < bytes.length; k++) {
+      data.set(k, bytes[k])
+    }
+    ftpReply(ask, FtpOpcode.ACK, data, req.seq + 1, req.offset, false)
   }
 
   /// OpenFileRO of "@PARAM/param.pck" (with the query `?start=N&count=C&withdefaults=1`, all optional): the Ack carries the

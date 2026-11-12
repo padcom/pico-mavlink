@@ -184,6 +184,111 @@ export function errorOfNack(what: string, p: FtpPacket): FtpError {
   new FtpError("FTP_FAILED", `${what}: refused (error ${err})`)
 }
 
+/// One entry of a directory listing.
+export class FtpEntry {
+  public readonly name: string
+  /// Whether it is a directory (else a file).
+  public readonly directory: bool
+  /// The size of a file, in bytes; 0 for a directory.
+  public readonly size: int
+  /// When a file was made (seconds since 1970), if the vehicle gives it; null when it does not. It is never made up.
+  public readonly time: int?
+
+  constructor(name: string, directory: bool, size: int, time: int? = null) {
+    this.name = name
+    this.directory = directory
+    this.size = size
+    this.time = time
+  }
+}
+
+/// The entries one reply of ListDirectory carries, and how many entries it stood for (the next request skips that many more than
+/// the ones before): a skip entry (`S`) counts, and is not returned.
+export class FtpListing {
+  public readonly entries: FtpEntry[]
+  public readonly count: int
+
+  constructor(entries: FtpEntry[], count: int) {
+    this.entries = entries
+    this.count = count
+  }
+}
+
+/// The number written in `text` with digits only, or -1 when it is not one (or is empty, or does not fit 32 bits).
+function digitsOf(text: string): int {
+  if (text.length == 0 || text.length > 10) {
+    return -1
+  }
+  let n = 0
+  for (const ch of text.split("")) {
+    const digit = "0123456789".indexOf(ch)
+    if (digit < 0) {
+      return -1
+    }
+    n = n * 10 + digit
+  }
+  if (n > 4294967295) -1 else n
+}
+
+/// One entry of a listing: `F<name>\t<size>` (a file; a third field `\t<time>`, seconds since 1970, if the vehicle gives it),
+/// `D<name>` (a directory) or `S` (to be skipped, gives null). Anything else is an `FTP_PROTOCOL` error.
+function entryOf(text: string): FtpEntry? throws FtpError {
+  const kind = text.slice(0, 1)
+  if (kind == "S") {
+    return null
+  }
+  const fields = text.slice(1, text.length).split("\t")
+  if (fields[0].length == 0 || (kind != "F" && kind != "D")) {
+    throw new FtpError("FTP_PROTOCOL", `a directory entry that is not one: "${text}"`)
+  }
+  if (kind == "D") {
+    return new FtpEntry(fields[0], true, 0)
+  }
+  const size = if (fields.length > 1) digitsOf(fields[1]) else -1
+  if (size < 0 || fields.length > 3) {
+    throw new FtpError("FTP_PROTOCOL", `a file entry without a size, or with more than a size and a time: "${text}"`)
+  }
+  let time: int? = null
+  if (fields.length == 3) {
+    const t = digitsOf(fields[2])
+    if (t < 0) {
+      throw new FtpError("FTP_PROTOCOL", `a file entry with a time that is not a number: "${text}"`)
+    }
+    time = t
+  }
+  new FtpEntry(fields[0], false, size, time)
+}
+
+/// The entries in the data of a ListDirectory reply: each ends with a NUL byte (one that does not is cut off, and an error).
+export function parseListing(data: Uint8Array): FtpListing throws FtpError {
+  const entries: FtpEntry[] = []
+  let count = 0
+  let from = 0
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] == 0) {
+      let text = ""
+      try {
+        text = new TextDecoder().decode(data.slice(from, i))
+      } catch (e: TypeError) {
+        throw new FtpError("FTP_PROTOCOL", "a directory entry that is not text")
+      }
+      const entry = entryOf(text)
+      count += 1
+      if (entry != null) {
+        entries.push(entry!)
+      }
+      from = i + 1
+    }
+  }
+  if (from < data.length) {
+    throw new FtpError("FTP_PROTOCOL", `a directory listing that ends in the middle of an entry (${data.length - from} bytes)`)
+  }
+  new FtpListing(entries, count)
+}
+
+/// The most entries `listDirectory` takes from one directory: a vehicle that never ends a listing cannot fill the memory.
+export const FTP_MAX_ENTRIES: int = 10_000
+
 export struct FtpOptions {
   /// How long to wait for one reply (default 1000 ms).
   timeoutMs?: int
@@ -355,6 +460,47 @@ export class FtpClient {
       throw new FtpError("FTP_PROTOCOL", `asked for the bytes at ${offset}, got none and no end of file`)
     }
     r.data
+  }
+
+  /// The entries of the directory `path` ("/APM/LOGS", no trailing slash needed), in the order the vehicle gives them, in pages: each
+  /// request skips the entries already read (the offset). An empty directory is an empty list; a path that is not a directory fails
+  /// as the vehicle says (`FTP_NOT_FOUND`, `FTP_ERRNO`). A reply with no entries and no end of listing, a name twice
+  /// (a page that repeats), or a listing longer than `FTP_MAX_ENTRIES` is `FTP_PROTOCOL`. No session is needed for it.
+  public async listDirectory(path: string): Promise<FtpEntry[]> throws FtpError {
+    const name = new TextEncoder().encode(path)
+    if (name.length > FTP_MAX_DATA) {
+      throw new FtpError("FTP_PROTOCOL", `the path is ${name.length} bytes: at most ${FTP_MAX_DATA}`)
+    }
+    const all: FtpEntry[] = []
+    const seen = new Set<string>()
+    let skip = 0
+    while (true) {
+      const r = await call(FtpOpcode.LIST_DIRECTORY, 0, skip, name, name.length)
+      if (r.opcode == FtpOpcode.NACK) {
+        const e = errorOfNack(`listing ${path}`, r)
+        if (e.code == "FTP_EOF") {
+          break
+        }
+        throw e
+      }
+      const page = parseListing(r.data)
+      if (page.count == 0) {
+        throw new FtpError("FTP_PROTOCOL", `listing ${path}: a reply with no entry at ${skip} and no end of listing`)
+      }
+      for (const entry of page.entries) {
+        // Names in a directory are unique: one seen again is a page that repeats.
+        if (seen.has(entry.name)) {
+          throw new FtpError("FTP_PROTOCOL", `listing ${path}: ${entry.name} twice`)
+        }
+        seen.add(entry.name)
+        all.push(entry)
+      }
+      skip += page.count
+      if (skip > FTP_MAX_ENTRIES) {
+        throw new FtpError("FTP_PROTOCOL", `listing ${path}: more than ${FTP_MAX_ENTRIES} entries`)
+      }
+    }
+    all
   }
 
   /// Ends this client's session on the vehicle. Always call it when done, also after an error or a cancel (it is sent after a
