@@ -313,6 +313,49 @@ async function refusesAFileWithoutAnEnd(): Promise<void> throws Error {
   expect(r.sim.openFtpSessions()).toBe(0)
 }
 
+async function endsWhenTheTimeIsUp(): Promise<void> throws Error {
+  const r = rig(many(50))
+  r.sim.ftpMode = "endless"
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 100, retries: 4, session: 7 })
+  const started = Date.now() as int
+  let code = "read"
+  try {
+    // Nothing but the time limit: the whole 16 MB are allowed, and it comes first.
+    await readFile(client, PATH, (_b: int, _e: int) => {}, 2000, 16_777_216, 300)
+  } catch (e: FtpError) {
+    code = e.code
+  }
+  r.gcs.close()
+  expect(code).toBe("FTP_TIMEOUT")
+  expect((Date.now() as int) - started < 5000).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function refusesAFileMuchBiggerThanItSaid(): Promise<void> throws Error {
+  const r = rig(many(50))
+  r.sim.ftpMode = "endless"
+  const client = new FtpClient(r.gcs, VEHICLE, { timeoutMs: 100, retries: 4, session: 7 })
+  let code = "read"
+  try {
+    // 50 parameters are 600 bytes by the vehicle's reckoning: four times that is under 256 kB, the least a bound is.
+    await readFile(client, PATH, (_b: int, _e: int) => {}, 2000, 16_777_216, 60_000, 4)
+  } catch (e: FtpError) {
+    code = e.code
+  }
+  r.gcs.close()
+  expect(code).toBe("FTP_PROTOCOL")
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
+async function readsAFileBiggerThanTheFactorWithoutIt(): Promise<void> throws Error {
+  const r = rig(many(50))
+  r.sim.ftpFile = bytesOf(300_000)
+  // The size given on opening (a made-up 12 bytes a "parameter" of the bytes) is small, but without a factor it means nothing.
+  const got = await readFile(clientOf(r), PATH, (_b: int, _e: int) => {}, 2000)
+  r.gcs.close()
+  expect(got.data.length).toBe(300_000)
+}
+
 async function refusesAFileOverTheMaximumSize(): Promise<void> throws Error {
   const r = rig(many(1))
   r.sim.ftpFile = bytesOf(50_000)
@@ -452,6 +495,9 @@ describe("reading a file with bursts", () => {
   it("gives up when a vehicle brings nothing", givesUpWhenNothingComes)
   it("gives up on a vehicle that repeats what it sent, and terminates", endsWhenTheVehicleRepeatsWhatItSent)
   it("refuses a file that has no end, at the most a file may hold", refusesAFileWithoutAnEnd)
+  it("gives up when the time for the whole read is up, whatever the vehicle sends", endsWhenTheTimeIsUp)
+  it("refuses a file much bigger than the size the vehicle gave, sooner than the maximum", refusesAFileMuchBiggerThanItSaid)
+  it("does not bound a file by the size the vehicle gave when it is not asked to", readsAFileBiggerThanTheFactorWithoutIt)
   it("refuses a file over the maximum size, and reads one under it", refusesAFileOverTheMaximumSize)
   it("terminates the session when the progress callback throws", terminatesWhenTheProgressCallbackThrows)
 })

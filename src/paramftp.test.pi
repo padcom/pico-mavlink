@@ -195,6 +195,21 @@ async function passesTheMaximumSizeOn(): Promise<void> throws Error {
   expect(r.sim.openFtpSessions()).toBe(0)
 }
 
+async function anEndlessVehicleFallsBackQuickly(): Promise<void> throws Error {
+  const r = rig(many(60))
+  r.sim.ftpMode = "endless"
+  const started = Date.now() as int
+  // Distinct chunks for ever: far bigger than the 720 bytes it said (so refused as nonsense) or past the time given.
+  const options: ParamDownloadOptions = { timeoutMs: 500, retries: 2, quietMs: 300, silenceMs: 500, deadlineMs: 400 }
+  const got = await new ParamDownload(r.gcs, VEHICLE, ParamEncoding.CCast, options).run()
+  r.gcs.close()
+  expect(got.source).toBe("list")
+  expect(got.fallback == "protocol" || got.fallback == "timeout").toBe(true)
+  expect(got.count).toBe(60)
+  expect((Date.now() as int) - started < 10000).toBe(true)
+  expect(r.sim.openFtpSessions()).toBe(0)
+}
+
 async function methodsListAndFtp(): Promise<void> throws Error {
   const r = rig(many(100))
   const list: ParamDownloadOptions = { timeoutMs: 500, retries: 2, quietMs: 300, silenceMs: 500, method: "list" }
@@ -411,6 +426,7 @@ describe("the parameter download", () => {
   it("takes the capabilities from the caller, and does not ask for them", takesTheCapabilitiesFromTheCaller)
   it("reports the progress of the list too, in parameters", reportsProgressOfTheList)
   it("refuses a file over the maximum size it was given, and falls back to the list", passesTheMaximumSizeOn)
+  it("falls back to the list from a vehicle that never ends the file, in time", anEndlessVehicleFallsBackQuickly)
   it("uses the list when asked to, and gives the error of a forced FTP", methodsListAndFtp)
   it("is cancelled for good, not retried by the list, and ends the FTP session", abortIsNotRetriedByTheList)
   it("is cancelled before it starts", abortsBeforeAnything)
