@@ -8,7 +8,8 @@
 // the reader found in it the day it was made; they are exact because the file is. Run from the repository root.
 import { describe, it, expect } from "std/test"
 import { readBytes } from "std/fs"
-import { Attitude, GpsRawInt, StatusText } from "./dialects/common"
+import { Attitude, GpsGlobalOrigin, GpsRawInt, HomePosition, StatusText, TerrainReport, TerrainRequest } from "./dialects/common"
+import { Ahrs2, SimState } from "./dialects/ardupilotmega"
 import { GlobalPositionInt } from "./dialects/standard"
 import { Heartbeat, MavAutopilot, MavType } from "./dialects/minimal"
 import { TlogReader, TlogRecord } from "./tlog"
@@ -66,6 +67,16 @@ async function readsTheRecordingMavproxyWrote(): Promise<void> throws Error {
     expect(p.bytesFed).toBe(105916)
     expect(p.bytesInRecords).toBe(105916)
     expect(p.byId.size).toBe(33)
+    // The exact set of message ids with their counts: a regenerated fixture changes this line, and what changed is to be reviewed.
+    const ids: int[] = []
+    for (const id of p.byId.keys()) {
+      ids.push(id)
+    }
+    ids.sort((a, b) => a - b)
+    expect(ids.map((id) => `${id}x${p.byId.get(id)}`).join(" ")).toBe(
+      "0x53 1x95 2x94 22x25 24x94 27x95 29x95 30x95 33x95 36x95 42x95 49x1 62x95 65x95 66x2 74x95 111x2 116x95 125x95 129x95 " +
+        "133x38 136x94 137x95 147x94 152x95 163x95 164x94 178x87 193x90 241x94 242x1 253x17 11030x80",
+    )
     // The messages the Flights view draws from, and the vehicle's and MAVProxy's heartbeats.
     expect(p.byId.get(0)).toBe(53)
     expect(p.byId.get(30)).toBe(95)
@@ -144,6 +155,46 @@ function isSitlHomeOrNone(lat: f64, lon: f64): bool {
   (lat == 0.0 && lon == 0.0) || (lat > -36.36 && lat < -34.36 && lon > 148.16 && lon < 150.16)
 }
 
+/// The position (degrees E7: latitude, longitude) a record carries, or an empty list for a message that carries none. Every message of the
+/// fixture that has a position field is here (checked against the dialects' fields of all 33 kinds): GPS_RAW_INT 24, GLOBAL_POSITION_INT 33,
+/// GPS_GLOBAL_ORIGIN 49, TERRAIN_REQUEST 133, TERRAIN_REPORT 136, SIMSTATE 164, AHRS2 178, HOME_POSITION 242.
+function positionOf(r: TlogRecord): int[] {
+  const p = r.payload()
+  if (r.msgid == 24) {
+    const g = GpsRawInt.decode(p)
+    return [g.lat, g.lon]
+  }
+  if (r.msgid == 33) {
+    const g = GlobalPositionInt.decode(p)
+    return [g.lat, g.lon]
+  }
+  if (r.msgid == 49) {
+    const g = GpsGlobalOrigin.decode(p)
+    return [g.latitude, g.longitude]
+  }
+  if (r.msgid == 133) {
+    const g = TerrainRequest.decode(p)
+    return [g.lat, g.lon]
+  }
+  if (r.msgid == 136) {
+    const g = TerrainReport.decode(p)
+    return [g.lat, g.lon]
+  }
+  if (r.msgid == 164) {
+    const g = SimState.decode(p)
+    return [g.lat, g.lng]
+  }
+  if (r.msgid == 178) {
+    const g = Ahrs2.decode(p)
+    return [g.lat, g.lng]
+  }
+  if (r.msgid == 242) {
+    const g = HomePosition.decode(p)
+    return [g.latitude, g.longitude]
+  }
+  []
+}
+
 async function containsNothingThatIdentifiesAnybody(): Promise<void> throws Error {
   const got = await readFixture(65536)
   let texts = 0
@@ -156,24 +207,20 @@ async function containsNothingThatIdentifiesAnybody(): Promise<void> throws Erro
       if (!TEXTS.includes(text)) {
         unexpected = `text: ${text}`
       }
-    } else if (r.msgid == 24) {
-      const g = GpsRawInt.decode(r.payload())
+    }
+    const at = positionOf(r)
+    if (at.length == 2) {
       positions += 1
-      if (!isSitlHomeOrNone(g.lat / 1.0e7, g.lon / 1.0e7)) {
-        unexpected = `GPS_RAW_INT at ${g.lat}, ${g.lon}`
-      }
-    } else if (r.msgid == 33) {
-      const g = GlobalPositionInt.decode(r.payload())
-      positions += 1
-      if (!isSitlHomeOrNone(g.lat / 1.0e7, g.lon / 1.0e7)) {
-        unexpected = `GLOBAL_POSITION_INT at ${g.lat}, ${g.lon}`
+      if (!isSitlHomeOrNone((at[0] as f64) / 1.0e7, (at[1] as f64) / 1.0e7)) {
+        unexpected = `message ${r.msgid} at ${at[0]}, ${at[1]}`
       }
     }
   }
 
   expect(unexpected).toBe("")
   expect(texts).toBe(17)
-  expect(positions).toBe(94 + 95)
+  // 24 x94, 33 x95, 49 x1, 133 x38, 136 x94, 164 x94, 178 x87, 242 x1.
+  expect(positions).toBe(94 + 95 + 1 + 38 + 94 + 94 + 87 + 1)
 }
 
 describe("a recording MAVProxy wrote (fixture)", () => {
