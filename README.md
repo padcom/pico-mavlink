@@ -38,7 +38,16 @@ Status: **in development (MV1).**
   the next request, `confirm` answers it, `run` does the whole walk. A command that calibrates is sent once and its ack waited for
   (30 s), never sent again; `rcCalibration(work)` sets the RC flag and clears it however `work` ends. There is no cancel in the protocol. `SimulatedAutopilot.calibration`
   (src/simcal.pi) does the vehicle's side, with a failure at a chosen position, a failed gyro and silence as faults; it refuses while armed.
-  The compass flow and `RC_CHANNELS` come next.
+- **Done:** calibration, part 2: the compass (src/compasscal.pi), the radio (src/rcchannels.pi) and `waitUntilUp` (src/ready.pi). `CompassCalibration`
+  starts `DO_START_MAG_CAL` (autosave, retry, reboot off unless asked), `next` reads `MAG_CAL_PROGRESS` (percent, status, the 80-bit completion mask
+  for the sphere) and `MAG_CAL_REPORT` (fitness, offsets, status with every ArduPilot failure), `accept` and `cancel` send `DO_ACCEPT_MAG_CAL` and
+  `DO_CANCEL_MAG_CAL`; `run` goes to the reports and `calibration(options, work)` runs a page's work and cancels on every exit (finish, error, abort,
+  start not answered), once more when the first cancel is not answered, saying `cancelFailed` when it cannot. NOTHING is accepted by itself. The vehicle
+  sends the two messages in its stream EXTRA3: ask for them (ids 191 and 192) with `TelemetryRates`. `rcReadingOf`/`RcMonitor` decode `RC_CHANNELS`
+  (65535 is no pulse), `RcExtremes` keeps the least and greatest pulse of each channel for the radio calibration (with `rcCalibration` of part 1).
+  `waitUntilUp` is the one rule for "can this vehicle be calibrated now": it said "AHRS: EKF3 active", or has been up for 10 s (ATTITUDE). The simulator
+  (`SimulatedAutopilot.compass`, `.rc`) does the vehicle's side with failure statuses, lost acks and a mute link as faults. SITL (calibration model,
+  `SITL_FLIGHT=1`): the compass calibrates with the vehicle turned as MAVProxy's `sitl_magcal` does, is kept only when accepted, and is cancelled when left.
 - **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte
   big-endian microsecond timestamp and one MAVLink 1 or 2 frame per record). Bounded memory (a chunk and a record), CRC-checked
   against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,

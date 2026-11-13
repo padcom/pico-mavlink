@@ -1,0 +1,35 @@
+// When a vehicle can be calibrated. ArduPilot starts to boot when a link is made to a SITL (and a real board has just been powered): a
+// calibration command sent while it still boots is not answered, and the vehicle then says nothing (no heartbeat) until it is restarted
+// (the gyro calibration of the boot and the command meet). The vehicle says "AHRS: EKF3 active" (or EKF2) in STATUSTEXT when it is up
+// (about 3.5 s after the link in SITL); a ground station that connects to a vehicle that has been up for long never sees that text, so
+// the uptime in ATTITUDE (time_boot_ms) says it as well. One rule, for every caller: `waitUntilUp`.
+import { MavLinkConnection, Received } from "./connection"
+import { Attitude, StatusText } from "./dialects/common"
+import { Target } from "./operations"
+
+/// How long a vehicle has been up (ms) when it is taken as up whether it said so or not: well past its boot.
+export const UP_AFTER_MS: int = 10_000
+
+/// Whether `r` says the vehicle at `target` is up: its "AHRS: EKF3 active", or an ATTITUDE with an uptime of `minUptimeMs`.
+function saysUp(r: Received, target: Target, minUptimeMs: int): bool {
+  if (r.packet.header.sysid != target.system || (target.component != 0 && r.packet.header.compid != target.component)) {
+    return false
+  }
+  const m = r.message
+  if (m instanceof StatusText) {
+    return m.text.startsWith("AHRS: EKF") && m.text.endsWith(" active")
+  }
+  if (m instanceof Attitude) {
+    return m.timeBootMs as int >= minUptimeMs
+  }
+  false
+}
+
+/// Waits until the vehicle can be calibrated: true when it said it is up (or has been up for `minUptimeMs`), false when it did not in
+/// `timeoutMs` (or the signal aborted). `conn.run()` must be running. The vehicle is asked for nothing: it must send ATTITUDE (a vehicle
+/// that does not is waited for the text only).
+export async function waitUntilUp(conn: MavLinkConnection, vehicle: Target, timeoutMs: int = 30_000, signal: AbortSignal? = null,
+  minUptimeMs: int = UP_AFTER_MS): Promise<bool> throws Error {
+  const r = await conn.waitFor((r: Received) => saysUp(r, vehicle, minUptimeMs), timeoutMs, signal)
+  r != null
+}

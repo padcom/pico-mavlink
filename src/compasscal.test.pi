@@ -1,0 +1,412 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError, MavLinkProtocolV2 } from "./protocol"
+import { SimulatedAutopilot } from "./simulator"
+import { CompassCalibration, CompassProgress, CompassStatus, MAX_COMPASSES, sectionLit, sectionsLit } from "./compasscal"
+import { MagCalReport, MavResult } from "./dialects/common"
+import { MagCalProgress } from "./dialects/ardupilotmega"
+
+/// A ground station and a simulated vehicle on the ground, disarmed, with two compasses that advance by 25 % every 10 ms.
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly cal: CompassCalibration
+
+  constructor(signal: AbortSignal? = null) {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.gcs = new MavLinkConnection(ends[0])
+    this.cal = new CompassCalibration(this.gcs, { system: 1, component: 1 }, { timeoutMs: 100, signal: signal })
+    this.sim.compass.progressMs = 10
+    this.sim.compass.stepPct = 25
+    this.gcs.run()
+    this.sim.start(1000)
+  }
+
+  public close(): void {
+    sim.stop()
+    gcs.close()
+  }
+}
+
+/// Every progress the callback is given, for a test to read.
+class Seen {
+  public readonly percents: int[] = []
+  public lit: int = 0
+  public stopAfter: int = 0
+}
+
+function seeing(seen: Seen): (p: CompassProgress) => bool {
+  (p: CompassProgress) => {
+    seen.percents.push(p.completionPct)
+    const lit = sectionsLit(p.completionMask)
+    seen.lit = if (lit > seen.lit) lit else seen.lit
+    seen.stopAfter == 0 || seen.percents.length < seen.stopAfter
+  }
+}
+
+async function runsToTheReportsAndAcceptsNothing(): Promise<void> throws Error {
+  const rig = new Rig()
+  const seen = new Seen()
+  const run = await rig.cal.run({}, seeing(seen), 500)
+  rig.close()
+  expect(run.ok).toBe(true)
+  expect(run.reason).toBe("")
+  expect(run.result).toBe(MavResult.ACCEPTED)
+  expect(run.reports.length).toBe(2)
+  expect(run.reports.map((r) => `${r.compassId}:${CompassStatus.nameOf(r.status) ?? "?"}:${r.fitness}`).join(",")).toBe("0:SUCCESS:12.5,1:SUCCESS:12.5")
+  expect(run.reports[1].offsets.join(",")).toBe("20,-5,2.5")
+  // the sphere is lit as the percent says: 80 sections, 75 % of them when the last progress went out
+  expect(seen.percents.length >= 6).toBe(true)
+  expect(seen.lit).toBe(60)
+  // nothing is kept and nothing is dropped by a run that ends: the user chooses
+  expect(rig.sim.compass.lastAutosave).toBe(false)
+  expect(rig.sim.compass.accepts).toBe(0)
+  expect(rig.sim.compass.cancels).toBe(0)
+  expect(rig.sim.compass.saved(0) || rig.sim.compass.saved(1)).toBe(false)
+}
+
+async function sendsWhatWasAskedFor(): Promise<void> throws Error {
+  const rig = new Rig()
+  expect(await rig.cal.start({ mask: 2, retry: true, autosave: true, delayS: 3, autoreboot: true })).toBe(MavResult.ACCEPTED)
+  const c = rig.sim.compass
+  expect(`${c.lastMask} ${c.lastRetry} ${c.lastAutosave} ${c.lastDelay} ${c.lastAutoreboot}`).toBe("2 true true 3 true")
+  expect(await rig.cal.cancel()).toBe(MavResult.ACCEPTED)
+  expect(await rig.cal.start()).toBe(MavResult.ACCEPTED)
+  expect(`${c.lastMask} ${c.lastRetry} ${c.lastAutosave} ${c.lastDelay} ${c.lastAutoreboot}`).toBe("0 false false 0 false")
+  rig.close()
+}
+
+async function calibratesOnlyTheCompassesAskedFor(): Promise<void> throws Error {
+  const rig = new Rig()
+  const run = await rig.cal.run({ mask: 2 }, seeing(new Seen()), 500)
+  rig.close()
+  expect(run.ok).toBe(true)
+  expect(run.reports.map((r) => r.compassId).join(",")).toBe("1")
+}
+
+async function reportsAFailureAndItsReason(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.compass.failWith = CompassStatus.FAILED_RADIUS
+  const run = await rig.cal.run({}, seeing(new Seen()), 500)
+  rig.close()
+  expect(run.ok).toBe(false)
+  expect(run.reason).toBe("")
+  expect(run.reports.map((r) => CompassStatus.nameOf(r.status) ?? "?").join(",")).toBe("FAILED_RADIUS,FAILED_RADIUS")
+}
+
+async function isRefusedWhileArmed(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.ticks = 5   // armed
+  const run = await rig.cal.run({}, seeing(new Seen()), 200)
+  rig.close()
+  expect(run.reason).toBe("refused")
+  expect(run.result).toBe(MavResult.FAILED)
+  expect(run.reports.length).toBe(0)
+  expect(rig.sim.compass.starts).toBe(0)
+  expect(rig.sim.compass.cancels).toBe(0)
+}
+
+async function cancelsWhenTheCallerStops(): Promise<void> throws Error {
+  const rig = new Rig()
+  const seen = new Seen()
+  seen.stopAfter = 3
+  const run = await rig.cal.run({}, seeing(seen), 500)
+  await delay(40)
+  rig.close()
+  expect(run.reason).toBe("stopped")
+  expect(run.ok).toBe(false)
+  expect(rig.sim.compass.cancels).toBe(1)
+  expect(rig.sim.compass.statusOf(0)).toBe(CompassStatus.NOT_STARTED)
+  expect(rig.sim.compass.accepts).toBe(0)
+}
+
+async function cancelsWhenTheVehicleIsSilent(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.compass.silent = true
+  const run = await rig.cal.run({}, seeing(new Seen()), 60)
+  rig.close()
+  expect(run.reason).toBe("silent")
+  expect(rig.sim.compass.cancels).toBe(1)
+}
+
+async function cancelsWhenItIsAborted(): Promise<void> throws Error {
+  const stop = new AbortController()
+  const rig = new Rig(stop.signal)
+  setTimeout(() => stop.abort(), 30)
+  let code = "none"
+  try {
+    await rig.cal.run({}, seeing(new Seen()), 500)
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("ABORTED")
+  // the cancel went out though the signal had aborted
+  expect(rig.sim.compass.cancels).toBe(1)
+  expect(rig.cal.cancelFailed).toBe(false)
+}
+
+async function saysSoWhenTheLinkIsGone(): Promise<void> throws Error {
+  const rig = new Rig()
+  const seen = new Seen()
+  let drop = true
+  const run = await rig.cal.run({}, (p: CompassProgress) => {
+    if (drop) {
+      drop = false
+      rig.sim.down = true   // the vehicle hears nothing from here, and says nothing
+      rig.sim.compass.mute = true
+    }
+    seen.percents.push(p.completionPct)
+    true
+  }, 60)
+  rig.close()
+  expect(run.reason).toBe("silent")
+  // the cancel could not be told: it says so
+  expect(rig.cal.cancelFailed).toBe(true)
+}
+
+async function acceptsOnlyWhatTheCallerAccepts(): Promise<void> throws Error {
+  const rig = new Rig()
+  const run = await rig.cal.run({}, seeing(new Seen()), 500)
+  expect(run.ok).toBe(true)
+  expect(await rig.cal.accept(2)).toBe(MavResult.ACCEPTED)   // compass 1 only
+  rig.close()
+  expect(rig.sim.compass.saved(0)).toBe(false)
+  expect(rig.sim.compass.saved(1)).toBe(true)
+  expect(rig.sim.compass.accepts).toBe(1)
+}
+
+async function acceptsNothingThatFailed(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.compass.failWith = CompassStatus.FAILED
+  await rig.cal.run({}, seeing(new Seen()), 500)
+  expect(await rig.cal.accept(0)).toBe(MavResult.FAILED)
+  rig.close()
+  expect(rig.sim.compass.accepts).toBe(0)
+}
+
+async function nothingToAcceptBeforeARun(): Promise<void> throws Error {
+  const rig = new Rig()
+  expect(await rig.cal.accept(0)).toBe(MavResult.FAILED)
+  rig.close()
+}
+
+async function theGuardCancelsWhenTheWorkEnds(): Promise<void> throws Error {
+  const rig = new Rig()
+  let progress = 0
+  await rig.cal.calibration({}, () => counts(rig.cal, 2, (n: int) => {
+    progress = n
+  }))
+  rig.close()
+  expect(progress >= 2).toBe(true)
+  // the vehicle is told to cancel, so nothing that was not accepted is left (or running)
+  expect(rig.sim.compass.cancels).toBe(1)
+  expect(rig.cal.cancelFailed).toBe(false)
+}
+
+/// Reads `n` progress events (the work of a page).
+async function counts(cal: CompassCalibration, n: int, done: (n: int) => void): Promise<void> throws Error {
+  let seen = 0
+  while (seen < n) {
+    const e = await cal.next(500)
+    expect(e == null).toBe(false)
+    if (e!.progress != null) {
+      seen += 1
+    }
+  }
+  done(seen)
+}
+
+async function ignoresACompassIdThatIsNoCompass(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  vehicle.run()
+  const cal = new CompassCalibration(gcs, { system: 1, component: 1 }, { timeoutMs: 100 })
+  const bad = new MagCalReport()
+  bad.compassId = 200
+  bad.calMask = 255
+  bad.calStatus = CompassStatus.SUCCESS as u8
+  const badProgress = new MagCalProgress()
+  badProgress.compassId = 8
+  const waiting = cal.next(150)
+  await vehicle.send(bad)
+  await vehicle.send(badProgress)
+  expect((await waiting) == null).toBe(true)   // neither is an event
+  const good = new MagCalReport()
+  good.compassId = 7
+  good.calMask = 128
+  good.calStatus = CompassStatus.SUCCESS as u8
+  const next = cal.next(150)
+  await vehicle.send(good)
+  const e = await next
+  expect(e == null).toBe(false)
+  expect(e!.report!.compassId).toBe(7)
+  expect(MAX_COMPASSES).toBe(8)
+  gcs.close()
+  vehicle.close()
+}
+
+async function throwsAtOnce(): Promise<void> throws Error {
+  throw new MavLinkError("WORK", "the work failed")
+}
+
+async function theGuardCancelsWhenTheWorkThrows(): Promise<void> throws Error {
+  const rig = new Rig()
+  let code = "none"
+  try {
+    await rig.cal.calibration({}, () => throwsAtOnce())
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("WORK")
+  expect(rig.sim.compass.cancels).toBe(1)
+}
+
+async function waitsForever(conn: MavLinkConnection, signal: AbortSignal): Promise<void> throws Error {
+  const r = await conn.waitFor((_r: Received) => false, 5000, signal)
+  if (r == null) {
+    throw new MavLinkError("ABORTED", "the work was cancelled")
+  }
+}
+
+async function theGuardCancelsWhenTheWorkIsAborted(): Promise<void> throws Error {
+  const stop = new AbortController()
+  const rig = new Rig(stop.signal)
+  setTimeout(() => stop.abort(), 30)
+  let code = "none"
+  try {
+    await rig.cal.calibration({}, () => waitsForever(rig.gcs, stop.signal))
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("ABORTED")
+  expect(rig.sim.compass.cancels).toBe(1)
+}
+
+async function theGuardDoesNotRunTheWorkWhenArmed(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.ticks = 5
+  let worked = false
+  let code = "none"
+  try {
+    await rig.cal.calibration({}, () => {
+      worked = true
+      counts(rig.cal, 0, (_n: int) => {
+      })
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("REFUSED")
+  expect(worked).toBe(false)
+}
+
+async function theGuardCancelsWhenTheStartWasNotAnswered(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.compass.swallowAcks = 1   // the vehicle starts, and the ack is lost
+  let worked = false
+  let code = "none"
+  try {
+    await rig.cal.calibration({}, () => {
+      worked = true
+      counts(rig.cal, 0, (_n: int) => {
+      })
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  expect(worked).toBe(false)
+  expect(rig.sim.compass.starts).toBe(1)
+  expect(rig.sim.compass.cancels).toBe(1)
+}
+
+async function theGuardTriesTheCancelOnceMore(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.cal.calibration({}, () => {
+    rig.sim.compass.swallowAcks = 1   // the ack of the first cancel is lost
+    counts(rig.cal, 0, (_n: int) => {
+    })
+  })
+  rig.close()
+  expect(rig.sim.compass.cancels).toBe(2)
+  expect(rig.cal.cancelFailed).toBe(false)
+}
+
+async function theGuardSaysSoWhenItCannotCancel(): Promise<void> throws Error {
+  const rig = new Rig()
+  let code = "none"
+  try {
+    await rig.cal.calibration({}, () => {
+      rig.sim.compass.swallowAcks = 2
+      counts(rig.cal, 0, (_n: int) => {
+      })
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  expect(rig.cal.cancelFailed).toBe(true)
+  expect(rig.sim.compass.cancels).toBe(2)
+}
+
+async function ignoresAMaskThatIsNoNumber(): Promise<void> throws Error {
+  const rig = new Rig()
+  expect(await rig.cal.start({ mask: 300 })).toBe(MavResult.FAILED)
+  expect(await rig.cal.start({ mask: 8 })).toBe(MavResult.FAILED)   // a compass the vehicle does not have
+  expect(rig.sim.compass.starts).toBe(0)
+  rig.close()
+}
+
+describe("compass calibration", () => {
+  it("runs to the report of every compass and accepts nothing", runsToTheReportsAndAcceptsNothing)
+  it("sends the compasses, retry, autosave, delay and reboot that were asked for, and autosave is off by default", sendsWhatWasAskedFor)
+  it("calibrates only the compasses asked for", calibratesOnlyTheCompassesAskedFor)
+  it("reports a failure and why", reportsAFailureAndItsReason)
+  it("is refused while armed", isRefusedWhileArmed)
+  it("refuses a mask outside 0 to 255 and a compass the vehicle does not have", ignoresAMaskThatIsNoNumber)
+  it("accepts the compasses the caller names and no others", acceptsOnlyWhatTheCallerAccepts)
+  it("accepts nothing that failed, and nothing before a run", acceptsNothingThatFailed)
+  it("has nothing to accept before a run", nothingToAcceptBeforeARun)
+})
+
+describe("the exits of a compass calibration", () => {
+  it("takes no event for a compass id past 7 (200)", ignoresACompassIdThatIsNoCompass)
+  it("cancels when the caller stops it", cancelsWhenTheCallerStops)
+  it("cancels when the vehicle goes silent", cancelsWhenTheVehicleIsSilent)
+  it("cancels when it is aborted, though the signal has aborted", cancelsWhenItIsAborted)
+  it("says so when the link is gone and the cancel cannot be told", saysSoWhenTheLinkIsGone)
+  it("is cancelled by the guard when the work ends", theGuardCancelsWhenTheWorkEnds)
+  it("is cancelled by the guard when the work throws", theGuardCancelsWhenTheWorkThrows)
+  it("is cancelled by the guard when the work is aborted", theGuardCancelsWhenTheWorkIsAborted)
+  it("is refused by the guard while armed: the work does not run", theGuardDoesNotRunTheWorkWhenArmed)
+  it("is cancelled by the guard when the start was not answered", theGuardCancelsWhenTheStartWasNotAnswered)
+  it("is cancelled by the guard with one more try when the first cancel is not answered", theGuardTriesTheCancelOnceMore)
+  it("says so when the guard cannot cancel", theGuardSaysSoWhenItCannotCancel)
+})
+
+describe("the sphere", () => {
+  it("counts and tells the lit sections of a completion mask", () => {
+    const mask = [255, 1, 0, 0, 0, 0, 0, 0, 0, 128]
+    expect(sectionsLit(mask)).toBe(10)
+    expect(sectionLit(mask, 0) && sectionLit(mask, 8) && sectionLit(mask, 79)).toBe(true)
+    expect(sectionLit(mask, 9) || sectionLit(mask, 78) || sectionLit(mask, 80) || sectionLit(mask, -1)).toBe(false)
+  })
+
+  it("names the statuses and tells running from done", () => {
+    expect(CompassStatus.nameOf(10) ?? "").toBe("FAILED_RESIDUALS_HIGH")
+    expect(CompassStatus.nameOf(11) == null).toBe(true)
+    expect(CompassStatus.isRunning(2) && CompassStatus.isRunning(3) && !CompassStatus.isRunning(4) && !CompassStatus.isRunning(0)).toBe(true)
+    expect(CompassStatus.isDone(4) && CompassStatus.isDone(10) && !CompassStatus.isDone(3)).toBe(true)
+  })
+})

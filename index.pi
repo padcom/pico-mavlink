@@ -112,7 +112,23 @@ export {
   decodeParamPack,
   encodeParamPack,
 } from "./src/parampack"
-export { AccelCalKind, AccelCalResult, AccelPosition, Calibration } from "./src/accelcal"
+export { AccelCalKind, AccelCalResult, AccelPosition, Calibration, wholeNumber } from "./src/accelcal"
+export {
+  CompassCalibration,
+  CompassEvent,
+  CompassOptions,
+  CompassProgress,
+  CompassReport,
+  CompassRun,
+  CompassStatus,
+  MAX_COMPASSES,
+  progressOf,
+  reportOf,
+  sectionLit,
+  sectionsLit,
+} from "./src/compasscal"
+export { MAX_PULSE, MIN_PULSE, RcExtremes, RcMonitor, RcReading, rcReadingOf } from "./src/rcchannels"
+export { UP_AFTER_MS, waitUntilUp } from "./src/ready"
 export {
   AutopilotVersionRead,
   CommandCall,

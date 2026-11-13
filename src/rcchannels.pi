@@ -1,0 +1,123 @@
+// The channels of the radio, from RC_CHANNELS (ArduPilot: libraries/GCS_MAVLink/GCS_Common.cpp `send_rc_channels`; the microseconds of the
+// pulse of each channel the receiver gives, 65535 for a channel that is not used, and rssi 0 to 254 or 255 for "unknown"): what the Radio
+// page draws, and what its calibration reads the extremes from.
+import { MavLinkConnection, Received } from "./connection"
+import { RcChannels } from "./dialects/common"
+import { Target } from "./operations"
+
+/// The pulse (µs) the message gives for a channel it does not carry: 0 here (65535 in the message).
+export const NO_PULSE: int = 0
+
+/// One RC_CHANNELS.
+export struct RcReading {
+  /// Milliseconds since the vehicle booted.
+  timeBootMs: int
+  /// How many channels the receiver has (0 to 18).
+  count: int
+  /// The pulse of each of the `count` channels in µs; 0 where the message says "not used" (65535) or the channel is past `count`.
+  pulses: int[]
+  /// 0 to 100 (%), or -1 when the vehicle does not know it (255).
+  rssi: int
+}
+
+/// A pulse as the message gives it: 65535 and 0 are no pulse, a real one is 800 to 2200 µs; anything else is taken as it is.
+function pulseOf(raw: int): int {
+  if (raw == 65535) NO_PULSE else raw
+}
+
+/// The reading `m` says: channel i (0 to 17) is `pulses[i]`, only the `chancount` the receiver has, at most 18.
+export function rcReadingOf(m: RcChannels): RcReading {
+  const raw: int[] = [
+    m.chan1Raw as int, m.chan2Raw as int, m.chan3Raw as int, m.chan4Raw as int, m.chan5Raw as int, m.chan6Raw as int,
+    m.chan7Raw as int, m.chan8Raw as int, m.chan9Raw as int, m.chan10Raw as int, m.chan11Raw as int, m.chan12Raw as int,
+    m.chan13Raw as int, m.chan14Raw as int, m.chan15Raw as int, m.chan16Raw as int, m.chan17Raw as int, m.chan18Raw as int,
+  ]
+  const carried = m.chancount as int
+  const count = if (carried > 18) 18 else carried
+  const pulses: int[] = []
+  for (let i = 0; i < count; i++) {
+    pulses.push(pulseOf(raw[i]))
+  }
+  const rssi = m.rssi as int
+  const reading: RcReading = { timeBootMs: m.timeBootMs as int, count: count, pulses: pulses, rssi: if (rssi == 255) -1 else rssi }
+  reading
+}
+
+/// Keeps the latest RC_CHANNELS of a vehicle. `conn.run()` must be running; `stop()` ends it.
+export class RcMonitor {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly listener: int
+  /// The latest reading, or null before the first.
+  public latest: RcReading? = null
+  /// How many readings came.
+  public count: int = 0
+
+  constructor(conn: MavLinkConnection, target: Target) {
+    this.conn = conn
+    this.target = target
+    this.listener = conn.on((r: Received) => this.heard(r))
+  }
+
+  heard(r: Received): void {
+    if (r.packet.header.sysid != target.system || (target.component != 0 && r.packet.header.compid != target.component)) {
+      return
+    }
+    const m = r.message
+    if (m instanceof RcChannels) {
+      latest = rcReadingOf(m)
+      count += 1
+    }
+  }
+
+  public stop(): void {
+    conn.off(listener)
+  }
+}
+
+/// The shortest and the longest pulse (µs) that is taken for a channel's: a receiver gives 1000 to 2000 (800 to 2200 for the ends of an
+/// extended range). A pulse outside them (a glitch of 1 µs, a 9000 µs spike) is not a reading, and never becomes an RCn_MIN or RCn_MAX.
+export const MIN_PULSE: int = 800
+export const MAX_PULSE: int = 2200
+
+/// The least and the greatest pulse of each channel over the readings it is given: what the radio calibration captures while the user
+/// moves the sticks and the switches. A pulse of 0 (no pulse) is not a reading, and a pulse outside 800 to 2200 µs is a glitch that is
+/// counted in `glitches` and kept out of the extremes (the values come from a vehicle, and are written to its parameters).
+export class RcExtremes {
+  public readonly mins: int[] = []
+  public readonly maxs: int[] = []
+  /// How many readings it has had.
+  public readings: int = 0
+  /// How many pulses were outside 800 to 2200 µs (not counting channels with no pulse), and kept out.
+  public glitches: int = 0
+
+  /// Takes a reading in.
+  public observe(r: RcReading): void {
+    readings += 1
+    for (let i = 0; i < r.count; i++) {
+      const p = r.pulses[i]
+      if (p <= 0) {
+        continue
+      }
+      if (p < MIN_PULSE || p > MAX_PULSE) {
+        glitches += 1
+        continue
+      }
+      while (mins.length <= i) {
+        mins.push(0)
+        maxs.push(0)
+      }
+      if (mins[i] == 0 || p < mins[i]) {
+        mins[i] = p
+      }
+      if (p > maxs[i]) {
+        maxs[i] = p
+      }
+    }
+  }
+
+  /// How far channel `i` (0 based) moved, in µs; 0 when it has not been seen.
+  public travel(i: int): int {
+    if (i < 0 || i >= mins.length) 0 else maxs[i] - mins[i]
+  }
+}

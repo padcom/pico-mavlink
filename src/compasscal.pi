@@ -1,0 +1,385 @@
+// The compass (magnetometer) calibration, as a ground station asks for it (ArduPilot: libraries/AP_Compass/AP_Compass_Calibration.cpp
+// `handle_mag_cal_command`, `send_mag_cal_progress`, `send_mag_cal_report`; libraries/AP_Compass/CompassCalibrator.h for the states):
+//  - MAV_CMD_DO_START_MAG_CAL: param1 the compasses (a bit for each, 0 for all), param2 retry on failure, param3 AUTOSAVE (the vehicle
+//    keeps the result by itself when it succeeds), param4 delay in seconds before it starts, param5 reboot when done. It is refused
+//    (FAILED, "Disarm to allow compass calibration") while armed. The ack comes at once, and the calibration runs on the vehicle:
+//    the user turns the vehicle round, every way, while the vehicle says how far it is.
+//  - MAG_CAL_PROGRESS for each compass that runs, at the vehicle's stream rate: status (WAITING_TO_START, RUNNING_STEP_ONE, RUNNING_STEP_TWO),
+//    the attempt, completion_pct and completion_mask (80 bits, 10 bytes: the sections of a sphere around the vehicle that have samples,
+//    for drawing it lit), and the mask of the compasses that calibrate.
+//  - MAG_CAL_REPORT for each compass that is done, SUCCESS or a failure (FAILED, bad orientation, radius, offsets, diagonal scaling,
+//    residuals), with fitness, offsets, diagonals, off-diagonals and orientation. The vehicle repeats it until the calibration is accepted
+//    or cancelled. `autosaved` says it kept the result (only when asked to: param3).
+//  - MAV_CMD_DO_ACCEPT_MAG_CAL (param1 the compasses, 0 for all) keeps the result: the offsets are written to COMPASS_OFS*, and the new
+//    values are used after a reboot. MAV_CMD_DO_CANCEL_MAG_CAL (param1, 0 for all) stops a calibration and drops a result not accepted;
+//    the vehicle acks it ACCEPTED.
+//  - What accepting keeps (a page must say so before it accepts): not only the offsets but the diagonals, the off-diagonals and the scale
+//    factor of each compass, and, when the vehicle's COMPASS_AUTO_ROT is 2 or more, the orientation of the compass the calibration found
+//    (the report's `oldOrientation` and `newOrientation`: show both before accepting).
+//  - A start with the mask 0 (all compasses) first makes the vehicle SAVE the removal of a compass that is missing from its priority list
+//    (COMPASS_PRIO*_ID). So "nothing is kept unless accepted" holds for the calibration, not for that housekeeping.
+//  - `run` ends, with no cancel, when every compass has reported. The vehicle goes on repeating the reports until the result is accepted
+//    or cancelled, or the vehicle reboots: a caller that leaves after `run` MUST cancel (`cancel`), or accept. `calibration` does.
+//  - A compass id is 0 to 7: a progress or a report with a bigger one (the vehicle's byte, used as it came it would shift out of range) is
+//    not taken for an event.
+//  - The vehicle sends MAG_CAL_PROGRESS and MAG_CAL_REPORT in its stream EXTRA3 (SR*_EXTRA3, libraries/GCS_MAVLink/GCS_MAVLink_Parameters.cpp), which
+//    a link made by a ground station may not have at a rate: ask for both (message ids 191 and 192) with `TelemetryRates` (or
+//    MAV_CMD_SET_MESSAGE_INTERVAL) before the calibration, or nothing comes and the run ends `silent`.
+//  - Nothing is kept unless the ground station accepts (or asked for autosave): `autosave` is off unless the options say so. A calibration
+//    that is left (the page is closed, the link drops) is cancelled: `calibration` and `run` cancel it on every exit.
+import { MavLinkConnection, Received } from "./connection"
+import { MavLinkError } from "./protocol"
+import { MavCmd as ApmCmd } from "./dialects/ardupilotmega"
+import { MagCalProgress } from "./dialects/ardupilotmega"
+import { MagCalReport } from "./dialects/common"
+import { MavResult } from "./dialects/common"
+import { CommandCall, ParamOptions, Target } from "./operations"
+
+/// The states of a compass calibrator (the `cal_status` of both messages). ArduPilot has more than the dialect's MAG_CAL_STATUS.
+export class CompassStatus {
+  public static readonly NOT_STARTED: int = 0
+  public static readonly WAITING_TO_START: int = 1
+  public static readonly RUNNING_STEP_ONE: int = 2
+  public static readonly RUNNING_STEP_TWO: int = 3
+  public static readonly SUCCESS: int = 4
+  public static readonly FAILED: int = 5
+  public static readonly FAILED_ORIENTATION: int = 6
+  public static readonly FAILED_RADIUS: int = 7
+  public static readonly FAILED_OFFSETS: int = 8
+  public static readonly FAILED_DIAG_SCALING: int = 9
+  public static readonly FAILED_RESIDUALS_HIGH: int = 10
+
+  /// Whether the calibration is still going on in `value`.
+  public static isRunning(value: int): bool {
+    value >= WAITING_TO_START && value <= RUNNING_STEP_TWO
+  }
+
+  /// Whether `value` is the end of a calibration (it succeeded or failed).
+  public static isDone(value: int): bool {
+    value >= SUCCESS && value <= FAILED_RESIDUALS_HIGH
+  }
+
+  /// The name of `value` (`SUCCESS` ...), or null for a number that is none.
+  public static nameOf(value: int): string? {
+    match (value) {
+      0 => "NOT_STARTED",
+      1 => "WAITING_TO_START",
+      2 => "RUNNING_STEP_ONE",
+      3 => "RUNNING_STEP_TWO",
+      4 => "SUCCESS",
+      5 => "FAILED",
+      6 => "FAILED_ORIENTATION",
+      7 => "FAILED_RADIUS",
+      8 => "FAILED_OFFSETS",
+      9 => "FAILED_DIAG_SCALING",
+      10 => "FAILED_RESIDUALS_HIGH",
+      _ => null,
+    }
+  }
+}
+
+/// How a compass calibration is asked for.
+export struct CompassOptions {
+  /// The compasses to calibrate, a bit for each (0 or unset: all).
+  mask?: int
+  /// Start again by itself when an attempt fails.
+  retry?: bool
+  /// Let the vehicle keep the result when it succeeds. OFF unless asked.
+  autosave?: bool
+  /// Seconds the vehicle waits before it starts.
+  delayS?: int
+  /// Let the vehicle reboot when it is done.
+  autoreboot?: bool
+}
+
+/// How far a compass is.
+export struct CompassProgress {
+  compassId: int
+  /// The compasses that calibrate, a bit for each.
+  calMask: int
+  /// `CompassStatus`.
+  status: int
+  attempt: int
+  completionPct: int
+  /// The 80 bits (10 bytes) of the sections of the sphere that have samples.
+  completionMask: int[]
+  /// The direction of the vehicle for display (body frame).
+  direction: f64[]
+}
+
+/// What a compass calibration came to for one compass.
+export struct CompassReport {
+  compassId: int
+  calMask: int
+  /// `CompassStatus`: SUCCESS, or why not.
+  status: int
+  /// Whether the vehicle kept the result by itself (it was asked to).
+  autosaved: bool
+  fitness: f64
+  offsets: f64[]
+  diagonals: f64[]
+  offDiagonals: f64[]
+  orientationConfidence: f64
+  oldOrientation: int
+  newOrientation: int
+  scaleFactor: f64
+}
+
+/// A progress or a report: the one that is not null.
+export struct CompassEvent {
+  progress: CompassProgress?
+  report: CompassReport?
+}
+
+/// What `run` came to.
+export struct CompassRun {
+  /// The compasses that were reported, the last report of each.
+  reports: CompassReport[]
+  /// Whether every compass that calibrated was reported SUCCESS (nothing is accepted: see `accept`).
+  ok: bool
+  /// Why it is not over: `""` (all reported), `refused` (the vehicle did not start; `result` is what it said), `stopped` (the caller
+  /// stopped it, and the vehicle was told to cancel), `silent` (nothing from the vehicle in time, and it was told to cancel).
+  reason: string
+  /// MAV_RESULT of the command that started it.
+  result: int
+}
+
+/// The progress `m` says, as a value.
+export function progressOf(m: MagCalProgress): CompassProgress {
+  const mask: int[] = []
+  for (const b of m.completionMask) {
+    mask.push(b as int)
+  }
+  const p: CompassProgress = { compassId: m.compassId as int, calMask: m.calMask as int, status: m.calStatus as int,
+    attempt: m.attempt as int, completionPct: m.completionPct as int, completionMask: mask,
+    direction: [m.directionX as f64, m.directionY as f64, m.directionZ as f64] }
+  p
+}
+
+/// The report `m` says, as a value.
+export function reportOf(m: MagCalReport): CompassReport {
+  const r: CompassReport = { compassId: m.compassId as int, calMask: m.calMask as int, status: m.calStatus as int,
+    autosaved: m.autosaved as int != 0, fitness: m.fitness as f64, offsets: [m.ofsX as f64, m.ofsY as f64, m.ofsZ as f64],
+    diagonals: [m.diagX as f64, m.diagY as f64, m.diagZ as f64], offDiagonals: [m.offdiagX as f64, m.offdiagY as f64, m.offdiagZ as f64],
+    orientationConfidence: m.orientationConfidence as f64, oldOrientation: m.oldOrientation as int,
+    newOrientation: m.newOrientation as int, scaleFactor: m.scaleFactor as f64 }
+  r
+}
+
+/// How many sections of the sphere a completion mask holds samples in (of 80).
+export function sectionsLit(mask: int[]): int {
+  let n = 0
+  for (const b of mask) {
+    let v = b & 0xFF
+    while (v != 0) {
+      n += v & 1
+      v = v >> 1
+    }
+  }
+  n
+}
+
+/// Whether bit `section` (0 to 79) of a completion mask is lit.
+export function sectionLit(mask: int[], section: int): bool {
+  if (section < 0) {
+    return false
+  }
+  const at = section / 8
+  at < mask.length && ((mask[at] >> (section % 8)) & 1) != 0
+}
+
+/// The compass calibration of a vehicle. `conn.run()` must be running.
+export class CompassCalibration {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly options: ParamOptions
+  readonly quick: CommandCall
+  /// Whether the last end of a calibration could not tell the vehicle to cancel (it may still be calibrating).
+  public cancelFailed: bool = false
+
+  constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.options = options
+    this.quick = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0, signal: options.signal })
+  }
+
+  /// Asks the vehicle to calibrate (see `CompassOptions`; nothing is kept unless `autosave`); MAV_RESULT, FAILED while armed.
+  public async start(o: CompassOptions = {}): Promise<int> throws Error {
+    await quick.run(ApmCmd.DO_START_MAG_CAL, [
+      (o.mask ?? 0) as f64, if (o.retry ?? false) 1.0 else 0.0, if (o.autosave ?? false) 1.0 else 0.0, (o.delayS ?? 0) as f64,
+      if (o.autoreboot ?? false) 1.0 else 0.0,
+    ])
+  }
+
+  /// Keeps the result of the compasses in `mask` (0: all): the vehicle writes the offsets; they are used after a reboot. MAV_RESULT.
+  public async accept(mask: int = 0): Promise<int> throws Error {
+    await quick.run(ApmCmd.DO_ACCEPT_MAG_CAL, [mask as f64])
+  }
+
+  /// Stops the calibration of the compasses in `mask` (0: all) and drops a result that was not accepted. MAV_RESULT.
+  public async cancel(mask: int = 0): Promise<int> throws Error {
+    await quick.run(ApmCmd.DO_CANCEL_MAG_CAL, [mask as f64])
+  }
+
+  /// The next progress or report of the vehicle, or null when there is none in `timeoutMs`.
+  public async next(timeoutMs: int): Promise<CompassEvent?> throws Error {
+    const r = await conn.waitFor((r: Received) => isEvent(r, target), timeoutMs, options.signal)
+    if (r == null) {
+      // An abort is not a silence: it ends the run as an error, so that the vehicle is told to cancel.
+      if (options.signal != null && options.signal!.aborted) {
+        throw new MavLinkError("ABORTED", "the compass calibration was cancelled")
+      }
+      return null
+    }
+    const m = r!.message
+    if (m instanceof MagCalProgress) {
+      return { progress: progressOf(m), report: null }
+    }
+    if (m instanceof MagCalReport) {
+      return { progress: null, report: reportOf(m) }
+    }
+    null
+  }
+
+  /// The calibration as a whole, for a caller that is a page: the vehicle is told to start, `work` runs (it reads `next`, shows it, and
+  /// accepts or cancels as the user says), and the vehicle is told to CANCEL however that ends: `work` returns, it throws, it is aborted
+  /// (the signal), or the start was not answered (it may have started). A calibration that was not accepted is dropped: nothing is kept
+  /// by this. The cancel is sent without the abort signal, and again once when it is not answered; if that fails too, `cancelFailed` is
+  /// set. A start that the vehicle refuses is thrown as `REFUSED` (and `work` does not run). What went wrong in the start or in `work`
+  /// is thrown after the cancel; a cancel that failed is thrown when nothing else went wrong.
+  public async calibration(o: CompassOptions, work: () => Promise<void, Error>): Promise<void> throws Error {
+    let failure: Error? = null
+    cancelFailed = false
+    try {
+      const started = await start(o)
+      if (started != MavResult.ACCEPTED) {
+        throw new MavLinkError("REFUSED", `the vehicle did not start the compass calibration (MAV_RESULT ${started})`)
+      }
+      await work()
+    } catch (e: Error) {
+      failure = e
+    }
+    const cancelled = await cancelOnExit(o.mask ?? 0)
+    if (failure != null) {
+      throw failure!
+    }
+    if (cancelled != "") {
+      throw new MavLinkError(cancelled, "the vehicle did not answer the end of the compass calibration: it may still be calibrating")
+    }
+  }
+
+  /// Tells the vehicle to cancel, with one more try; "" when it answered, else `TIMEOUT`. Not stopped by the abort signal.
+  async cancelOnExit(mask: int): Promise<string> {
+    const calls = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0 })
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await calls.run(ApmCmd.DO_CANCEL_MAG_CAL, [mask as f64])
+        return ""
+      } catch (e: Error) {
+      }
+    }
+    cancelFailed = true
+    "TIMEOUT"
+  }
+
+  /// The whole run, as far as the reports: starts, tells `onProgress` of each progress (it returns false to stop: the user left), and ends
+  /// with the report of every compass that calibrated. NOTHING IS ACCEPTED (use `accept` for the compasses that the user chose, or `cancel`
+  /// to drop the reports). The vehicle is told to cancel when this stops early (`stopped`, `silent`, an error). `waitMs` is how long
+  /// the vehicle may be silent.
+  public async run(o: CompassOptions, onProgress: (p: CompassProgress) => bool, waitMs: int = 30_000): Promise<CompassRun> throws Error {
+    const reports: CompassReport[] = []
+    let result = MavResult.ACCEPTED
+    let reason = ""
+    let failure: Error? = null
+    try {
+      result = await start(o)
+      if (result != MavResult.ACCEPTED) {
+        return { reports: reports, ok: false, reason: "refused", result: result }
+      }
+      reason = await collect(reports, onProgress, waitMs)
+    } catch (e: Error) {
+      failure = e
+    }
+    if (failure != null || reason != "") {
+      await cancelOnExit(o.mask ?? 0)
+    }
+    if (failure != null) {
+      throw failure!
+    }
+    let ok = reports.length > 0
+    for (const r of reports) {
+      ok = ok && r.status == CompassStatus.SUCCESS
+    }
+    const run: CompassRun = { reports: reports, ok: ok && reason == "", reason: reason, result: result }
+    run
+  }
+
+  /// Reads events until every compass that calibrates has reported; "" then, `stopped` or `silent` when it stopped.
+  async collect(reports: CompassReport[], onProgress: (p: CompassProgress) => bool, waitMs: int): Promise<string> throws Error {
+    let expected = 0
+    while (true) {
+      const e = await next(waitMs)
+      if (e == null) {
+        return "silent"
+      }
+      const event = e!
+      if (event.progress != null) {
+        const p = event.progress!
+        expected = expected | p.calMask
+        if (!onProgress(p)) {
+          return "stopped"
+        }
+      } else if (event.report != null) {
+        const r = event.report!
+        expected = expected | r.calMask
+        keep(reports, r)
+        if (covers(reports, expected)) {
+          return ""
+        }
+      }
+    }
+    ""
+  }
+}
+
+/// The last report of each compass: a report that comes again (the vehicle repeats it) takes the place of the one before.
+function keep(reports: CompassReport[], r: CompassReport): void {
+  for (let i = 0; i < reports.length; i++) {
+    if (reports[i].compassId == r.compassId) {
+      reports[i] = r
+      return
+    }
+  }
+  reports.push(r)
+}
+
+/// Whether every compass in `mask` has a report.
+function covers(reports: CompassReport[], mask: int): bool {
+  let have = 0
+  for (const r of reports) {
+    if (r.compassId < MAX_COMPASSES) {
+      have = have | (1 << r.compassId)
+    }
+  }
+  (mask & have) == mask
+}
+
+/// The most compasses a vehicle has: the ids are 0 to 7 (the masks are a byte).
+export const MAX_COMPASSES: int = 8
+
+/// A MAG_CAL_PROGRESS or MAG_CAL_REPORT from the vehicle, for a compass id that is one.
+function isEvent(r: Received, target: Target): bool {
+  const m = r.message
+  const mine = r.packet.header.sysid == target.system && (target.component == 0 || r.packet.header.compid == target.component)
+  if (!mine) {
+    return false
+  }
+  if (m instanceof MagCalProgress) {
+    return (m.compassId as int) < MAX_COMPASSES
+  }
+  if (m instanceof MagCalReport) {
+    return (m.compassId as int) < MAX_COMPASSES
+  }
+  false
+}

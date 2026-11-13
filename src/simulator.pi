@@ -18,8 +18,9 @@ import { FTP_MAX_DATA, FtpError, FtpNack, FtpOpcode, FtpPacket, ftpMessage, ftpP
 import { ByteStream } from "./stream"
 import { SimLogs } from "./simlogs"
 import { SimCalibration } from "./simcal"
+import { SimCompass } from "./simcompass"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
+import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
 
 /// An FTP request and who sent it.
@@ -195,6 +196,11 @@ export class SimulatedAutopilot {
   public readonly logs: SimLogs
   /// Calibration (MAV_CMD_PREFLIGHT_CALIBRATION, the vehicle asking for positions): see simcal.pi. Refused while armed.
   public readonly calibration: SimCalibration
+  /// Compass calibration (MAV_CMD_DO_START_MAG_CAL, MAG_CAL_PROGRESS and MAG_CAL_REPORT): see simcompass.pi. Refused while armed.
+  public readonly compass: SimCompass
+  /// The pulses (µs) of the channels of the radio, one for each: sent as RC_CHANNELS at each tick when `rcStream` is on (off: nothing).
+  public rc: int[] = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
+  public rcStream: bool = false
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -204,6 +210,7 @@ export class SimulatedAutopilot {
     this.params = params
     this.logs = new SimLogs(conn, fsFiles, fsTimes, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
     this.calibration = new SimCalibration(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
+    this.compass = new SimCompass(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
     conn.on((r: Received) => this.handle(r))
   }
 
@@ -242,6 +249,7 @@ export class SimulatedAutopilot {
   public stop(): void {
     logs.stop()
     calibration.stop()
+    compass.stop()
     clearInterval(timer)
     clearTimeout(downTimer)
     stopTimers()
@@ -342,7 +350,38 @@ export class SimulatedAutopilot {
     if (streaming && !intervals.has(Attitude.MSG_ID)) {
       sendAttitude()
     }
+    if (rcStream) {
+      sendRc()
+    }
     ticks += 1
+  }
+
+  /// RC_CHANNELS: the pulses of `rc` (the first 18), 65535 for the channels past them, rssi 100 %.
+  public sendRc(): void {
+    const m = new RcChannels()
+    m.timeBootMs = ((Date.now() as int) - bootedAt) as u32
+    m.chancount = (if (rc.length > 18) 18 else rc.length) as u8
+    const p = (i: int) => (if (i < rc.length) rc[i] else 65535) as u16
+    m.chan1Raw = p(0)
+    m.chan2Raw = p(1)
+    m.chan3Raw = p(2)
+    m.chan4Raw = p(3)
+    m.chan5Raw = p(4)
+    m.chan6Raw = p(5)
+    m.chan7Raw = p(6)
+    m.chan8Raw = p(7)
+    m.chan9Raw = p(8)
+    m.chan10Raw = p(9)
+    m.chan11Raw = p(10)
+    m.chan12Raw = p(11)
+    m.chan13Raw = p(12)
+    m.chan14Raw = p(13)
+    m.chan15Raw = p(14)
+    m.chan16Raw = p(15)
+    m.chan17Raw = p(16)
+    m.chan18Raw = p(17)
+    m.rssi = 100
+    conn.send(m)
   }
 
   sendSystemTime(): void {
@@ -356,7 +395,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (logs.handle(r) || calibration.handle(r)) {
+    if (logs.handle(r) || calibration.handle(r) || compass.handle(r)) {
       return
     }
     const m = r.message

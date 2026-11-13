@@ -1,0 +1,121 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { SimulatedAutopilot } from "./simulator"
+import { RcExtremes, RcMonitor, RcReading, rcReadingOf } from "./rcchannels"
+import { RcChannels } from "./dialects/common"
+
+function reading(pulses: int[]): RcReading {
+  const r: RcReading = { timeBootMs: 0, count: pulses.length, pulses: pulses, rssi: 100 }
+  r
+}
+
+async function keepsTheLatestReading(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  sim.rcStream = true
+  sim.rc = [1500, 1500, 1000, 1500, 2000]
+  const monitor = new RcMonitor(gcs, { system: 1, component: 1 })
+  sim.start(10)
+  await delay(60)
+  const first = monitor.latest
+  expect(first == null).toBe(false)
+  expect(first!.count).toBe(5)
+  expect(first!.pulses.join(",")).toBe("1500,1500,1000,1500,2000")
+  expect(first!.rssi).toBe(100)
+  sim.rc = [1100, 1500, 1000, 1500, 2000]
+  await delay(60)
+  expect(monitor.latest!.pulses[0]).toBe(1100)
+  // after stop it hears no more
+  monitor.stop()
+  const seen = monitor.count
+  await delay(40)
+  sim.stop()
+  gcs.close()
+  expect(monitor.count).toBe(seen)
+}
+
+async function hearsNothingUnlessSimulatorSends(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  const monitor = new RcMonitor(gcs, { system: 1, component: 1 })
+  sim.start(10)
+  await delay(50)
+  sim.stop()
+  gcs.close()
+  expect(monitor.count).toBe(0)
+  expect(monitor.latest == null).toBe(true)
+}
+
+describe("RC_CHANNELS", () => {
+  it("is read as the pulses of the channels the receiver has, and no more", () => {
+    const m = new RcChannels()
+    m.chancount = 4
+    m.chan1Raw = 1500
+    m.chan2Raw = 1100
+    m.chan3Raw = 1900
+    m.chan4Raw = 65535   // a channel that is not used
+    m.chan5Raw = 1234    // past the count: not the receiver's
+    m.rssi = 255
+    m.timeBootMs = 4200
+    const r = rcReadingOf(m)
+    expect(r.count).toBe(4)
+    expect(r.pulses.join(",")).toBe("1500,1100,1900,0")
+    expect(r.rssi).toBe(-1)
+    expect(r.timeBootMs).toBe(4200)
+  })
+
+  it("is read with all 18 channels, and a count past 18 is 18", () => {
+    const m = new RcChannels()
+    m.chancount = 200
+    m.chan18Raw = 1777
+    m.rssi = 80
+    const r = rcReadingOf(m)
+    expect(r.count).toBe(18)
+    expect(r.pulses[17]).toBe(1777)
+    expect(r.rssi).toBe(80)
+  })
+
+  it("comes from the vehicle and is kept as the latest", keepsTheLatestReading)
+
+  it("does not come from a simulator that is not asked to send it", hearsNothingUnlessSimulatorSends)
+})
+
+describe("the extremes of the channels", () => {
+  it("are the least and the greatest pulse of each channel, and how far it moved", () => {
+    const x = new RcExtremes()
+    x.observe(reading([1500, 1500, 1000]))
+    x.observe(reading([1100, 1500, 1000]))
+    x.observe(reading([1900, 1490, 2000]))
+    x.observe(reading([1500, 0, 1500]))   // a channel with no pulse is not a reading
+    expect(x.mins.join(",")).toBe("1100,1490,1000")
+    expect(x.maxs.join(",")).toBe("1900,1500,2000")
+    expect(x.travel(0)).toBe(800)
+    expect(x.travel(1)).toBe(10)
+    expect(x.travel(2)).toBe(1000)
+    expect(x.travel(7)).toBe(0)
+    expect(x.travel(-1)).toBe(0)
+    expect(x.readings).toBe(4)
+    expect(x.glitches).toBe(0)
+  })
+})
+
+describe("the extremes of the channels and a glitch", () => {
+  it("keeps a pulse of 1 us or 9000 us out, and counts it", () => {
+    const x = new RcExtremes()
+    x.observe(reading([1500, 1500]))
+    x.observe(reading([1, 9000]))
+    x.observe(reading([2201, 799]))
+    x.observe(reading([1200, 1800]))
+    x.observe(reading([800, 2200]))   // the ends of the range are readings
+    expect(x.mins.join(",")).toBe("800,1500")
+    expect(x.maxs.join(",")).toBe("1500,2200")
+    expect(x.glitches).toBe(4)
+    expect(x.travel(0)).toBe(700)
+  })
+})
