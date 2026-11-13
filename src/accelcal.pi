@@ -149,14 +149,19 @@ export class Calibration {
   }
 
   /// The RC calibration: the flag is set, `work` runs, and the flag is cleared however that ends: `work` returns, it throws, it is
-  /// aborted (its signal), or the set was not answered (the vehicle may have set it). The clear is sent without the abort signal, and
-  /// again once when it is not answered; if that fails too, `rcFlagStuck` is set. What went wrong in the set or in `work` is thrown
-  /// after the clear; a clear that failed is thrown when nothing else went wrong.
+  /// aborted (its signal), or the set was not answered (the vehicle may have set it). A vehicle answers the set ACCEPTED or UNSUPPORTED
+  /// (ArduPilot answers UNSUPPORTED to a command with only the flag, though it noted it); any other answer is a refusal (FAILED while
+  /// armed: ArduPilot refuses before it sets the flag), thrown as `REFUSED`, and `work` does not run. The clear is sent without the abort
+  /// signal, and again once when it is not answered or refused; if that fails too, `rcFlagStuck` is set. What went wrong in the set or in
+  /// `work` is thrown after the clear; a clear that failed is thrown when nothing else went wrong.
   public async rcCalibration(work: () => Promise<void, Error>): Promise<void> throws Error {
     let failure: Error? = null
     rcFlagStuck = false
     try {
-      await rcCalibrating(true)
+      const set = await rcCalibrating(true)
+      if (!flagTaken(set)) {
+        throw new MavLinkError("REFUSED", `the vehicle refused the RC calibration (MAV_RESULT ${set})`)
+      }
       await work()
     } catch (e: Error) {
       failure = e
@@ -165,23 +170,29 @@ export class Calibration {
     if (failure != null) {
       throw failure!
     }
-    if (!cleared) {
-      throw new MavLinkError("TIMEOUT", "the vehicle did not answer the end of the RC calibration: its flag may still be set")
+    if (cleared != "") {
+      throw new MavLinkError(cleared, "the vehicle did not end the RC calibration: its flag may still be set")
     }
   }
 
-  /// Clears the RC flag, with one more try; whether the vehicle answered.
-  async clearRcFlag(): Promise<bool> {
+  /// Clears the RC flag, with one more try; "" when the vehicle took it (ACCEPTED or UNSUPPORTED), else `TIMEOUT` (no answer) or
+  /// `REFUSED` (any other answer: FAILED while armed).
+  async clearRcFlag(): Promise<string> {
     const calls = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0 })
+    let why = "TIMEOUT"
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await calls.run(MavCmd.PREFLIGHT_CALIBRATION, [0.0, 0.0, 0.0, 0.0, 0.0])
-        return true
+        const result = await calls.run(MavCmd.PREFLIGHT_CALIBRATION, [0.0, 0.0, 0.0, 0.0, 0.0])
+        if (flagTaken(result)) {
+          return ""
+        }
+        why = "REFUSED"
       } catch (e: Error) {
+        why = "TIMEOUT"
       }
     }
     rcFlagStuck = true
-    false
+    why
   }
 
   /// The next position the vehicle asks for (`AccelPosition`), or null when it asked for none in `timeoutMs`. A request that holds
@@ -258,6 +269,12 @@ export class Calibration {
       }
     }
   }
+}
+
+/// Whether a vehicle's answer to a command that sets or clears the RC flag is one that took it: ACCEPTED, or UNSUPPORTED (what ArduPilot
+/// answers a command with only the flag).
+function flagTaken(result: int): bool {
+  result == MavResult.ACCEPTED || result == MavResult.UNSUPPORTED
 }
 
 /// A COMMAND_LONG for MAV_CMD_ACCELCAL_VEHICLE_POS from the vehicle that holds a whole number.

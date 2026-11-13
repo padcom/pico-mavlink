@@ -300,6 +300,44 @@ async function saysSoWhenTheRcFlagCannotBeCleared(): Promise<void> throws Error 
   expect(rig.sim.calibration.preflightCommands).toBe(3)
 }
 
+async function theRcCalibrationIsRefusedWhileArmed(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.ticks = 5   // armed
+  let worked = false
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => {
+      worked = true
+      nothing()
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("REFUSED")
+  expect(worked).toBe(false)
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  expect(rig.sim.calibration.preflightCommands).toBe(3)   // the set, and the clear and its retry: all refused
+  expect(rig.cal.rcFlagStuck).toBe(true)
+}
+
+async function theRcFlagIsStuckWhenTheVehicleArmsBeforeTheClear(): Promise<void> throws Error {
+  const rig = new Rig()
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => {
+      rig.sim.ticks = 5   // armed after the set
+      nothing()
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("REFUSED")
+  expect(rig.sim.calibration.rcCalibrating).toBe(true)   // the vehicle still has it
+  expect(rig.cal.rcFlagStuck).toBe(true)
+}
+
 /// A vehicle that is a connection of its own, to send what a real one could: a number a float holds that no position is.
 async function ignoresPositionsThatAreNoNumber(): Promise<void> throws Error {
   const ends = MemoryStream.pair()
@@ -382,6 +420,8 @@ describe("the RC calibration flag", () => {
   it("is cleared when the set was not answered (the vehicle may have set it)", theRcFlagIsClearedWhenTheSetWasNotAnswered)
   it("is cleared with one more try when the first clear is not answered", theRcFlagClearIsTriedOnceMore)
   it("says so when it cannot be cleared", saysSoWhenTheRcFlagCannotBeCleared)
+  it("is refused while armed: the work does not run", theRcCalibrationIsRefusedWhileArmed)
+  it("is stuck when the vehicle arms between the set and the clear", theRcFlagIsStuckWhenTheVehicleArmsBeforeTheClear)
 })
 
 describe("accel positions", () => {
