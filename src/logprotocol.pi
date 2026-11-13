@@ -30,8 +30,16 @@ import { LogData, LogEntry, LogErase, LogRequestData, LogRequestEnd, LogRequestL
 /// The most bytes a LOG_DATA carries.
 export const LOG_DATA_BYTES: int = 90
 
+/// How far past the first byte missing a packet may be and be kept (bytes): a vehicle that streams a whole log past a lost packet
+/// fills this and no more; the rest is asked for again from the front. Also bounds the memory of a download.
+const AHEAD_BYTES: int = 1_048_576
+
+/// The largest offset or size the protocol can say (its fields are 32 bits).
+const MAX_U32: int = 0xFFFFFFFF
+
 /// Why an operation failed: `LOG_ABORTED` (cancelled), `LOG_TIMEOUT` (nothing came), `LOG_PROTOCOL` (the vehicle contradicts itself, or
-/// cannot be reached), `LOG_SIZE` (the log is not the size that was expected), `LOG_SINK` (the sink failed), `LOG_CALLBACK`, `LOG_BAD_ID`.
+/// cannot be reached), `LOG_SIZE` (the log is not the size that was expected), `LOG_SINK` (the sink failed), `LOG_CALLBACK`, `LOG_BAD_ID`, `LOG_RANGE` (an
+/// offset or size past 32 bits), `LOG_VETOED` (the callback of `erase` said no).
 export class LogProtocolError extends Error {
   public readonly code: string
 
@@ -122,13 +130,27 @@ class Arrived {
   public top: int = 0
   /// When something new last arrived (ms since 1970).
   public lastNew: int = 0
-  /// Whether this request's transfer is over (a short packet, or the end that was expected).
+  /// Whether this request's transfer is over (a short packet, the end that was expected, or the window ahead of the front is full).
   public over: bool = false
+  /// How many bytes of the log are in order in the sink (the front): what is below it is a duplicate.
+  public front: int = 0
+  /// What the request that runs asked for: from this byte, to that one (-1: no end asked for).
+  public reqFrom: int = 0
+  public reqEnd: int = -1
+  /// Set when the vehicle sent what a vehicle does not (`LOG_PROTOCOL`); the download throws it.
+  public failure: LogProtocolError? = null
 
   constructor(id: int, target: Target, end: int) {
     this.id = id
     this.target = target
     this.end = end
+  }
+
+  /// Remembers that the vehicle sent what it must not.
+  refuse(why: string): void {
+    if (failure == null) {
+      failure = new LogProtocolError("LOG_PROTOCOL", `log ${id}: the vehicle sent ${why}`)
+    }
   }
 
   /// Takes a message, if it is a LOG_DATA of this log from this vehicle.
@@ -141,6 +163,23 @@ class Arrived {
     packets += 1
     const n = m.count as int
     const ofs = m.ofs as int
+    if (n > LOG_DATA_BYTES) {
+      refuse(`a LOG_DATA of ${n} bytes (90 at most) at ${ofs}`)
+      return
+    }
+    if (ofs < front) {
+      // Already in the sink (a duplicate, or a packet of an earlier request).
+      return
+    }
+    if (reqEnd >= 0 && ofs + n > reqEnd) {
+      refuse(`a LOG_DATA at ${ofs} of ${n} bytes, outside the ${reqFrom}-${reqEnd} that was asked for`)
+      return
+    }
+    if (ofs + n > front + AHEAD_BYTES) {
+      // More than the window ahead of what is missing: not kept, and the round is over (it is asked for again from the front).
+      over = true
+      return
+    }
     if (n < LOG_DATA_BYTES) {
       // The end of the log (or of what is there): even with no bytes.
       if (end < 0 || ofs + n < end) {
@@ -179,6 +218,7 @@ class Flow {
     this.progress = progress
     this.expected = expected
     this.front = front
+    a.front = front
   }
 
   /// Writes every packet that is next in order, and lets it go; tells the progress.
@@ -200,6 +240,7 @@ class Flow {
     }
     if (at != front) {
       front = at
+      a.front = at
       try {
         const report = progress
         report(at, if (expected >= 0) expected else a.end)
@@ -342,6 +383,9 @@ export class LogProtocolClient {
     if (id < 1 || id > 65535 || startAt < 0) {
       throw new LogProtocolError("LOG_BAD_ID", `log ${id} from ${startAt}: not a log of the vehicle`)
     }
+    if (startAt > MAX_U32 || expectedSize > MAX_U32) {
+      throw new LogProtocolError("LOG_RANGE", `log ${id} from ${startAt}, ${expectedSize} bytes: the protocol's offsets and sizes are 32 bits`)
+    }
     const a = new Arrived(id, target, expectedSize)
     const crc = new Crc32(crcAtStart)
     const flow = new Flow(a, sink, crc, progress, expectedSize, startAt)
@@ -368,6 +412,14 @@ export class LogProtocolClient {
     new LogProtocolDownload(flow.front, startAt, crc.crc, counts[0], a.packets, (Date.now() as int) - started)
   }
 
+  /// Throws what the vehicle sent that it must not.
+  checkFailure(a: Arrived): void throws LogProtocolError {
+    const failure = a.failure
+    if (failure != null) {
+      throw failure!
+    }
+  }
+
   /// Rounds of a request from the first byte missing and the wait for what comes, until the log is whole.
   async rounds(f: Flow, counts: int[], deadline: int): Promise<void> throws LogProtocolError {
     const a = f.a
@@ -381,6 +433,7 @@ export class LogProtocolClient {
       }
       const before = f.front
       await transfer(f)
+      checkFailure(a)
       counts[0] += 1
       await f.flush()
       stalls = if (f.front == before) stalls + 1 else 0
@@ -402,7 +455,10 @@ export class LogProtocolClient {
     m.targetComponent = target.component as u8
     m.id = a.id as u16
     m.ofs = from as u32
-    m.count = (if (expected >= 0 && expected > from) expected - from else 0xFFFFFFFF) as u32
+    const count = if (expected >= 0 && expected > from) expected - from else MAX_U32
+    m.count = count as u32
+    a.reqFrom = from
+    a.reqEnd = if (count < MAX_U32) from + count else -1
     a.over = false
     a.lastNew = Date.now() as int
     const began = a.lastNew
@@ -412,7 +468,7 @@ export class LogProtocolClient {
       throw new LogProtocolError("LOG_PROTOCOL", `could not send (${e.message})`)
     }
     // Over when the end is in, or nothing new for `silenceMs` (the first answer is given `timeoutMs`).
-    while (!aborted() && !a.over && !reachedEnd(a, from)) {
+    while (!aborted() && !a.over && a.failure == null && !reachedEnd(a, f.front)) {
       const idle = (Date.now() as int) - a.lastNew
       if (idle >= (if (a.top <= from && a.lastNew == began) timeoutMs else silenceMs)) {
         break
@@ -448,7 +504,20 @@ export class LogProtocolClient {
 
   /// Erases ALL the logs on the vehicle (the protocol has no way to erase one; the vehicle does not answer, and ignores it while it
   /// is armed), and lists again: how many logs it still has. 0 when the erase took.
-  public async erase(): Promise<int> throws LogProtocolError {
+  /// `veto` is told the list of logs before anything is sent, and says whether NOT to erase (true): then nothing is sent and the
+  /// call fails with `LOG_VETOED`, so that a caller can refuse while a log on the list is not safe somewhere else.
+  public async erase(veto: (logs: LogInfo[]) => bool throws Error = (_logs: LogInfo[]) => false): Promise<int> throws LogProtocolError {
+    const logs = await list()
+    let refused = false
+    try {
+      const ask = veto
+      refused = ask(logs)
+    } catch (e: Error) {
+      throw new LogProtocolError("LOG_CALLBACK", `the erase check failed: ${e.message}`)
+    }
+    if (refused) {
+      throw new LogProtocolError("LOG_VETOED", `erasing ${logs.length} logs was vetoed`)
+    }
     await beat()
     const m = new LogErase()
     m.targetSystem = target.system as u8

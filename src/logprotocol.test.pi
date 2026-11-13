@@ -10,8 +10,8 @@ import { SimulatedAutopilot } from "./simulator"
 import { simulatedLog } from "./simlogs"
 import { DfDecoder } from "./dataflash"
 import { crc32Of } from "./crc32"
-import { LogProtocolClient, LogProtocolError, LogProtocolOptions, LogSink } from "./logprotocol"
-import { LogRequestList } from "./dialects/common"
+import { LogInfo, LogProtocolClient, LogProtocolError, LogProtocolOptions, LogSink } from "./logprotocol"
+import { LogData, LogRequestList } from "./dialects/common"
 
 const VEHICLE: Target = { system: 1, component: 1 }
 const FAST: LogProtocolOptions = { timeoutMs: 300, retries: 2, silenceMs: 40 }
@@ -173,10 +173,12 @@ async function aLogThatIsAMultipleOfNinetyEndsWhereTheListingSays(): Promise<voi
   }
   r.sim.addLog(1, exact)
   const sink = new MemorySink()
-  const done = await client(r).download(1, sink, 0, 0, 4500)
+  // A silence of 5 s: the end is not waited for (the size says where it is), so the download does not take it.
+  const done = await client(r, { timeoutMs: 1000, retries: 2, silenceMs: 5000 }).download(1, sink, 0, 0, 4500)
 
   expect(same(sink.bytes, exact)).toBe(true)
   expect(done.size).toBe(4500)
+  expect(done.elapsedMs < 2000).toBe(true)
   r.sim.stop()
 }
 
@@ -336,6 +338,109 @@ async function anEraseThatIsIgnoredWhileArmedLeavesTheLogsAndSaysSo(): Promise<v
   r.sim.stop()
 }
 
+/// A LOG_DATA as a vehicle sends it, whatever it holds.
+function logData(id: int, ofs: int, count: int): LogData {
+  const p = new LogData()
+  p.id = id as u16
+  p.ofs = ofs as u32
+  p.count = count as u8
+  for (let i = 0; i < 90; i++) {
+    p.data.push((i + 1) as u8)
+  }
+  p
+}
+
+/// Starts a download of log 1 from a vehicle that says nothing itself, sends what `packets` are, and gives the code it ends with.
+async function downloadWhileSent(r: Rig, packets: LogData[], size: int, sink: LogSink): Promise<string> throws Error {
+  r.sim.logs.silent = true
+  const code = downloadFails(client(r, { timeoutMs: 400, retries: 1, silenceMs: 60 }), 1, sink, size)
+  await delay(40)
+  for (const p of packets) {
+    await r.sim.conn.send(p)
+  }
+  await code
+}
+
+async function refusesALogDataOfMoreThanNinetyBytes(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const code = await downloadWhileSent(r, [logData(1, 0, 255)], 4000, sink)
+
+  expect(code).toBe("LOG_PROTOCOL")
+  expect(sink.bytes.length).toBe(0)
+  r.sim.stop()
+}
+
+async function refusesAnOffsetOutsideTheRequest(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const code = await downloadWhileSent(r, [logData(1, 2147483648, 90)], 4000, sink)
+
+  expect(code).toBe("LOG_PROTOCOL")
+  expect(sink.bytes.length).toBe(0)
+  const past = new MemorySink()
+  expect(await downloadWhileSent(r, [logData(1, 3990, 90)], 4000, past)).toBe("LOG_PROTOCOL")
+  r.sim.stop()
+}
+
+async function dropsDuplicatesAndKeepsNothingFarAhead(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const packets: LogData[] = []
+  // The first packet over and over (once it is in order it is below the front, and dropped), and a thousand far ahead.
+  for (let i = 0; i < 500; i++) {
+    packets.push(logData(1, 0, 90))
+  }
+  for (let i = 0; i < 1000; i++) {
+    packets.push(logData(1, 5_000_000 + i * 90, 90))
+  }
+  // No size: nothing says where the log ends, so what is far ahead is dropped, not kept and not an error.
+  const code = await downloadWhileSent(r, packets, -1, sink)
+
+  expect(code).toBe("LOG_TIMEOUT")
+  expect(sink.bytes.length).toBe(90)
+  expect(sink.writes).toBe(1)
+  r.sim.stop()
+}
+
+async function refusesOffsetsAndSizesPastThirtyTwoBits(): Promise<void> throws Error {
+  const r = rig(1)
+  const c = client(r)
+  const sink = new MemorySink()
+  let code = ""
+  try {
+    await c.download(1, sink, 4294967296)
+  } catch (e: LogProtocolError) {
+    code = e.code
+  }
+  expect(code).toBe("LOG_RANGE")
+  code = await downloadFails(c, 1, sink, 4294967296)
+  expect(code).toBe("LOG_RANGE")
+  expect(r.sim.logs.log.length).toBe(0)
+  r.sim.stop()
+}
+
+async function anEraseThatIsVetoedSendsNothing(): Promise<void> throws Error {
+  const r = rig(3)
+  const seen = [0]
+  let code = ""
+  try {
+    await client(r).erase((logs: LogInfo[]) => {
+      seen[0] = logs.length
+      true
+    })
+  } catch (e: LogProtocolError) {
+    code = e.code
+  }
+
+  expect(code).toBe("LOG_VETOED")
+  expect(seen[0]).toBe(3)
+  expect(r.sim.logs.paths().length).toBe(3)
+  const left = await client(r).erase((_logs: LogInfo[]) => false)
+  expect(left).toBe(0)
+  r.sim.stop()
+}
+
 async function aCorruptLinkIsNotCaughtByTheProtocol(): Promise<void> throws Error {
   const r = rig(1)
   r.sim.logs.corrupt = true
@@ -366,5 +471,10 @@ describe("the MAVLink log protocol", () => {
   it("is not answered without the ground station's heartbeat, and sends one", theVehicleSendsNothingToAGroundStationThatSendsNoHeartbeat)
   it("erases all the logs and says how many are left", erasesAllTheLogsAndSaysHowManyAreLeft)
   it("leaves the logs and says so when the erase is ignored while armed", anEraseThatIsIgnoredWhileArmedLeavesTheLogsAndSaysSo)
+  it("refuses a LOG_DATA of more than 90 bytes", refusesALogDataOfMoreThanNinetyBytes)
+  it("refuses a LOG_DATA outside what was asked for", refusesAnOffsetOutsideTheRequest)
+  it("drops duplicates and what is far ahead, keeping no more than a window", dropsDuplicatesAndKeepsNothingFarAhead)
+  it("refuses an offset or a size past 32 bits", refusesOffsetsAndSizesPastThirtyTwoBits)
+  it("sends no LOG_ERASE when the check says no, and gives it the list", anEraseThatIsVetoedSendsNothing)
   it("does not catch a corrupt link: no CRC, so never verified", aCorruptLinkIsNotCaughtByTheProtocol)
 })
