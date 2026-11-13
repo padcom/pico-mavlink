@@ -29,7 +29,7 @@ function saysUp(r: Received, target: Target, minUptimeMs: int): bool {
 /// `timeoutMs` (or the signal aborted). `conn.run()` must be running. The vehicle is asked for nothing: it must send ATTITUDE (a vehicle
 /// that does not is waited for the text only).
 export async function waitUntilUp(conn: MavLinkConnection, vehicle: Target, timeoutMs: int = 30_000, signal: AbortSignal? = null,
-    minUptimeMs: int = UP_AFTER_MS): Promise<bool> throws Error {
+  minUptimeMs: int = UP_AFTER_MS): Promise<bool> throws Error {
   const r = await conn.waitFor((r: Received) => saysUp(r, vehicle, minUptimeMs), timeoutMs, signal)
   r != null
 }

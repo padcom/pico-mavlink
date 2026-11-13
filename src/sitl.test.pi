@@ -1024,7 +1024,7 @@ function turnIsSpent(t: MagTurn, p: CompassProgress): bool {
 /// Reads the vehicle's events and turns SITL's vehicle as they ask, until every compass that calibrates has a report (the reports are put in
 /// `reports`), or `seconds` have passed. `progress` is called with each progress.
 async function driveCompass(cal: CompassCalibration, cmd: CommandCall, pose: SimPose, reports: CompassReport[], seconds: int,
-    progress: (p: CompassProgress) => bool): Promise<void> throws Error {
+  progress: (p: CompassProgress) => bool): Promise<void> throws Error {
   const t = new MagTurn()
   await startSpin(cmd, pose, t)
   const deadline = (Date.now() as int) + seconds * 1000
@@ -1078,7 +1078,7 @@ async function numberOf(s: Sitl, id: string): Promise<f64> throws Error {
 /// The work of the compass test: the vehicle is turned until every compass has its report, the offsets are still the old ones (nothing
 /// was accepted by itself), and then the caller accepts: the offsets are the report's.
 async function turnThenAccept(s: Sitl, cal: CompassCalibration, cmd: CommandCall, pose: SimPose, reports: CompassReport[],
-    before: f64): Promise<void> throws Error {
+  before: f64): Promise<void> throws Error {
   let top = 0
   await driveCompass(cal, cmd, pose, reports, 540, (p: CompassProgress) => {
     top = if (p.completionPct > top) p.completionPct else top
