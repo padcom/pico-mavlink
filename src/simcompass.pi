@@ -1,0 +1,288 @@
+// The compass calibration of the simulated autopilot, as ArduPilot does it (see compasscal.pi for the protocol and where it is in the source):
+//  - MAV_CMD_DO_START_MAG_CAL is refused (FAILED, "Disarm to allow compass calibration") while the vehicle is armed, and when the compasses
+//    asked for are none it has; otherwise it is acked ACCEPTED at once and each compass asked for runs: MAG_CAL_PROGRESS every `progressMs`,
+//    `stepPct` per time (step one up to half, step two after), with the completion mask lit in proportion, then the report: SUCCESS (or
+//    the status `failWith` says) with fitness and offsets, sent again every `progressMs` until the result is accepted or cancelled.
+//  - MAV_CMD_DO_ACCEPT_MAG_CAL keeps the results of the compasses it names (0 is all), FAILED when none of them has a successful one;
+//    the report says `autosaved` after it. MAV_CMD_DO_CANCEL_MAG_CAL stops those compasses and drops what they had, ACCEPTED always.
+//  - Nothing is kept unless it is accepted, or the start asked for autosave (and then at once, when a compass succeeds): `saved` says which.
+// Faults for tests: `refuse` (the start is answered FAILED), `failWith` (the status a compass ends in instead of SUCCESS, 0 for none), `silent`
+// (the start is acked and nothing else is ever said), `swallowAcks` (that many commands are carried out and not acked).
+import { MavLinkConnection, Received } from "./connection"
+import { CommandAck, CommandLong, MagCalReport, MavResult, MavSeverity, StatusText } from "./dialects/common"
+import { MagCalProgress, MavCmd as ApmCmd } from "./dialects/ardupilotmega"
+import { CompassStatus } from "./compasscal"
+import { wholeNumber } from "./accelcal"
+
+/// One compass of the simulated vehicle.
+class SimCompassState {
+  public status: int = 0
+  public pct: int = 0
+  public attempt: int = 1
+  public saved: bool = false
+  /// Whether the saved report has gone out once since it was accepted.
+  public told: bool = false
+}
+
+/// The compass calibration commands of the simulated autopilot.
+export class SimCompass {
+  readonly conn: MavLinkConnection
+  readonly armed: () => bool
+  readonly forMe: (system: int, component: int) => bool
+  /// How many compasses the vehicle has.
+  public compasses: int = 2
+  /// How often the progress and the reports go out (ms), and how much a compass advances each time (%).
+  public progressMs: int = 100
+  public stepPct: int = 10
+  public refuse: bool = false
+  public failWith: int = 0
+  public silent: bool = false
+  /// The vehicle says nothing more (a link that is gone): progress and reports stop where they are.
+  public mute: bool = false
+  /// How many of the next commands are carried out and not acked (an ack lost on the link).
+  public swallowAcks: int = 0
+  /// What was asked: starts, accepts and cancels; the last start's compasses (0: all), retry, autosave, delay and autoreboot.
+  public starts: int = 0
+  public accepts: int = 0
+  public cancels: int = 0
+  public lastMask: int = 0
+  public lastRetry: bool = false
+  public lastAutosave: bool = false
+  public lastDelay: int = 0
+  public lastAutoreboot: bool = false
+  readonly states: SimCompassState[] = []
+  timer: int = -1
+
+  constructor(conn: MavLinkConnection, armed: () => bool, forMe: (system: int, component: int) => bool) {
+    this.conn = conn
+    this.armed = armed
+    this.forMe = forMe
+  }
+
+  isArmed(): bool {
+    const f = armed
+    f()
+  }
+
+  mine(system: int, component: int): bool {
+    const f = forMe
+    f(system, component)
+  }
+
+  public stop(): void {
+    clearInterval(timer)
+    timer = -1
+  }
+
+  /// Whether the compass `id` has its result kept (accepted, or saved by itself).
+  public saved(id: int): bool {
+    id >= 0 && id < states.length && states[id].saved
+  }
+
+  /// The status of compass `id` (`CompassStatus`).
+  public statusOf(id: int): int {
+    if (id >= 0 && id < states.length) states[id].status else 0
+  }
+
+  /// The offsets the report of compass `id` gives (they are the same every time).
+  public offsetsOf(id: int): f64[] {
+    [(id + 1) as f64 * 10.0, -5.0, 2.5]
+  }
+
+  /// Handles one message; whether it was one of the compass calibration's.
+  public handle(r: Received): bool {
+    const m = r.message
+    if (!(m instanceof CommandLong)) {
+      return false
+    }
+    const command = m.command as int
+    if (command != ApmCmd.DO_START_MAG_CAL && command != ApmCmd.DO_ACCEPT_MAG_CAL && command != ApmCmd.DO_CANCEL_MAG_CAL) {
+      return false
+    }
+    if (!mine(m.targetSystem as int, m.targetComponent as int)) {
+      return true
+    }
+    const mask = wholeNumber(m._param1 as f64)
+    if (mask < 0 || mask > 255) {
+      ack(command, MavResult.FAILED)
+    } else if (command == ApmCmd.DO_START_MAG_CAL) {
+      begin(m, mask)
+    } else if (command == ApmCmd.DO_ACCEPT_MAG_CAL) {
+      accept(mask)
+    } else {
+      cancel(mask)
+    }
+    true
+  }
+
+  ack(command: int, result: int): void {
+    if (swallowAcks > 0) {
+      swallowAcks -= 1
+      return
+    }
+    const a = new CommandAck()
+    a.command = command as u16
+    a.result = result as u8
+    conn.send(a)
+  }
+
+  say(text: string): void {
+    const s = new StatusText()
+    s.severity = MavSeverity.NOTICE as u8
+    s.text = text
+    conn.send(s)
+  }
+
+  /// The compasses a mask names: 0 is all.
+  names(mask: int, id: int): bool {
+    id < compasses && (mask == 0 || ((mask >> id) & 1) != 0)
+  }
+
+  begin(m: CommandLong, mask: int): void {
+    const command = m.command as int
+    if (isArmed()) {
+      say("Disarm to allow compass calibration")
+      ack(command, MavResult.FAILED)
+      return
+    }
+    let any = false
+    for (let id = 0; id < compasses; id++) {
+      any = any || names(mask, id)
+    }
+    if (refuse || !any) {
+      say("Compass calibration failed to start")
+      ack(command, MavResult.FAILED)
+      return
+    }
+    starts += 1
+    lastMask = mask
+    lastRetry = m._param2 as f64 != 0.0
+    lastAutosave = m._param3 as f64 != 0.0
+    lastDelay = wholeNumber(m._param4 as f64)
+    lastAutoreboot = m._param5 as f64 != 0.0
+    ack(command, MavResult.ACCEPTED)
+    clearInterval(timer)
+    timer = -1
+    while (states.length < compasses) {
+      states.push(new SimCompassState())
+    }
+    for (let id = 0; id < compasses; id++) {
+      if (names(mask, id)) {
+        const s = states[id]
+        s.status = CompassStatus.WAITING_TO_START
+        s.pct = 0
+        s.saved = false
+        s.told = false
+      }
+    }
+    if (!silent) {
+      timer = setInterval(() => this.tick(), progressMs)
+    }
+  }
+
+  /// The mask of the compasses that are not NOT_STARTED.
+  calMask(): int {
+    let mask = 0
+    for (let id = 0; id < states.length; id++) {
+      if (states[id].status != CompassStatus.NOT_STARTED) {
+        mask = mask | (1 << id)
+      }
+    }
+    mask
+  }
+
+  /// One step: each running compass reports its progress and moves on, each finished one is reported (until it is accepted).
+  tick(): void {
+    if (mute) {
+      return
+    }
+    for (let id = 0; id < states.length; id++) {
+      const s = states[id]
+      if (CompassStatus.isRunning(s.status)) {
+        sendProgress(id, s)
+        s.pct = if (s.pct + stepPct > 100) 100 else s.pct + stepPct
+        s.status = if (s.pct >= 50) CompassStatus.RUNNING_STEP_TWO else CompassStatus.RUNNING_STEP_ONE
+        if (s.pct >= 100) {
+          s.status = if (failWith != 0) failWith else CompassStatus.SUCCESS
+          if (s.status == CompassStatus.SUCCESS && lastAutosave) {
+            s.saved = true
+          }
+        }
+      } else if (CompassStatus.isDone(s.status) && !(s.saved && s.told)) {
+        sendReport(id, s)
+        s.told = s.saved
+      }
+    }
+  }
+
+  sendProgress(id: int, s: SimCompassState): void {
+    const p = new MagCalProgress()
+    p.compassId = id as u8
+    p.calMask = calMask() as u8
+    p.calStatus = s.status as u8
+    p.attempt = s.attempt as u8
+    p.completionPct = s.pct as u8
+    p.completionMask = completion(s.pct)
+    p.directionX = 1.0
+    conn.send(p)
+  }
+
+  /// The 80 bits of the completion mask: the first `pct * 80 / 100` are lit.
+  completion(pct: int): u8[] {
+    const bytes: u8[] = []
+    const lit = pct * 80 / 100
+    for (let b = 0; b < 10; b++) {
+      let v = 0
+      for (let bit = 0; bit < 8; bit++) {
+        if (b * 8 + bit < lit) {
+          v = v | (1 << bit)
+        }
+      }
+      bytes.push(v as u8)
+    }
+    bytes
+  }
+
+  sendReport(id: int, s: SimCompassState): void {
+    const o = offsetsOf(id)
+    const r = new MagCalReport()
+    r.compassId = id as u8
+    r.calMask = calMask() as u8
+    r.calStatus = s.status as u8
+    r.autosaved = (if (s.saved) 1 else 0) as u8
+    r.fitness = (if (s.status == CompassStatus.SUCCESS) 12.5 else 0.0) as f32
+    r.ofsX = o[0] as f32
+    r.ofsY = o[1] as f32
+    r.ofsZ = o[2] as f32
+    r.diagX = 1.0
+    r.diagY = 1.0
+    r.diagZ = 1.0
+    r.scaleFactor = 1.0
+    conn.send(r)
+  }
+
+  accept(mask: int): void {
+    let any = false
+    for (let id = 0; id < states.length; id++) {
+      if (names(if (mask == 0) 0 else mask, id) && states[id].status == CompassStatus.SUCCESS) {
+        states[id].saved = true
+        any = true
+      }
+    }
+    if (any) {
+      accepts += 1
+    }
+    ack(ApmCmd.DO_ACCEPT_MAG_CAL, if (any) MavResult.ACCEPTED else MavResult.FAILED)
+  }
+
+  cancel(mask: int): void {
+    cancels += 1
+    for (let id = 0; id < states.length; id++) {
+      if (names(mask, id)) {
+        states[id].status = CompassStatus.NOT_STARTED
+        states[id].pct = 0
+      }
+    }
+    ack(ApmCmd.DO_CANCEL_MAG_CAL, MavResult.ACCEPTED)
+  }
+}

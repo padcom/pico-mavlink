@@ -17,6 +17,7 @@ import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Ta
 import { Heartbeat } from "./dialects/minimal"
 import { MavCmd, MavParamType, MavResult, RequestDataStream, StatusText } from "./dialects/common"
 import { AccelCalKind, AccelPosition, Calibration } from "./accelcal"
+import { CompassCalibration, CompassProgress, CompassReport, CompassStatus } from "./compasscal"
 import { SimState } from "./dialects/ardupilotmega"
 import { GlobalPositionInt } from "./dialects/standard"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
@@ -855,14 +856,36 @@ function pulseOf(angle: f64): f64 {
   1500.0 + Math.round(angle * 500.0 / Math.PI)
 }
 
+/// Keeps SITL's turn (SIMSTATE, at 10 Hz) up to date in the pose it returns.
+async function watchPose(s: Sitl): Promise<SimPose> throws Error {
+  const pose = new SimPose()
+  s.conn.on((r: Received) => {
+    const m = r.message
+    if (m instanceof SimState) {
+      pose.roll = m.roll as f64
+      pose.pitch = m.pitch as f64
+      pose.yaw = m.yaw as f64
+      pose.seen += 1
+    }
+  })
+  const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+  expect(await cmd.setMessageInterval(SimState.MSG_ID, 100_000)).toBe(MavResult.ACCEPTED)
+  pose
+}
+
 /// Turns SITL's vehicle to `position` and waits until SIMSTATE says it has turned (five reports in a row).
 async function turnTo(cmd: CommandCall, pose: SimPose, position: int): Promise<void> throws Error {
   const angles = poseOf(position)
-  const want = quaternionOf(angles[0], angles[1], 0.0)
+  await turnToAngles(cmd, pose, angles[0], angles[1], 0.0)
+}
+
+/// Turns SITL's vehicle to roll, pitch and yaw (radians, yaw within -pi to pi) and waits until SIMSTATE says it has turned.
+async function turnToAngles(cmd: CommandCall, pose: SimPose, roll: f64, pitch: f64, yaw: f64): Promise<void> throws Error {
+  const want = quaternionOf(roll, pitch, yaw)
   await cmd.run(MavCmd.DO_SET_SERVO, [5.0, 1150.0])
-  await cmd.run(MavCmd.DO_SET_SERVO, [6.0, pulseOf(angles[0])])
-  await cmd.run(MavCmd.DO_SET_SERVO, [7.0, pulseOf(angles[1])])
-  await cmd.run(MavCmd.DO_SET_SERVO, [8.0, pulseOf(0.0)])
+  await cmd.run(MavCmd.DO_SET_SERVO, [6.0, pulseOf(roll)])
+  await cmd.run(MavCmd.DO_SET_SERVO, [7.0, pulseOf(pitch)])
+  await cmd.run(MavCmd.DO_SET_SERVO, [8.0, pulseOf(yaw)])
   let close = 0
   let last = pose.seen
   for (let i = 0; i < 200 && close < 5; i++) {
@@ -888,18 +911,8 @@ async function calibratesTheAccelerometerInSixPositions(): Promise<void> throws 
   const s = sitl!
   try {
     await afterBoot(s, (Date.now() as int) + 60_000)
-    const pose = new SimPose()
-    s.conn.on((r: Received) => {
-      const m = r.message
-      if (m instanceof SimState) {
-        pose.roll = m.roll as f64
-        pose.pitch = m.pitch as f64
-        pose.yaw = m.yaw as f64
-        pose.seen += 1
-      }
-    })
+    const pose = await watchPose(s)
     const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
-    expect(await cmd.setMessageInterval(SimState.MSG_ID, 100_000)).toBe(MavResult.ACCEPTED)
     const cal = new Calibration(s.conn, s.target, { timeoutMs: 2000 }, 30_000)
     expect(await cal.startAccel(AccelCalKind.FULL)).toBe(MavResult.ACCEPTED)
     const asked: int[] = []
@@ -922,6 +935,239 @@ async function calibratesTheAccelerometerInSixPositions(): Promise<void> throws 
     println(`SITL accel calibration: positions ${asked.join(",")}, end ${AccelPosition.nameOf(end) ?? "none"}`)
     expect(asked.join(",")).toBe("1,2,3,4,5,6")
     expect(end).toBe(AccelPosition.SUCCESS)
+  } finally {
+    await s.stop()
+  }
+}
+
+/// How SITL's vehicle is turned for a compass calibration: ArduPilot's Tools/mavproxy_modules/sitl_calibration.py `MagcalController`, in
+/// the same steps. The vehicle is put level at a yaw, then spun at pi/4 rad/s about an axis (x, y, then x and y together); when no
+/// compass has moved on for half a turn (8 s), or three full turns have passed, the next axis is taken, and after the third the yaw
+/// goes on by 45 degrees. The vehicle is spun by the servo outputs 5 (the speed, over 1300) and 6 to 8 (the axis).
+class MagTurn {
+  public axis: int = 0
+  public yaw: f64 = 0.0
+  /// When (ms) the spin of this turn began; 0 while the vehicle is being put in place.
+  public startedAt: int = 0
+  /// The last percent of each compass, when it last changed (ms), and whether it is stuck or done; -1 for a compass not seen yet.
+  public readonly pct: int[] = [-1, -1, -1, -1, -1, -1, -1, -1]
+  public readonly changedAt: int[] = [0, 0, 0, 0, 0, 0, 0, 0]
+  public readonly stuck: bool[] = [false, false, false, false, false, false, false, false]
+  public readonly done: bool[] = [false, false, false, false, false, false, false, false]
+}
+
+const MAG_FULL_TURN_MS: int = 8000
+
+/// Puts the vehicle level at the yaw of `t` and spins it.
+async function startSpin(cmd: CommandCall, pose: SimPose, t: MagTurn): Promise<void> throws Error {
+  await turnToAngles(cmd, pose, 0.0, 0.0, t.yaw)
+  const axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]
+  const a = axes[t.axis]
+  const biggest = Math.max(Math.abs(a[0]), Math.abs(a[1]), Math.abs(a[2]))
+  await cmd.run(MavCmd.DO_SET_SERVO, [5.0, 1300.0 + Math.round(Math.PI / 4.0 / (2.0 * Math.PI) * 700.0)])
+  await cmd.run(MavCmd.DO_SET_SERVO, [6.0, 1500.0 + Math.round(a[0] / biggest * 500.0)])
+  await cmd.run(MavCmd.DO_SET_SERVO, [7.0, 1500.0 + Math.round(a[1] / biggest * 500.0)])
+  await cmd.run(MavCmd.DO_SET_SERVO, [8.0, 1500.0 + Math.round(a[2] / biggest * 500.0)])
+  t.startedAt = Date.now() as int
+  for (let i = 0; i < 8; i++) {
+    t.pct[i] = -1
+    t.stuck[i] = false
+  }
+}
+
+/// Takes the next axis (and the next yaw after the third) and spins the vehicle again.
+async function nextSpin(cmd: CommandCall, pose: SimPose, t: MagTurn): Promise<void> throws Error {
+  t.axis = (t.axis + 1) % 3
+  if (t.axis == 0) {
+    let yaw = t.yaw + Math.PI / 4.0
+    if (yaw > Math.PI) {
+      yaw = yaw - 2.0 * Math.PI
+    }
+    t.yaw = yaw
+  }
+  t.startedAt = 0
+  await startSpin(cmd, pose, t)
+}
+
+/// Whether the turn must go on to the next axis, given a progress: three full turns have passed, or every compass that is not done
+/// has stood still for half a turn.
+function turnIsSpent(t: MagTurn, p: CompassProgress): bool {
+  if (t.startedAt == 0) {
+    return false
+  }
+  const now = Date.now() as int
+  const id = p.compassId
+  if (t.pct[id] < 0) {
+    t.pct[id] = p.completionPct
+    t.changedAt[id] = now
+    return false
+  }
+  if (now - t.startedAt > 3 * MAG_FULL_TURN_MS) {
+    return true
+  }
+  if (p.completionPct == t.pct[id]) {
+    if (now - t.changedAt[id] > MAG_FULL_TURN_MS / 2) {
+      t.stuck[id] = true
+    }
+  } else {
+    t.pct[id] = p.completionPct
+    t.changedAt[id] = now
+    t.stuck[id] = false
+  }
+  let anyMoving = false
+  for (let i = 0; i < 8; i++) {
+    anyMoving = anyMoving || (t.pct[i] >= 0 && !t.done[i] && !t.stuck[i])
+  }
+  !anyMoving
+}
+
+/// Reads the vehicle's events and turns SITL's vehicle as they ask, until every compass that calibrates has a report (the reports are put in
+/// `reports`), or `seconds` have passed. `progress` is called with each progress.
+async function driveCompass(cal: CompassCalibration, cmd: CommandCall, pose: SimPose, reports: CompassReport[], seconds: int,
+    progress: (p: CompassProgress) => bool): Promise<void> throws Error {
+  const t = new MagTurn()
+  await startSpin(cmd, pose, t)
+  const deadline = (Date.now() as int) + seconds * 1000
+  let expected = 0
+  let have = 0
+  while ((Date.now() as int) < deadline && (expected == 0 || (expected & have) != expected)) {
+    const e = await cal.next(30_000)
+    expect(e == null).toBe(false)
+    const event = e!
+    if (event.progress != null) {
+      const p = event.progress!
+      expected = expected | p.calMask
+      if (!progress(p)) {
+        break
+      }
+      if (turnIsSpent(t, p)) {
+        await nextSpin(cmd, pose, t)
+      }
+    } else if (event.report != null) {
+      const r = event.report!
+      expected = expected | r.calMask
+      have = have | (1 << r.compassId)
+      t.done[r.compassId] = true
+      let known = false
+      for (const old of reports) {
+        known = known || old.compassId == r.compassId
+      }
+      if (!known) {
+        reports.push(r)
+      }
+    }
+  }
+  await cmd.run(MavCmd.DO_SET_SERVO, [5.0, 1000.0])
+}
+
+/// The vehicle sends MAG_CAL_PROGRESS (191) and MAG_CAL_REPORT (192) in its stream EXTRA3, which a new link has at no rate: 5 Hz each.
+async function askForCompassMessages(cmd: CommandCall): Promise<void> throws Error {
+  expect(await cmd.setMessageInterval(191, 200_000)).toBe(MavResult.ACCEPTED)
+  expect(await cmd.setMessageInterval(192, 200_000)).toBe(MavResult.ACCEPTED)
+}
+
+/// A parameter of the vehicle as a number (the integers too).
+async function numberOf(s: Sitl, id: string): Promise<f64> throws Error {
+  const p = await new ParamRead(s.conn, s.target, s.encoding, { timeoutMs: 1000, retries: 3 }).run(id)
+  match (p.value) {
+    Real { value } => value,
+    Int { value } => value as f64,
+  }
+}
+
+/// The work of the compass test: the vehicle is turned until every compass has its report, the offsets are still the old ones (nothing
+/// was accepted by itself), and then the caller accepts: the offsets are the report's.
+async function turnThenAccept(s: Sitl, cal: CompassCalibration, cmd: CommandCall, pose: SimPose, reports: CompassReport[],
+    before: f64): Promise<void> throws Error {
+  let top = 0
+  await driveCompass(cal, cmd, pose, reports, 540, (p: CompassProgress) => {
+    top = if (p.completionPct > top) p.completionPct else top
+    true
+  })
+  println(`SITL compass calibration: ${reports.map((r) => `${r.compassId}:${CompassStatus.nameOf(r.status) ?? "?"} fitness ${r.fitness} ofs ${r.offsets.join(",")}`).join("; ")}; most complete ${top} %`)
+  expect(reports.length > 0).toBe(true)
+  expect(reports.every((r) => r.status == CompassStatus.SUCCESS)).toBe(true)
+  expect(top >= 90).toBe(true)   // the vehicle sends the report, not 100 %, at the end
+  expect(await numberOf(s, "COMPASS_OFS_X")).toBe(before)   // not accepted yet: the old offsets
+  expect(await cal.accept(0)).toBe(MavResult.ACCEPTED)
+  await delay(1000)
+}
+
+/// The compass calibration against ArduCopter on SITL's calibration model, the vehicle turned as the vehicle asks (as
+/// `sitl_magcal` does): it ends with a report of every compass, nothing is kept until it is accepted, and the offsets are then the report's.
+async function calibratesTheCompassAndKeepsItOnlyWhenAccepted(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1, "calibration")
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    await afterBoot(s, (Date.now() as int) + 60_000)
+    const pose = await watchPose(s)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    const cal = new CompassCalibration(s.conn, s.target, { timeoutMs: 2000 })
+    await askForCompassMessages(cmd)
+    const before = await numberOf(s, "COMPASS_OFS_X")
+    const reports: CompassReport[] = []
+    await cal.calibration({}, () => turnThenAccept(s, cal, cmd, pose, reports, before))
+    // the guard cancelled at the end; what was accepted stays
+    const after = await numberOf(s, "COMPASS_OFS_X")
+    const first = reports.find((r) => r.compassId == 0)
+    println(`SITL compass calibration: COMPASS_OFS_X ${before} -> ${after}`)
+    expect(after != before).toBe(true)
+    if (first != null) {
+      expect(Math.abs(after - first!.offsets[0]) < 1.0).toBe(true)
+    }
+  } finally {
+    await s.stop()
+  }
+}
+
+/// The work of the cancel test: two progress, and then the page is left.
+async function leaveAfterTwoProgress(cal: CompassCalibration, cmd: CommandCall, pose: SimPose): Promise<void> throws Error {
+  let seen = 0
+  const reports: CompassReport[] = []
+  await driveCompass(cal, cmd, pose, reports, 120, (_p: CompassProgress) => {
+    seen += 1
+    seen < 2
+  })
+  expect(seen).toBe(2)
+  expect(reports.length).toBe(0)
+}
+
+/// A compass calibration that is left is cancelled: the vehicle goes quiet, and nothing was kept.
+async function cancelsTheCompassWhenTheWorkIsLeft(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1, "calibration")
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    await afterBoot(s, (Date.now() as int) + 60_000)
+    const pose = await watchPose(s)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    const cal = new CompassCalibration(s.conn, s.target, { timeoutMs: 2000 })
+    await askForCompassMessages(cmd)
+    const before = await numberOf(s, "COMPASS_OFS_X")
+    await cal.calibration({}, () => leaveAfterTwoProgress(cal, cmd, pose))
+    // nothing more comes: the calibration is not running
+    await delay(2000)
+    let more = 0
+    for (let i = 0; i < 3; i++) {
+      const e = await cal.next(1000)
+      if (e != null && e!.progress != null) {
+        more += 1
+      }
+    }
+    expect(more).toBe(0)
+    expect(await numberOf(s, "COMPASS_OFS_X")).toBe(before)
+    expect(cal.cancelFailed).toBe(false)
   } finally {
     await s.stop()
   }
@@ -979,6 +1225,8 @@ async function refusesToCalibrateWhileArmed(): Promise<void> throws Error {
     expect(await cal.startAccel(AccelCalKind.FULL)).toBe(MavResult.FAILED)
     expect(await cal.gyro()).toBe(MavResult.FAILED)
     expect(f.texts.indexOf("Disarm to allow calibration") >= 0).toBe(true)
+    expect(await new CompassCalibration(s.conn, s.target, { timeoutMs: 2000 }).start()).toBe(MavResult.FAILED)
+    expect(f.texts.indexOf("Disarm to allow compass calibration") >= 0).toBe(true)
   } finally {
     await s.stop()
   }
@@ -995,4 +1243,6 @@ describe("ArduCopter SITL", () => {
   it("calibrates the accelerometer: six prompts in order, answered, and a result (SITL_FLIGHT=1)", calibratesTheAccelerometerInSixPositions)
   it("calibrates the gyro and the level, and notes the RC flag (SITL_FLIGHT=1)", calibratesTheLevelAndTheGyro)
   it("refuses to calibrate while armed (SITL_FLIGHT=1)", refusesToCalibrateWhileArmed)
+  it("calibrates the compass, and keeps the result only when it is accepted (SITL_FLIGHT=1)", calibratesTheCompassAndKeepsItOnlyWhenAccepted)
+  it("cancels the compass calibration when the work is left (SITL_FLIGHT=1)", cancelsTheCompassWhenTheWorkIsLeft)
 })

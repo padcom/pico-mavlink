@@ -77,6 +77,8 @@ const STREAM_OF: int[][] = [
   [74, 11], // VFR_HUD: EXTRA2
   [2, 12], // SYSTEM_TIME: EXTRA3
   [241, 12], // VIBRATION
+  [191, 12], // MAG_CAL_PROGRESS
+  [192, 12], // MAG_CAL_REPORT
 ]
 
 function streamOf(messageId: int): int {

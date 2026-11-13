@@ -204,6 +204,10 @@ export class Calibration {
   public async prompt(timeoutMs: int): Promise<int?> throws Error {
     const r = await conn.waitFor((r: Received) => isPrompt(r, target), timeoutMs, options.signal)
     if (r == null) {
+      // An abort is not a silence.
+      if (options.signal != null && options.signal!.aborted) {
+        throw new MavLinkError("ABORTED", "the accelerometer calibration was cancelled")
+      }
       return null
     }
     const m = r!.message

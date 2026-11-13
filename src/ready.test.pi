@@ -1,0 +1,83 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkProtocolV2 } from "./protocol"
+import { SimulatedAutopilot } from "./simulator"
+import { UP_AFTER_MS, waitUntilUp } from "./ready"
+import { StatusText } from "./dialects/common"
+
+function text(words: string): StatusText {
+  const s = new StatusText()
+  s.text = words
+  s
+}
+
+async function endsWhenAhrsIsActive(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  vehicle.run()
+  const waiting = waitUntilUp(gcs, { system: 1, component: 1 }, 500)
+  await vehicle.send(text("AHRS: EKF3 active"))
+  expect(await waiting).toBe(true)
+  const again = waitUntilUp(gcs, { system: 1, component: 1 }, 500)
+  await vehicle.send(text("AHRS: EKF2 active"))
+  expect(await again).toBe(true)
+  gcs.close()
+  vehicle.close()
+}
+
+async function isNotEndedByOtherTexts(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(7, 1) })
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  vehicle.run()
+  const waiting = waitUntilUp(gcs, { system: 1, component: 1 }, 120)
+  await vehicle.send(text("AHRS: DCM active"))
+  await vehicle.send(text("ArduPilot Ready"))
+  await vehicle.send(text("AHRS: EKF3 active"))   // vehicle 7, not 1
+  expect(await waiting).toBe(false)
+  gcs.close()
+  vehicle.close()
+}
+
+async function endsOnAnUptimeLongEnough(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  sim.start(10)
+  expect(await waitUntilUp(gcs, { system: 1, component: 1 }, 500, null, 40)).toBe(true)
+  // a vehicle that has just booted is not up by its uptime
+  const fresh = await waitUntilUp(gcs, { system: 1, component: 1 }, 60, null, 100_000)
+  sim.stop()
+  gcs.close()
+  expect(fresh).toBe(false)
+}
+
+async function givesUpOnTimeAndOnAbort(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  const stop = new AbortController()
+  const waiting = waitUntilUp(gcs, { system: 1, component: 1 }, 5000, stop.signal)
+  await delay(20)
+  stop.abort()
+  expect(await waiting).toBe(false)
+  expect(await waitUntilUp(gcs, { system: 1, component: 1 }, 30)).toBe(false)
+  gcs.close()
+  expect(UP_AFTER_MS).toBe(10_000)
+}
+
+describe("waiting for the vehicle to be up", () => {
+  it("is over when the vehicle says its AHRS is active (EKF3 or EKF2)", endsWhenAhrsIsActive)
+
+  it("is not over for DCM (the boot), another text, or another vehicle", isNotEndedByOtherTexts)
+
+  it("is over for a vehicle that has been up for long, though it never said so (the ground station came late)", endsOnAnUptimeLongEnough)
+
+  it("gives up at the end of its time, and as soon as it is aborted", givesUpOnTimeAndOnAbort)
+})
