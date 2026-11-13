@@ -1,0 +1,159 @@
+// The motor test, as a ground station asks for it (ArduPilot: ArduCopter/motor_test.cpp `mavlink_motor_test_start`,
+// GCS_MAVLink_Copter.cpp `handle_MAV_CMD_DO_MOTOR_TEST`):
+//  - MAV_CMD_DO_MOTOR_TEST spins one motor. param1 is the motor (1 to 12, the TEST sequence: A, B, C ...), param2 the kind of throttle (0:
+//    a percent), param3 the throttle, param4 the TIMEOUT in seconds, param5 how many motors in sequence (1: this one), param6 the order.
+//  - THE DANGER (read before changing anything here): the vehicle must be landed; it then ARMS ITS MOTORS and DISABLES THE THROTTLE, GCS AND
+//    EKF FAILSAFES until the test ends; it takes a timeout of up to 600 seconds, and nothing but the timeout (or a command with a timeout of
+//    0, which ends the test at once) stops the motor. A ground station that dies, loses the link or just forgets leaves a motor spinning,
+//    with no failsafe, for as long as it asked.
+//  - So this helper never sends a timeout above 2 seconds (`MAX_TEST_SECONDS`) and never a throttle above 20 % (`MAX_TEST_THROTTLE`),
+//    whatever it is asked: it throws instead of sending. A test that is to go on is the SAME short test sent again (`hold`: every 800 ms,
+//    a test of 1.5 s), so a vehicle that stops hearing from the ground station stops the motor itself within 1.5 s. And every test, however
+//    it ends (released, aborted, refused, the ack lost, an error), ends with a stop (timeout 0) that is sent anyway and, when it is not
+//    acknowledged, sent again.
+//  - A vehicle that is not landed answers FAILED (with its own STATUSTEXT, "Motor Test: ..."): the answer is returned, never hidden.
+//    A vehicle that is ARMED does NOT refuse: ArduPilot (SITL, Copter, landed) answers ACCEPTED and spins the motor ("starting motor test").
+//    This helper cannot tell that the vehicle is armed: the CALLER must not call it, and must not call it again, for a vehicle that is
+//    armed, or whose armed state is not known.
+//  - The number of the motor is the TEST ORDER (A is 1, B is 2 ...), not the output: of a quad X, test 1 spins output 3, 2 output 1, 3
+//    output 4 and 4 output 2 (SITL). Which output a test spins is the vehicle's frame; param6 (the order) is ignored by the vehicle.
+import { delay } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { MavLinkError } from "./protocol"
+import { MavCmd, MavResult } from "./dialects/common"
+import { CommandCall, ParamOptions, Target } from "./operations"
+
+/// The longest test (seconds) this helper sends: the vehicle accepts 600.
+export const MAX_TEST_SECONDS: f64 = 2.0
+
+/// The greatest throttle (percent) this helper sends.
+export const MAX_TEST_THROTTLE: int = 20
+
+/// The motors a test can name (ArduPilot: AP_MOTORS_MAX_NUM_MOTORS).
+export const MAX_TEST_MOTORS: int = 12
+
+/// What a held test is made of: a test of this many seconds, sent again every this many milliseconds.
+export const HOLD_TEST_SECONDS: f64 = 1.5
+export const HOLD_REPEAT_MS: int = 800
+
+/// How a held test went.
+export struct HoldResult {
+  /// How many starts the vehicle accepted.
+  starts: int
+  /// The MAV_RESULT of the first start, or -1 when nothing acknowledged it.
+  first: int
+  /// Why it ended before it was released, `""` when it was released: `refused` (the vehicle did not accept a start: see `first`),
+  /// `unacknowledged` (no answer to a start in time: the vehicle may have spun the motor all the same), or the code of another error.
+  why: string
+  /// Whether the vehicle acknowledged the stop (ACCEPTED). When it did not, the test it was told to run ends by itself within `HOLD_TEST_SECONDS`.
+  stopped: bool
+}
+
+/// The motor test of a vehicle. `conn.run()` must be running.
+export class MotorTest {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  /// A start is sent once (never again by itself) and may be aborted with the signal; a stop never is aborted and is sent again if it is not acked.
+  readonly startCall: CommandCall
+  readonly stopCall: CommandCall
+  /// The motor the last test named (a stop names it too: the vehicle checks the number before it looks at the timeout).
+  public lastMotor: int = 1
+  readonly timeoutMs: int
+
+  constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.timeoutMs = options.timeoutMs ?? 1000
+    this.startCall = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0, signal: options.signal })
+    this.stopCall = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 2 })
+  }
+
+  /// MAV_RESULT of a test of motor `motor` (1 to 12) at `throttlePercent` (1 to 20 %) for `seconds` (more than 0 and up to 2): sent once.
+  /// A `TIMEOUT` MavLinkError says nothing about what the vehicle did (it may be spinning the motor): send `stop`. Anything outside the
+  /// limits is an `INVALID_VALUE` MavLinkError and nothing is sent.
+  public async start(motor: int, throttlePercent: int, seconds: f64): Promise<int> throws Error {
+    await send(startCall, motor, throttlePercent, seconds)
+  }
+
+  /// Checks the limits (see `start`), then sends the test once through `call`.
+  async send(call: CommandCall, motor: int, throttlePercent: int, seconds: f64): Promise<int> throws Error {
+    if (motor < 1 || motor > MAX_TEST_MOTORS) {
+      throw new MavLinkError("INVALID_VALUE", `motor ${motor} is not 1 to ${MAX_TEST_MOTORS}`)
+    }
+    if (throttlePercent < 1 || throttlePercent > MAX_TEST_THROTTLE) {
+      throw new MavLinkError("INVALID_VALUE", `a throttle of ${throttlePercent} % is not 1 to ${MAX_TEST_THROTTLE} %`)
+    }
+    // (written so that NaN is outside)
+    if (!(seconds > 0.0 && seconds <= MAX_TEST_SECONDS)) {
+      throw new MavLinkError("INVALID_VALUE", `a test of ${seconds} s is not more than 0 and up to ${MAX_TEST_SECONDS} s`)
+    }
+    lastMotor = motor
+    await call.run(MavCmd.DO_MOTOR_TEST, [motor as f64, 0.0, throttlePercent as f64, seconds, 1.0, 0.0])
+  }
+
+  /// MAV_RESULT of the stop: a test of the last motor, at no throttle, with a timeout of 0, which ends the test at once. Sent again (twice)
+  /// when it is not acknowledged; a `TIMEOUT` MavLinkError when it never is.
+  public async stop(): Promise<int> throws Error {
+    await stopCall.run(MavCmd.DO_MOTOR_TEST, [lastMotor as f64, 0.0, 0.0, 0.0, 1.0, 0.0])
+  }
+
+  /// Spins motor `motor` at `throttlePercent` until `released` is aborted: a test of `HOLD_TEST_SECONDS` sent every `repeatMs`. However it
+  /// ends (released, a start the vehicle refuses, no answer to a start, an error) the stop is sent, and sent again if it is not acknowledged;
+  /// a start that was not acknowledged does not keep it from being sent. It does not throw: what happened is in the result.
+  public async hold(motor: int, throttlePercent: int, released: AbortSignal, repeatMs: int = HOLD_REPEAT_MS): Promise<HoldResult> {
+    let starts = 0
+    let first = -1
+    let why = ""
+    // The starts of this hold are aborted by the release (a release does not wait for an ack); the stop is not.
+    const call = new CommandCall(conn, target, { timeoutMs: timeoutMs, retries: 0, signal: released })
+    try {
+      while (!released.aborted && why == "") {
+        const result = await send(call, motor, throttlePercent, HOLD_TEST_SECONDS)
+        if (first < 0) {
+          first = result
+        }
+        if (result == MavResult.ACCEPTED) {
+          starts += 1
+          await waitUnlessReleased(repeatMs, released)
+        } else {
+          why = "refused"
+        }
+      }
+    } catch (e: Error) {
+      why = whyItEnded(e, released)
+    }
+    const stopped = await stopQuietly()
+    const out: HoldResult = { starts: starts, first: first, why: why, stopped: stopped }
+    out
+  }
+
+  /// Sends the stop and says whether the vehicle acknowledged it.
+  async stopQuietly(): Promise<bool> {
+    try {
+      return (await stop()) == MavResult.ACCEPTED
+    } catch (e: Error) {
+      return false
+    }
+  }
+}
+
+/// Why a hold ended on an error: `""` when a start was aborted by the release (that is the release), `unacknowledged` when a start got no
+/// answer, else the error's own code.
+function whyItEnded(e: Error, released: AbortSignal): string {
+  if (e instanceof MavLinkError) {
+    if (e.code == "ABORTED" && released.aborted) {
+      return ""
+    }
+    return if (e.code == "TIMEOUT") "unacknowledged" else e.code
+  }
+  "ERROR"
+}
+
+/// Waits `ms`, or until `released` is aborted (looking every 20 ms: a release is answered with the stop in that time).
+async function waitUnlessReleased(ms: int, released: AbortSignal): Promise<void> throws Error {
+  let waited = 0
+  while (waited < ms && !released.aborted) {
+    await delay(20)
+    waited += 20
+  }
+}

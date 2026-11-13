@@ -1,0 +1,156 @@
+// The motor test of the simulated autopilot, as ArduPilot does it (see motortest.pi for the protocol and its danger):
+//  - MAV_CMD_DO_MOTOR_TEST (param1 the motor 1 to 12, param2 the throttle type, param3 the throttle, param4 the timeout in seconds, param5
+//    how many motors) is answered FAILED, with "Motor Test: ..." in STATUSTEXT, for a motor that is not 1 to 12 or when the vehicle is not
+//    landed (`landed`), and ACCEPTED otherwise, ARMED OR NOT (as SITL does; `refuseWhileArmed` makes it refuse): the motor spins at the throttle for the timeout (at most 600 s) and then
+//    stops BY ITSELF; a command with a timeout of 0 stops it at once (ACCEPTED too). A second test replaces the first.
+//  - The outputs of the first four motors are what SERVO_OUTPUT_RAW says (see `outputs`): 1000 µs at rest, and 1000 + 10 × the throttle for
+//    the motor that spins.
+// What a test reads: `starts` and `stops` (commands that began and that ended a test), `maxSeconds` (the longest timeout it was ever asked
+// for: a test of the helper checks that it is never above 2), `maxThrottle`, `lastMotor`, `running()`. Faults for tests: `refuse` (every test
+// is answered FAILED), `swallowAcks` (the next commands are carried out and not acknowledged: an ack lost on the link).
+import { MavLinkConnection, Received } from "./connection"
+import { CommandAck, CommandLong, MavCmd, MavResult, MavSeverity, StatusText } from "./dialects/common"
+import { wholeNumber } from "./accelcal"
+
+/// The longest timeout the vehicle takes (seconds).
+const VEHICLE_MAX_SECONDS: f64 = 600.0
+
+/// The motor test of the simulated autopilot.
+export class SimMotors {
+  readonly conn: MavLinkConnection
+  readonly armed: () => bool
+  readonly forMe: (system: int, component: int) => bool
+  /// Whether the vehicle is landed (a test is refused when it is not).
+  public landed: bool = true
+  /// Every test is answered FAILED.
+  public refuse: bool = false
+  /// A test is answered FAILED while the vehicle is armed (a real Copter accepts it: off by default).
+  public refuseWhileArmed: bool = false
+  /// How many of the next DO_MOTOR_TEST commands are carried out and not acknowledged.
+  public swallowAcks: int = 0
+  /// How many DO_MOTOR_TEST commands came, how many started a test and how many stopped one.
+  public commands: int = 0
+  public starts: int = 0
+  public stops: int = 0
+  /// The longest timeout (seconds) and the greatest throttle (percent) any test was asked for.
+  public maxSeconds: f64 = 0.0
+  public maxThrottle: f64 = 0.0
+  /// The motor of the last command (1 based).
+  public lastMotor: int = 0
+  motor: int = 0
+  throttle: f64 = 0.0
+  endsAt: int = 0
+
+  constructor(conn: MavLinkConnection, armed: () => bool, forMe: (system: int, component: int) => bool) {
+    this.conn = conn
+    this.armed = armed
+    this.forMe = forMe
+  }
+
+  isArmed(): bool {
+    const f = armed
+    f()
+  }
+
+  mine(system: int, component: int): bool {
+    const f = forMe
+    f(system, component)
+  }
+
+  /// Whether a motor spins now (a test that has run out has stopped by itself).
+  public running(): bool {
+    if (motor != 0 && (Date.now() as int) >= endsAt) {
+      motor = 0
+    }
+    motor != 0
+  }
+
+  /// The pulse (µs) of each of the 8 outputs of the main port: the first four are the motors.
+  public outputs(): int[] {
+    const out: int[] = [1000, 1000, 1000, 1000, 0, 0, 0, 0]
+    if (running() && motor <= 4) {
+      out[motor - 1] = 1000 + Math.round(throttle * 10.0) as int
+    }
+    out
+  }
+
+  /// Handles one message; whether it was a motor test.
+  public handle(r: Received): bool {
+    const m = r.message
+    if (!(m instanceof CommandLong) || m.command as int != MavCmd.DO_MOTOR_TEST) {
+      return false
+    }
+    if (mine(m.targetSystem as int, m.targetComponent as int)) {
+      test(m)
+    }
+    true
+  }
+
+  say(text: string): void {
+    const s = new StatusText()
+    s.severity = MavSeverity.CRITICAL as u8
+    s.text = text
+    conn.send(s)
+  }
+
+  answer(result: int): void {
+    if (swallowAcks > 0) {
+      swallowAcks -= 1
+      return
+    }
+    const a = new CommandAck()
+    a.command = MavCmd.DO_MOTOR_TEST as u16
+    a.result = result as u8
+    conn.send(a)
+  }
+
+  /// Why a test is refused (and says so), or "" when it is not.
+  refusal(motorNumber: int): string {
+    if (refuse) {
+      return "Motor Test: refused"
+    }
+    if (motorNumber < 1 || motorNumber > 12) {
+      return "Motor Test: invalid motor"
+    }
+    // ArduPilot (SITL, Copter) does NOT refuse a motor test while the vehicle is armed and landed: it accepts it. So the simulator accepts
+    // it too, unless a test asks it to refuse (`refuseWhileArmed`): the refusal of an armed vehicle is the ground station's to make.
+    if (refuseWhileArmed && isArmed()) {
+      return "Motor Test: vehicle armed"
+    }
+    if (!landed) {
+      return "Motor Test: vehicle not landed"
+    }
+    ""
+  }
+
+  test(m: CommandLong): void {
+    commands += 1
+    const motorNumber = wholeNumber(m._param1 as f64)
+    const seconds = m._param4 as f64
+    const percent = m._param3 as f64
+    lastMotor = motorNumber
+    if (seconds > maxSeconds) {
+      maxSeconds = seconds
+    }
+    if (percent > maxThrottle) {
+      maxThrottle = percent
+    }
+    const why = refusal(motorNumber)
+    if (why != "") {
+      say(why)
+      answer(MavResult.FAILED)
+      return
+    }
+    if (seconds <= 0.0) {
+      stops += 1
+      motor = 0
+      answer(MavResult.ACCEPTED)
+      return
+    }
+    starts += 1
+    motor = motorNumber
+    throttle = percent
+    endsAt = (Date.now() as int) + Math.round((if (seconds > VEHICLE_MAX_SECONDS) VEHICLE_MAX_SECONDS else seconds) * 1000.0) as int
+    answer(MavResult.ACCEPTED)
+  }
+}

@@ -1,0 +1,278 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError } from "./protocol"
+import { SimulatedAutopilot } from "./simulator"
+import { HOLD_TEST_SECONDS, MAX_TEST_SECONDS, MAX_TEST_THROTTLE, MotorTest } from "./motortest"
+import { SERVO_OUTPUTS, ServoMonitor, servoReadingOf } from "./servooutputs"
+import { CommandLong, MavCmd, MavResult, ServoOutputRaw } from "./dialects/common"
+
+/// A ground station and a vehicle that is landed and disarmed (the first ticks: it arms itself after 3, a second each here).
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly test: MotorTest
+  /// What the vehicle was sent: the commands of DO_MOTOR_TEST, as "motor throttle timeout" in order.
+  public readonly sent: string[] = []
+
+  constructor(timeoutMs: int = 150) {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.gcs = new MavLinkConnection(ends[0])
+    this.test = new MotorTest(this.gcs, { system: 1, component: 1 }, { timeoutMs: timeoutMs })
+    this.sim.conn.on((r: Received) => {
+      const m = r.message
+      if (m instanceof CommandLong && m.command as int == MavCmd.DO_MOTOR_TEST) {
+        this.sent.push(`${m._param1} ${m._param3} ${m._param4}`)
+      }
+    })
+    this.gcs.run()
+    this.sim.start(1000)
+  }
+
+  public close(): void {
+    sim.stop()
+    gcs.close()
+  }
+}
+
+/// A test the helper is asked for.
+struct Try {
+  motor: int
+  throttle: int
+  seconds: f64
+}
+
+async function startSendsAShortTestOfOneMotor(): Promise<void> throws Error {
+  const rig = new Rig()
+  const result = await rig.test.start(2, 10, 1.5)
+  rig.close()
+  expect(result).toBe(MavResult.ACCEPTED)
+  expect(rig.sent.join(";")).toBe("2 10 1.5")
+  expect(rig.sim.motors.starts).toBe(1)
+  expect(rig.sim.motors.lastMotor).toBe(2)
+}
+
+async function startRefusesWhatIsOutsideTheLimitsAndSendsNothing(): Promise<void> throws Error {
+  const rig = new Rig()
+  let refused = 0
+  const tries: Try[] = [
+    { motor: 0, throttle: 10, seconds: 1.0 },
+    { motor: 13, throttle: 10, seconds: 1.0 },
+    { motor: 1, throttle: 0, seconds: 1.0 },
+    { motor: 1, throttle: MAX_TEST_THROTTLE + 1, seconds: 1.0 },
+    { motor: 1, throttle: 10, seconds: 0.0 },
+    { motor: 1, throttle: 10, seconds: -1.0 },
+    { motor: 1, throttle: 10, seconds: MAX_TEST_SECONDS + 0.001 },
+    { motor: 1, throttle: 10, seconds: 600.0 },
+    { motor: 1, throttle: 10, seconds: 0.0 / 0.0 },
+  ]
+  for (const t of tries) {
+    try {
+      const _result = await rig.test.start(t.motor, t.throttle, t.seconds)
+    } catch (e: MavLinkError) {
+      if (e.code == "INVALID_VALUE") {
+        refused += 1
+      }
+    }
+  }
+  const limit = await rig.test.start(1, MAX_TEST_THROTTLE, MAX_TEST_SECONDS)
+  rig.close()
+  expect(refused).toBe(tries.length)
+  // only the one test inside the limits was sent, and the vehicle was never asked for more than 2 s
+  expect(rig.sent.length).toBe(1)
+  expect(limit).toBe(MavResult.ACCEPTED)
+  expect(rig.sim.motors.maxSeconds).toBe(2.0)
+}
+
+async function stopEndsTheTestAtOnce(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.test.start(3, 15, 2.0)
+  expect(rig.sim.motors.running()).toBe(true)
+  const stopped = await rig.test.stop()
+  rig.close()
+  expect(stopped).toBe(MavResult.ACCEPTED)
+  expect(rig.sim.motors.running()).toBe(false)
+  expect(rig.sim.motors.stops).toBe(1)
+  // the stop names the motor under test and has a timeout of 0
+  expect(rig.sent[1]).toBe("3 0 0")
+}
+
+async function holdSendsTheSameShortTestAgainAndStopsOnRelease(): Promise<void> throws Error {
+  const rig = new Rig()
+  const release = new AbortController()
+  const held = rig.test.hold(4, 12, release.signal, 100)
+  await delay(450)
+  expect(rig.sim.motors.running()).toBe(true)
+  release.abort()
+  const result = await held
+  rig.close()
+  expect(result.why).toBe("")
+  expect(result.starts >= 3).toBe(true)
+  expect(result.first).toBe(MavResult.ACCEPTED)
+  expect(result.stopped).toBe(true)
+  expect(rig.sim.motors.running()).toBe(false)
+  expect(rig.sim.motors.stops).toBe(1)
+  // every test was the short one, and the longest the vehicle was ever asked for is that
+  expect(rig.sim.motors.maxSeconds).toBe(HOLD_TEST_SECONDS)
+  expect(rig.sim.motors.maxThrottle).toBe(12.0)
+}
+
+async function aVehicleThatHearsNothingMoreStopsTheMotorItself(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.test.start(1, 10, 0.2)
+  expect(rig.sim.motors.running()).toBe(true)
+  await delay(300)
+  rig.close()
+  // no stop was sent: the test ran out by itself
+  expect(rig.sim.motors.running()).toBe(false)
+  expect(rig.sim.motors.stops).toBe(0)
+}
+
+async function aStartTheVehicleRefusesIsReportedAndStillStopped(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.motors.landed = false
+  const release = new AbortController()
+  const result = await rig.test.hold(1, 10, release.signal, 100)
+  rig.close()
+  expect(result.why).toBe("refused")
+  expect(result.first).toBe(MavResult.FAILED)
+  expect(result.starts).toBe(0)
+  // the stop is sent anyway (and refused too: the vehicle is not landed; there is nothing running)
+  expect(rig.sent.length).toBe(2)
+  expect(rig.sent[1]).toBe("1 0 0")
+}
+
+async function aStartThatIsNotAcknowledgedIsStoppedAnyway(): Promise<void> throws Error {
+  const rig = new Rig(80)
+  // the vehicle carries out the start and the ack is lost
+  rig.sim.motors.swallowAcks = 1
+  const release = new AbortController()
+  const result = await rig.test.hold(2, 10, release.signal, 100)
+  rig.close()
+  expect(result.why).toBe("unacknowledged")
+  expect(result.first).toBe(-1)
+  expect(result.stopped).toBe(true)
+  expect(rig.sim.motors.starts).toBe(1)
+  expect(rig.sim.motors.stops).toBe(1)
+  expect(rig.sim.motors.running()).toBe(false)
+}
+
+async function aStopThatIsNotAcknowledgedIsSentAgain(): Promise<void> throws Error {
+  const rig = new Rig(80)
+  await rig.test.start(1, 10, 1.0)
+  rig.sim.motors.swallowAcks = 2
+  const result = await rig.test.stop()
+  rig.close()
+  expect(result).toBe(MavResult.ACCEPTED)
+  // the first two stops were not acknowledged: the third was
+  expect(rig.sim.motors.stops).toBe(3)
+  expect(rig.sim.motors.running()).toBe(false)
+}
+
+async function aStopTheVehicleNeverAcknowledgesIsAnErrorTheHoldSurvives(): Promise<void> throws Error {
+  const rig = new Rig(60)
+  const release = new AbortController()
+  const held = rig.test.hold(1, 10, release.signal, 100)
+  await delay(150)
+  rig.sim.motors.swallowAcks = 100
+  release.abort()
+  const result = await held
+  rig.close()
+  expect(result.stopped).toBe(false)
+  // the stop was sent three times (the first and twice again) though nobody answered
+  expect(rig.sim.motors.stops >= 3).toBe(true)
+}
+
+async function aReleaseDoesNotWaitForTheAckOfAStart(): Promise<void> throws Error {
+  const rig = new Rig(1000)
+  rig.sim.motors.swallowAcks = 1
+  const release = new AbortController()
+  const held = rig.test.hold(1, 10, release.signal, 100)
+  await delay(50)
+  const before = rig.sim.motors.stops
+  release.abort()
+  const result = await held
+  rig.close()
+  expect(before).toBe(0)
+  // the start was never acknowledged (1 s), but the release did not wait for that second: the stop went out at once
+  expect(result.stopped).toBe(true)
+  expect(rig.sim.motors.stops).toBe(1)
+}
+
+async function aVehicleThatIsNotLandedRefusesAndAnArmedOneDoesNot(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.motors.landed = false
+  const notLanded = await rig.test.start(1, 10, 1.0)
+  rig.sim.motors.landed = true
+  rig.sim.ticks = 5
+  // as ArduPilot does: an armed vehicle ACCEPTS the test (the caller must not ask)
+  const armed = await rig.test.start(1, 10, 1.0)
+  rig.sim.motors.refuseWhileArmed = true
+  const refused = await rig.test.start(1, 10, 1.0)
+  rig.close()
+  expect(notLanded).toBe(MavResult.FAILED)
+  expect(armed).toBe(MavResult.ACCEPTED)
+  expect(refused).toBe(MavResult.FAILED)
+  expect(rig.sim.motors.starts).toBe(1)
+}
+
+describe("the motor test", () => {
+  it("sends one short test of one motor", startSendsAShortTestOfOneMotor)
+  it("refuses a motor, a throttle or a time outside the limits, and sends nothing", startRefusesWhatIsOutsideTheLimitsAndSendsNothing)
+  it("stops the motor at once with a timeout of 0, naming the motor under test", stopEndsTheTestAtOnce)
+  it("is held by sending the same short test again, and stops on release", holdSendsTheSameShortTestAgainAndStopsOnRelease)
+  it("leaves a vehicle that hears nothing more to stop the motor by itself within the test's time", aVehicleThatHearsNothingMoreStopsTheMotorItself)
+  it("reports a start the vehicle refuses, and sends the stop anyway", aStartTheVehicleRefusesIsReportedAndStillStopped)
+  it("sends the stop when a start is not acknowledged", aStartThatIsNotAcknowledgedIsStoppedAnyway)
+  it("sends a stop that is not acknowledged again", aStopThatIsNotAcknowledgedIsSentAgain)
+  it("says when no stop was acknowledged, after sending it three times", aStopTheVehicleNeverAcknowledgesIsAnErrorTheHoldSurvives)
+  it("sends the stop on release without waiting for the ack of a start", aReleaseDoesNotWaitForTheAckOfAStart)
+  it("shows the vehicle's refusal when it is not landed as its answer; an armed vehicle accepts, as ArduPilot's", aVehicleThatIsNotLandedRefusesAndAnArmedOneDoesNot)
+})
+
+async function servoMonitorKeepsTheLatestOfEachPort(): Promise<void> throws Error {
+  const rig = new Rig()
+  const monitor = new ServoMonitor(rig.gcs, { system: 1, component: 1 })
+  rig.sim.servoStream = true
+  rig.sim.sendServo()
+  await delay(40)
+  expect(monitor.count).toBe(1)
+  expect(monitor.pulse(0, 1)).toBe(1000)
+  expect(monitor.pulse(0, 4)).toBe(1000)
+  // the unused outputs are 0, a port that was not heard is 0
+  expect(monitor.pulse(0, 5)).toBe(0)
+  expect(monitor.pulse(1, 1)).toBe(0)
+  expect(monitor.pulse(0, 17)).toBe(0)
+  // a motor under test shows its throttle on its output only
+  await rig.test.start(2, 20, 1.5)
+  rig.sim.sendServo()
+  await delay(40)
+  rig.close()
+  expect(monitor.pulse(0, 2)).toBe(1200)
+  expect(monitor.pulse(0, 1)).toBe(1000)
+  monitor.stop()
+}
+
+describe("SERVO_OUTPUT_RAW", () => {
+  it("is read as the pulses of the 16 outputs of a port, 0 where not used", () => {
+    const m = new ServoOutputRaw()
+    m.timeUsec = 4200000
+    m.port = 1
+    m.servo1Raw = 1100
+    m.servo8Raw = 1900
+    m.servo9Raw = 1500
+    m.servo16Raw = 2000
+    const r = servoReadingOf(m)
+    expect(r.port).toBe(1)
+    expect(r.timeUsec).toBe(4200000)
+    expect(r.pulses.length).toBe(SERVO_OUTPUTS)
+    expect(r.pulses[0]).toBe(1100)
+    expect(r.pulses[1]).toBe(0)
+    expect(r.pulses[7]).toBe(1900)
+    expect(r.pulses[8]).toBe(1500)
+    expect(r.pulses[15]).toBe(2000)
+  })
+  it("is kept by the monitor, a port at a time, and read in the simulator's motor outputs", servoMonitorKeepsTheLatestOfEachPort)
+})
