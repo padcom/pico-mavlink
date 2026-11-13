@@ -1,0 +1,447 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError, MavLinkProtocolV2 } from "./protocol"
+import { SimulatedAutopilot } from "./simulator"
+import { AccelCalKind, AccelPosition, Calibration, wholeNumber } from "./accelcal"
+import { CommandAck, CommandLong, MavCmd, MavResult, StatusText } from "./dialects/common"
+import { MavCmd as ApmCmd } from "./dialects/ardupilotmega"
+
+/// A ground station and a vehicle that is on the ground, disarmed (the first ticks), asking for a position every 15 ms. The ground
+/// station waits `ackMs` for the ack of a command that calibrates.
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly cal: Calibration
+  public readonly said: string[] = []
+
+  constructor(ackMs: int = 500, signal: AbortSignal? = null) {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.gcs = new MavLinkConnection(ends[0])
+    this.cal = new Calibration(this.gcs, { system: 1, component: 1 }, { timeoutMs: 100, signal: signal }, ackMs)
+    this.sim.calibration.repeatMs = 15
+    this.sim.calibration.takesMs = 0
+    this.gcs.on((r: Received) => {
+      const m = r.message
+      if (m instanceof StatusText) {
+        this.said.push(m.text)
+      }
+    })
+    this.gcs.run()
+    this.sim.start(1000)
+  }
+
+  public close(): void {
+    sim.stop()
+    gcs.close()
+  }
+}
+
+async function walksThroughAllSixPositions(): Promise<void> throws Error {
+  const rig = new Rig()
+  const placed: string[] = []
+  const result = await rig.cal.run((p: int) => {
+    placed.push(AccelPosition.nameOf(p) ?? "?")
+    true
+  }, 500)
+  rig.close()
+  expect(result.ok).toBe(true)
+  expect(result.reason).toBe("")
+  expect(result.result).toBe(MavResult.ACCEPTED)
+  expect(placed.join(",")).toBe("level,left,right,nose down,nose up,back")
+  expect(result.positions.join(",")).toBe("1,2,3,4,5,6")
+  expect(rig.sim.calibration.confirmed.join(",")).toBe("1,2,3,4,5,6")
+  expect(rig.sim.calibration.gyroRuns).toBe(1)
+  expect(rig.sim.calibration.preflightCommands).toBe(1)
+  expect(rig.said[0]).toBe("Place vehicle level and press any key.")
+  expect(rig.said.indexOf("Calibration successful") >= 0).toBe(true)
+}
+
+async function reportsAFailureThePositionItFailedAt(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.calibration.failAt = 3
+  const result = await rig.cal.run((_p: int) => true, 500)
+  rig.close()
+  expect(result.ok).toBe(false)
+  expect(result.reason).toBe("failed")
+  expect(result.positions.join(",")).toBe("1,2,3")
+  expect(rig.said.indexOf("Calibration FAILED") >= 0).toBe(true)
+}
+
+async function stopsWhenTheUserGivesUp(): Promise<void> throws Error {
+  const rig = new Rig()
+  const result = await rig.cal.run((p: int) => p < 2, 500)
+  rig.close()
+  expect(result.ok).toBe(false)
+  expect(result.reason).toBe("abandoned")
+  expect(result.positions.join(",")).toBe("1,2")
+  expect(rig.sim.calibration.confirmed.join(",")).toBe("1")
+}
+
+async function saysSoWhenTheVehicleNeverAsks(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.calibration.silent = true
+  const result = await rig.cal.run((_p: int) => true, 60)
+  rig.close()
+  expect(result.ok).toBe(false)
+  expect(result.reason).toBe("silent")
+  expect(result.result).toBe(MavResult.ACCEPTED)
+}
+
+async function givesUpOnAVehicleThatAcceptsNoAnswer(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.calibration.rejectPositions = true
+  let placed = 0
+  const result = await rig.cal.run((_p: int) => {
+    placed += 1
+    true
+  }, 500)
+  rig.close()
+  expect(result.ok).toBe(false)
+  expect(result.reason).toBe("notaccepted")
+  expect(placed).toBe(3)
+  expect(rig.sim.calibration.confirmed.length).toBe(0)
+}
+
+async function refusesWhileArmed(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  const said: string[] = []
+  gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof StatusText) {
+      said.push(m.text)
+    }
+  })
+  gcs.run()
+  sim.start(5)
+  await delay(40)   // armed from the third tick
+  const cal = new Calibration(gcs, { system: 1, component: 1 }, { timeoutMs: 100 }, 200)
+  const result = await cal.run((_p: int) => true, 100)
+  const gyro = await cal.gyro()
+  sim.stop()
+  gcs.close()
+  expect(result.ok).toBe(false)
+  expect(result.reason).toBe("refused")
+  expect(result.result).toBe(MavResult.FAILED)
+  expect(gyro).toBe(MavResult.FAILED)
+  expect(said.indexOf("Disarm to allow calibration") >= 0).toBe(true)
+  expect(sim.calibration.accelRuns).toBe(0)
+}
+
+async function aPositionThatWasNotAskedForIsRefused(): Promise<void> throws Error {
+  const rig = new Rig()
+  expect(await rig.cal.confirm(AccelPosition.LEFT)).toBe(MavResult.FAILED)   // nothing runs
+  expect(await rig.cal.startAccel(AccelCalKind.FULL)).toBe(MavResult.ACCEPTED)
+  const first = await rig.cal.prompt(200)
+  expect(first == null).toBe(false)
+  expect(first!).toBe(AccelPosition.LEVEL)
+  await delay(40)
+  const again = await rig.cal.prompt(200)   // it asks again until it is answered
+  expect(again!).toBe(AccelPosition.LEVEL)
+  expect(await rig.cal.confirm(AccelPosition.BACK)).toBe(MavResult.FAILED)   // the vehicle waits for level
+  expect(await rig.cal.confirm(AccelPosition.LEVEL)).toBe(MavResult.ACCEPTED)
+  rig.close()
+}
+
+async function theOtherCalibrations(): Promise<void> throws Error {
+  const rig = new Rig()
+  expect(await rig.cal.gyro()).toBe(MavResult.ACCEPTED)
+  expect(await rig.cal.startAccel(AccelCalKind.LEVEL)).toBe(MavResult.ACCEPTED)
+  expect(await rig.cal.startAccel(AccelCalKind.SIMPLE)).toBe(MavResult.ACCEPTED)
+  expect(await rig.cal.startAccel(AccelCalKind.ACCEPT)).toBe(MavResult.UNSUPPORTED)
+  // the RC flag: noted, and answered UNSUPPORTED as ArduPilot answers it
+  expect(await rig.cal.rcCalibrating(true)).toBe(MavResult.UNSUPPORTED)
+  expect(rig.sim.calibration.rcCalibrating).toBe(true)
+  expect(await rig.cal.rcCalibrating(false)).toBe(MavResult.UNSUPPORTED)
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  rig.sim.calibration.gyroFails = true
+  expect(await rig.cal.gyro()).toBe(MavResult.FAILED)
+  rig.close()
+  expect(rig.sim.calibration.gyroRuns).toBe(2)
+  expect(rig.sim.calibration.levelRuns).toBe(1)
+  expect(rig.sim.calibration.simpleRuns).toBe(1)
+}
+
+async function sendsACalibratingCommandOnceAndWaitsForTheAck(): Promise<void> throws Error {
+  // The vehicle calibrates inside the command and acks after: slower than the ack wait of a quick command.
+  const rig = new Rig(1000)
+  rig.sim.calibration.takesMs = 250
+  expect(await rig.cal.gyro()).toBe(MavResult.ACCEPTED)
+  expect(rig.sim.calibration.preflightCommands).toBe(1)
+  expect(rig.sim.calibration.gyroRuns).toBe(1)
+  rig.close()
+}
+
+async function doesNotAskAgainWhenTheAckIsLate(): Promise<void> throws Error {
+  const rig = new Rig(60)
+  rig.sim.calibration.takesMs = 250
+  let code = "acked"
+  try {
+    await rig.cal.gyro()
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  await delay(350)
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  // not asked again after the wait: a command sent again restarts a calibration
+  expect(rig.sim.calibration.preflightCommands).toBe(1)
+  expect(rig.sim.calibration.gyroRuns).toBe(1)
+}
+
+async function nothing(): Promise<void> {
+}
+
+async function throwsAtOnce(): Promise<void> throws Error {
+  throw new MavLinkError("WORK", "the work failed")
+}
+
+async function waitsForever(conn: MavLinkConnection, signal: AbortSignal): Promise<void> throws Error {
+  const r = await conn.waitFor((_r: Received) => false, 5000, signal)
+  if (r == null) {
+    throw new MavLinkError("ABORTED", "the work was cancelled")
+  }
+}
+
+async function theRcFlagIsClearedWhenTheWorkEnds(): Promise<void> throws Error {
+  const rig = new Rig()
+  let during = false
+  await rig.cal.rcCalibration(() => {
+    during = rig.sim.calibration.rcCalibrating
+    nothing()
+  })
+  rig.close()
+  expect(during).toBe(true)
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  expect(rig.sim.calibration.preflightCommands).toBe(2)   // the set and the clear
+  expect(rig.cal.rcFlagStuck).toBe(false)
+}
+
+async function theRcFlagIsClearedWhenTheWorkThrows(): Promise<void> throws Error {
+  const rig = new Rig()
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => throwsAtOnce())
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("WORK")
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  expect(rig.sim.calibration.preflightCommands).toBe(2)
+}
+
+async function theRcFlagIsClearedWhenTheCalibrationIsCancelled(): Promise<void> throws Error {
+  const stop = new AbortController()
+  const rig = new Rig(500, stop.signal)
+  setTimeout(() => stop.abort(), 40)
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => waitsForever(rig.gcs, stop.signal))
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("ABORTED")
+  // the clear was sent though the signal had aborted, and the vehicle has the flag off
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  expect(rig.sim.calibration.preflightCommands).toBe(2)
+}
+
+async function theRcFlagIsClearedWhenTheSetWasNotAnswered(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.calibration.swallowAcks = 1   // the vehicle sets the flag and its ack is lost
+  let worked = false
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => {
+      worked = true
+      nothing()
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  expect(worked).toBe(false)
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  expect(rig.sim.calibration.preflightCommands).toBe(2)
+}
+
+async function theRcFlagClearIsTriedOnceMore(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.cal.rcCalibration(() => {
+    rig.sim.calibration.swallowAcks = 1   // the ack of the first clear is lost
+    nothing()
+  })
+  rig.close()
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  expect(rig.sim.calibration.preflightCommands).toBe(3)   // set, clear, clear again
+  expect(rig.cal.rcFlagStuck).toBe(false)
+}
+
+async function saysSoWhenTheRcFlagCannotBeCleared(): Promise<void> throws Error {
+  const rig = new Rig()
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => {
+      rig.sim.calibration.swallowAcks = 2   // neither clear is answered
+      nothing()
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  expect(rig.cal.rcFlagStuck).toBe(true)
+  expect(rig.sim.calibration.preflightCommands).toBe(3)
+}
+
+async function theRcCalibrationIsRefusedWhileArmed(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.ticks = 5   // armed
+  let worked = false
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => {
+      worked = true
+      nothing()
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("REFUSED")
+  expect(worked).toBe(false)
+  expect(rig.sim.calibration.rcCalibrating).toBe(false)
+  expect(rig.sim.calibration.preflightCommands).toBe(3)   // the set, and the clear and its retry: all refused
+  expect(rig.cal.rcFlagStuck).toBe(true)
+}
+
+async function theRcFlagIsStuckWhenTheVehicleArmsBeforeTheClear(): Promise<void> throws Error {
+  const rig = new Rig()
+  let code = "none"
+  try {
+    await rig.cal.rcCalibration(() => {
+      rig.sim.ticks = 5   // armed after the set
+      nothing()
+    })
+  } catch (e: MavLinkError) {
+    code = e.code
+  }
+  rig.close()
+  expect(code).toBe("REFUSED")
+  expect(rig.sim.calibration.rcCalibrating).toBe(true)   // the vehicle still has it
+  expect(rig.cal.rcFlagStuck).toBe(true)
+}
+
+/// A vehicle that is a connection of its own, to send what a real one could: a number a float holds that no position is.
+async function ignoresPositionsThatAreNoNumber(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(1, 1) })
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  vehicle.run()
+  const cal = new Calibration(gcs, { system: 1, component: 1 }, { timeoutMs: 100 }, 200)
+  const send = (value: f64) => {
+    const c = new CommandLong()
+    c.command = ApmCmd.ACCELCAL_VEHICLE_POS as u16
+    c._param1 = value as f32
+    vehicle.send(c)
+  }
+  const nan = 0.0 / 0.0
+  const waiting = cal.prompt(150)
+  send(nan)
+  send(1.0e30)
+  send(-3.0)
+  send(2.5)
+  expect((await waiting) == null).toBe(true)   // none of them is a position
+  const next = cal.prompt(150)
+  send(3.0)
+  expect((await next)!).toBe(AccelPosition.RIGHT)
+  gcs.close()
+  vehicle.close()
+}
+
+async function theSimulatedVehicleIgnoresNumbersThatAreNoNumber(): Promise<void> throws Error {
+  const rig = new Rig()
+  const answers: int[] = []
+  rig.gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof CommandAck) {
+      answers.push(m.result as int)
+    }
+  })
+  const bad = [0.0 / 0.0, 1.0e30, -1.0, 1.5]
+  for (const value of bad) {
+    const c = new CommandLong()
+    c.targetSystem = 1
+    c.targetComponent = 1
+    c.command = ApmCmd.ACCELCAL_VEHICLE_POS as u16
+    c._param1 = value as f32
+    await rig.gcs.send(c)
+    const p = new CommandLong()
+    p.targetSystem = 1
+    p.targetComponent = 1
+    p.command = MavCmd.PREFLIGHT_CALIBRATION as u16
+    p._param5 = value as f32
+    await rig.gcs.send(p)
+  }
+  await delay(60)
+  rig.close()
+  // each command is answered, none is taken for a calibration or a position
+  expect(answers.length).toBe(8)
+  expect(rig.sim.calibration.accelRuns + rig.sim.calibration.levelRuns + rig.sim.calibration.simpleRuns).toBe(0)
+  expect(rig.sim.calibration.confirmed.length).toBe(0)
+}
+
+describe("accelerometer calibration", () => {
+  it("walks through the six positions the vehicle asks for, answering each once", walksThroughAllSixPositions)
+  it("reports the failure and where it came", reportsAFailureThePositionItFailedAt)
+  it("ends when the user gives up", stopsWhenTheUserGivesUp)
+  it("says so when the vehicle never asks", saysSoWhenTheVehicleNeverAsks)
+  it("gives up on a vehicle that accepts none of its answers", givesUpOnAVehicleThatAcceptsNoAnswer)
+  it("is refused while the vehicle is armed", refusesWhileArmed)
+  it("is refused a position the vehicle did not ask for", aPositionThatWasNotAskedForIsRefused)
+  it("has the gyro, level, simple and RC flag commands", theOtherCalibrations)
+  it("sends a command that calibrates once, and waits for the ack the vehicle gives when it is done", sendsACalibratingCommandOnceAndWaitsForTheAck)
+  it("does not send it again when the ack is late", doesNotAskAgainWhenTheAckIsLate)
+  it("ignores a request for a position that is NaN, 1e30, negative or a fraction", ignoresPositionsThatAreNoNumber)
+  it("answers a NaN, 1e30, negative or fractional number from the ground station and does not take it for anything", theSimulatedVehicleIgnoresNumbersThatAreNoNumber)
+})
+
+describe("the RC calibration flag", () => {
+  it("is cleared when the work ends", theRcFlagIsClearedWhenTheWorkEnds)
+  it("is cleared when the work throws, and the error is the work's", theRcFlagIsClearedWhenTheWorkThrows)
+  it("is cleared when the calibration is cancelled, though the signal has aborted", theRcFlagIsClearedWhenTheCalibrationIsCancelled)
+  it("is cleared when the set was not answered (the vehicle may have set it)", theRcFlagIsClearedWhenTheSetWasNotAnswered)
+  it("is cleared with one more try when the first clear is not answered", theRcFlagClearIsTriedOnceMore)
+  it("says so when it cannot be cleared", saysSoWhenTheRcFlagCannotBeCleared)
+  it("is refused while armed: the work does not run", theRcCalibrationIsRefusedWhileArmed)
+  it("is stuck when the vehicle arms between the set and the clear", theRcFlagIsStuckWhenTheVehicleArmsBeforeTheClear)
+})
+
+describe("accel positions", () => {
+  it("names the placements and the two ends", () => {
+    expect(AccelPosition.nameOf(5) ?? "").toBe("nose up")
+    expect(AccelPosition.nameOf(AccelPosition.FAILED) ?? "").toBe("failed")
+    expect(AccelPosition.nameOf(7) == null).toBe(true)
+    expect(AccelPosition.isPlacement(6) && !AccelPosition.isPlacement(0) && !AccelPosition.isPlacement(AccelPosition.SUCCESS)).toBe(true)
+    expect(AccelPosition.isEnd(AccelPosition.SUCCESS) && !AccelPosition.isEnd(1)).toBe(true)
+  })
+
+  it("takes a float of a command for a whole number only when it is one in range", () => {
+    expect(wholeNumber(3.0)).toBe(3)
+    expect(wholeNumber(16777215.0)).toBe(16777215)
+    expect(wholeNumber(0.0 / 0.0)).toBe(-1)
+    expect(wholeNumber(1.0e30)).toBe(-1)
+    expect(wholeNumber(1.0 / 0.0)).toBe(-1)
+    expect(wholeNumber(-1.0)).toBe(-1)
+    expect(wholeNumber(2.5)).toBe(-1)
+    expect(wholeNumber(16777217.0)).toBe(-1)
+  })
+})

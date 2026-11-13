@@ -16,6 +16,8 @@ import { TcpStream } from "./stream"
 import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
 import { Heartbeat } from "./dialects/minimal"
 import { MavCmd, MavParamType, MavResult, RequestDataStream, StatusText } from "./dialects/common"
+import { AccelCalKind, AccelPosition, Calibration } from "./accelcal"
+import { SimState } from "./dialects/ardupilotmega"
 import { GlobalPositionInt } from "./dialects/standard"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
 import { FtpClient, FtpEntry, FtpError, hexOf } from "./ftp"
@@ -92,7 +94,9 @@ async function defaultsFor(binary: string): Promise<string[]> throws Error {
 }
 
 /// Starts SITL and waits for its first heartbeat; null, with a line printed, when there is no SITL binary to start.
-async function startSitl(speedup: int = 1): Promise<Sitl?> throws Error {
+/// `model` is SITL's `--model`: `quad`, or `calibration`, a vehicle that is turned to the angles its servo outputs 5 to 8 say (ArduPilot's
+/// libraries/SITL/SIM_Calibration.cpp; only a vehicle that can be turned can be calibrated in six positions).
+async function startSitl(speedup: int = 1, model: string = "quad"): Promise<Sitl?> throws Error {
   const binary = await findBinary()
   if (binary == null) {
     println("SITL tests skipped: no SITL_BINARY, and no arducopter on the PATH")
@@ -101,7 +105,7 @@ async function startSitl(speedup: int = 1): Promise<Sitl?> throws Error {
   const instance = await freeInstance()
   const dir = `/tmp/pico-mavlink-sitl-${Date.now()}-${instance}`
   await mkdir(dir, true)
-  const args = ["-w", "--model", "quad", "--speedup", `${speedup}`, "-I", `${instance}`, "--sim-address=127.0.0.1"]
+  const args = ["-w", "--model", model, "--speedup", `${speedup}`, "-I", `${instance}`, "--sim-address=127.0.0.1"]
   const defaults = await defaultsFor(binary!)
   if (defaults.length > 0) {
     args.push("--defaults")
@@ -780,6 +784,206 @@ async function readsARecordingAnotherProgramWrote(): Promise<void> throws Error 
   }
 }
 
+/// Whether the calibration tests run: they need a SITL (a minute to start) and, for the armed one, a flight, so with `SITL_FLIGHT=1`.
+function calibrationTestsRun(): bool {
+  const flight = env.get("SITL_FLIGHT")
+  if (flight == null || flight! != "1") {
+    println("SITL calibration test skipped: set SITL_FLIGHT=1 to run it")
+    return false
+  }
+  true
+}
+
+/// Waits until the vehicle can calibrate, and returns what it says from then on (see `watchFlight`). SITL starts to boot when the link
+/// is made: AUTOPILOT_VERSION is answered by then, but a calibration command sent in the first second of the boot is never answered
+/// (the vehicle does not even send its heartbeat again: it is stuck in the calibration the boot is doing). The vehicle says "AHRS:
+/// EKF3 active" about 3.5 s after the link, and from then on the level calibration is accepted too (at 2 s it was answered
+/// TEMPORARILY_REJECTED: no AHRS yet). So a ground station that calibrates waits for the vehicle to be up, as this does.
+async function afterBoot(s: Sitl, deadline: int): Promise<Flight> throws Error {
+  const f = watchFlight(s)
+  const up = await until(() => f.texts.indexOf("AHRS: EKF3 active") >= 0, 30, deadline)
+  expect(up).toBe(true)
+  f
+}
+
+/// Where SITL says its vehicle is turned (SIMSTATE, radians), kept up to date by the link.
+class SimPose {
+  public roll: f64 = 0.0
+  public pitch: f64 = 0.0
+  public yaw: f64 = 0.0
+  public seen: int = 0
+}
+
+/// The quaternion of roll, pitch and yaw.
+function quaternionOf(roll: f64, pitch: f64, yaw: f64): f64[] {
+  const cr = Math.cos(roll / 2.0)
+  const sr = Math.sin(roll / 2.0)
+  const cp = Math.cos(pitch / 2.0)
+  const sp = Math.sin(pitch / 2.0)
+  const cy = Math.cos(yaw / 2.0)
+  const sy = Math.sin(yaw / 2.0)
+  [cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy]
+}
+
+/// Whether two quaternions are one turn (q and -q are).
+function sameTurn(a: f64[], b: f64[]): bool {
+  let plus = 0.0
+  let minus = 0.0
+  for (let i = 0; i < 4; i++) {
+    plus = Math.max(plus, Math.abs(a[i] - b[i]))
+    minus = Math.max(minus, Math.abs(a[i] + b[i]))
+  }
+  plus <= 0.01 || minus <= 0.01
+}
+
+/// The turn of the vehicle for each position the accelerometer calibration asks for, and the pulse widths that give it to SITL: SITL
+/// turns its vehicle to the angles that servo outputs 6 (roll), 7 (pitch) and 8 (yaw) say, 1500 + angle * 500 / pi, once output 5
+/// is above 1100 (ArduPilot's Tools/mavproxy_modules/sitl_calibration.py does this for `sitl_accelcal`).
+function poseOf(position: int): f64[] {
+  const half = Math.PI / 2.0
+  match (position) {
+    2 => [-half, 0.0],
+    3 => [half, 0.0],
+    4 => [0.0, -half],
+    5 => [0.0, half],
+    6 => [Math.PI, 0.0],
+    _ => [0.0, 0.0],
+  }
+}
+
+function pulseOf(angle: f64): f64 {
+  1500.0 + Math.round(angle * 500.0 / Math.PI)
+}
+
+/// Turns SITL's vehicle to `position` and waits until SIMSTATE says it has turned (five reports in a row).
+async function turnTo(cmd: CommandCall, pose: SimPose, position: int): Promise<void> throws Error {
+  const angles = poseOf(position)
+  const want = quaternionOf(angles[0], angles[1], 0.0)
+  await cmd.run(MavCmd.DO_SET_SERVO, [5.0, 1150.0])
+  await cmd.run(MavCmd.DO_SET_SERVO, [6.0, pulseOf(angles[0])])
+  await cmd.run(MavCmd.DO_SET_SERVO, [7.0, pulseOf(angles[1])])
+  await cmd.run(MavCmd.DO_SET_SERVO, [8.0, pulseOf(0.0)])
+  let close = 0
+  let last = pose.seen
+  for (let i = 0; i < 200 && close < 5; i++) {
+    await delay(50)
+    if (pose.seen != last) {
+      last = pose.seen
+      close = if (sameTurn(want, quaternionOf(pose.roll, pose.pitch, pose.yaw))) close + 1 else 0
+    }
+  }
+  expect(close >= 5).toBe(true)
+}
+
+/// The full accelerometer calibration against ArduCopter: it asks for the six positions in order, one after the other, the test turns
+/// SITL's vehicle to each (as the vehicle asks) and answers, and the calibration ends with the vehicle's success.
+async function calibratesTheAccelerometerInSixPositions(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1, "calibration")
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    await afterBoot(s, (Date.now() as int) + 60_000)
+    const pose = new SimPose()
+    s.conn.on((r: Received) => {
+      const m = r.message
+      if (m instanceof SimState) {
+        pose.roll = m.roll as f64
+        pose.pitch = m.pitch as f64
+        pose.yaw = m.yaw as f64
+        pose.seen += 1
+      }
+    })
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    expect(await cmd.setMessageInterval(SimState.MSG_ID, 100_000)).toBe(MavResult.ACCEPTED)
+    const cal = new Calibration(s.conn, s.target, { timeoutMs: 2000 }, 30_000)
+    expect(await cal.startAccel(AccelCalKind.FULL)).toBe(MavResult.ACCEPTED)
+    const asked: int[] = []
+    let end = 0
+    let answered = 0
+    for (let i = 0; i < 60 && end == 0; i++) {
+      const position = await cal.prompt(30_000)
+      expect(position == null).toBe(false)
+      const p = position!
+      if (AccelPosition.isEnd(p)) {
+        end = p
+      } else if (AccelPosition.isPlacement(p) && p != answered) {
+        asked.push(p)
+        await turnTo(cmd, pose, p)
+        expect(await cal.confirm(p)).toBe(MavResult.ACCEPTED)
+        answered = p
+      }
+    }
+    await cmd.run(MavCmd.DO_SET_SERVO, [5.0, 1000.0])
+    println(`SITL accel calibration: positions ${asked.join(",")}, end ${AccelPosition.nameOf(end) ?? "none"}`)
+    expect(asked.join(",")).toBe("1,2,3,4,5,6")
+    expect(end).toBe(AccelPosition.SUCCESS)
+  } finally {
+    await s.stop()
+  }
+}
+
+/// The level calibration and the gyro calibration are answered by one command each, when they are done (the gyro about half a
+/// second after, the level a second).
+async function calibratesTheLevelAndTheGyro(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    await afterBoot(s, (Date.now() as int) + 60_000)
+    const cal = new Calibration(s.conn, s.target, { timeoutMs: 2000 }, 30_000)
+    expect(await cal.gyro()).toBe(MavResult.ACCEPTED)
+    expect(await cal.startAccel(AccelCalKind.LEVEL)).toBe(MavResult.ACCEPTED)
+    // the RC flag is noted, and ArduPilot answers UNSUPPORTED to a command that carries only it
+    expect(await cal.rcCalibrating(true)).toBe(MavResult.UNSUPPORTED)
+    expect(await cal.rcCalibrating(false)).toBe(MavResult.UNSUPPORTED)
+  } finally {
+    await s.stop()
+  }
+}
+
+/// An armed vehicle refuses a calibration: FAILED, and "Disarm to allow calibration".
+async function refusesToCalibrateWhileArmed(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  const deadline = (Date.now() as int) + FLIGHT_BUDGET_MS
+  try {
+    const f = await afterBoot(s, deadline)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    let armed = false
+    for (let i = 0; i < 90 && !armed && (Date.now() as int) < deadline; i++) {
+      const mode = await cmd.run(MavCmd.DO_SET_MODE, [1.0, 4.0])
+      const res = if (mode == MavResult.ACCEPTED) await cmd.run(MavCmd.COMPONENT_ARM_DISARM, [1.0]) else mode
+      armed = res == MavResult.ACCEPTED && await until(() => f.armed, 3, deadline)
+      if (!armed) {
+        await delay(1000)
+      }
+    }
+    expect(armed).toBe(true)
+    const cal = new Calibration(s.conn, s.target, { timeoutMs: 2000 }, 30_000)
+    expect(await cal.startAccel(AccelCalKind.FULL)).toBe(MavResult.FAILED)
+    expect(await cal.gyro()).toBe(MavResult.FAILED)
+    expect(f.texts.indexOf("Disarm to allow calibration") >= 0).toBe(true)
+  } finally {
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
   it("writes a log that FTP can see: where, when, and what it looks like (the spike; SITL_FLIGHT=1)", writesALogWhereFtpCanSeeIt)
   it("downloads a file by FTP, in order, and the vehicle's CRC-32 is ours; going on from the middle gives the same file", downloadsAFileAndMatchesItsCrc)
@@ -788,4 +992,7 @@ describe("ArduCopter SITL", () => {
   it("lists its file system, with a time where it has one", listsTheFileSystem)
   it("gives the whole parameter list by file transfer in under 2 s, the same as the list", ftpGivesTheListFastAndTheSame)
   it("falls back to the list when FTP is disabled by BRD_OPTIONS", disabledFtpFallsBackToTheList)
+  it("calibrates the accelerometer: six prompts in order, answered, and a result (SITL_FLIGHT=1)", calibratesTheAccelerometerInSixPositions)
+  it("calibrates the gyro and the level, and notes the RC flag (SITL_FLIGHT=1)", calibratesTheLevelAndTheGyro)
+  it("refuses to calibrate while armed (SITL_FLIGHT=1)", refusesToCalibrateWhileArmed)
 })

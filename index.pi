@@ -112,6 +112,7 @@ export {
   decodeParamPack,
   encodeParamPack,
 } from "./src/parampack"
+export { AccelCalKind, AccelCalResult, AccelPosition, Calibration } from "./src/accelcal"
 export {
   AutopilotVersionRead,
   CommandCall,

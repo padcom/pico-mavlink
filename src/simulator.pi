@@ -17,6 +17,7 @@ import { Crc32 } from "./crc32"
 import { FTP_MAX_DATA, FtpError, FtpNack, FtpOpcode, FtpPacket, ftpMessage, ftpPacketOf } from "./ftp"
 import { ByteStream } from "./stream"
 import { SimLogs } from "./simlogs"
+import { SimCalibration } from "./simcal"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
 import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
@@ -192,6 +193,8 @@ export class SimulatedAutopilot {
   /// The MAVLink log protocol (LOG_REQUEST_LIST ...) over the same `/logs/NNNNNNNN.BIN` files as FTP: see simlogs.pi, which has its
   /// faults (loss, a stall, one packet dropped once, silence, corruption) and the rule that it is ignored while armed.
   public readonly logs: SimLogs
+  /// Calibration (MAV_CMD_PREFLIGHT_CALIBRATION, the vehicle asking for positions): see simcal.pi. Refused while armed.
+  public readonly calibration: SimCalibration
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -200,6 +203,7 @@ export class SimulatedAutopilot {
     this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(sysid, compid) })
     this.params = params
     this.logs = new SimLogs(conn, fsFiles, fsTimes, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
+    this.calibration = new SimCalibration(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
     conn.on((r: Received) => this.handle(r))
   }
 
@@ -237,6 +241,7 @@ export class SimulatedAutopilot {
 
   public stop(): void {
     logs.stop()
+    calibration.stop()
     clearInterval(timer)
     clearTimeout(downTimer)
     stopTimers()
@@ -351,7 +356,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (logs.handle(r)) {
+    if (logs.handle(r) || calibration.handle(r)) {
       return
     }
     const m = r.message
