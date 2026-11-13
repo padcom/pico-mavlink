@@ -36,6 +36,10 @@ export const MAX_TEST_MOTORS: int = 12
 export const HOLD_TEST_SECONDS: f64 = 1.5
 export const HOLD_REPEAT_MS: int = 800
 
+/// What `hold` holds its repeat time to: a test of `HOLD_TEST_SECONDS` must still be running when the next is sent, and not too often.
+export const MIN_REPEAT_MS: int = 100
+export const MAX_REPEAT_MS: int = 1000
+
 /// How a held test went.
 export struct HoldResult {
   /// How many starts the vehicle accepted.
@@ -93,17 +97,33 @@ export class MotorTest {
 
   /// MAV_RESULT of the stop: a test of the last motor, at no throttle, with a timeout of 0, which ends the test at once. Sent again (twice)
   /// when it is not acknowledged; a `TIMEOUT` MavLinkError when it never is.
-  public async stop(): Promise<int> throws Error {
-    await stopCall.run(MavCmd.DO_MOTOR_TEST, [lastMotor as f64, 0.0, 0.0, 0.0, 1.0, 0.0])
+  ///
+  /// An ack is matched by its command and its sender only, so an ack that is LATE (of a start whose answer was still awaited) could be
+  /// taken for the stop's. `unanswered` is how many starts may still be acknowledged: the stop is sent that many times MORE, each one
+  /// awaited, and the answer is the last one's: what confirms the stop is an ack that came after every late ack of a start could have.
+  ///
+  /// A stop sent to a vehicle that has NO test running is not a no-op: ArduPilot takes it for a start (it arms the motors for a moment,
+  /// turns the throttle, GCS and EKF failsafes off and loads them again) and then stops at once; on a vehicle that is armed it ends
+  /// by disarming the motors. Send it when a test may be running, which is what `hold` does.
+  public async stop(unanswered: int = 0): Promise<int> throws Error {
+    let result = await stopCall.run(MavCmd.DO_MOTOR_TEST, [lastMotor as f64, 0.0, 0.0, 0.0, 1.0, 0.0])
+    for (let i = 0; i < unanswered; i++) {
+      result = await stopCall.run(MavCmd.DO_MOTOR_TEST, [lastMotor as f64, 0.0, 0.0, 0.0, 1.0, 0.0])
+    }
+    result
   }
 
   /// Spins motor `motor` at `throttlePercent` until `released` is aborted: a test of `HOLD_TEST_SECONDS` sent every `repeatMs`. However it
   /// ends (released, a start the vehicle refuses, no answer to a start, an error) the stop is sent, and sent again if it is not acknowledged;
   /// a start that was not acknowledged does not keep it from being sent. It does not throw: what happened is in the result.
+  /// `repeatMs` is held to `MIN_REPEAT_MS` .. `MAX_REPEAT_MS` (a test must still be running when the next one is sent).
   public async hold(motor: int, throttlePercent: int, released: AbortSignal, repeatMs: int = HOLD_REPEAT_MS): Promise<HoldResult> {
     let starts = 0
     let first = -1
     let why = ""
+    // 1 when the last start was sent and its answer never came (the release, or no ack in time): its ack may still arrive.
+    let unanswered = 0
+    const every = if (repeatMs < MIN_REPEAT_MS) MIN_REPEAT_MS else if (repeatMs > MAX_REPEAT_MS) MAX_REPEAT_MS else repeatMs
     // The starts of this hold are aborted by the release (a release does not wait for an ack); the stop is not.
     const call = new CommandCall(conn, target, { timeoutMs: timeoutMs, retries: 0, signal: released })
     try {
@@ -114,23 +134,24 @@ export class MotorTest {
         }
         if (result == MavResult.ACCEPTED) {
           starts += 1
-          await waitUnlessReleased(repeatMs, released)
+          await waitUnlessReleased(every, released)
         } else {
           why = "refused"
         }
       }
     } catch (e: Error) {
       why = whyItEnded(e, released)
+      unanswered = if (e instanceof MavLinkError && (e.code == "ABORTED" || e.code == "TIMEOUT")) 1 else 0
     }
-    const stopped = await stopQuietly()
+    const stopped = await stopQuietly(unanswered)
     const out: HoldResult = { starts: starts, first: first, why: why, stopped: stopped }
     out
   }
 
   /// Sends the stop and says whether the vehicle acknowledged it.
-  async stopQuietly(): Promise<bool> {
+  async stopQuietly(unanswered: int): Promise<bool> {
     try {
-      return (await stop()) == MavResult.ACCEPTED
+      return (await stop(unanswered)) == MavResult.ACCEPTED
     } catch (e: Error) {
       return false
     }

@@ -1281,7 +1281,7 @@ async function spinsOnly(monitor: ServoMonitor, rest: int, which: string, second
 
 /// The motor test in ArduPilot itself: a motor spins at the throttle asked and shows in SERVO_OUTPUT_RAW, a stop (timeout 0) ends it at once,
 /// and a held test (a short test sent again) ends when it is released, with the stop. The vehicle arms its motors for the test and disarms
-/// them when it ends; it answers FAILED when it is armed.
+/// them when it ends. (It does NOT refuse a vehicle that is armed: see `acceptsTheMotorTestWhileArmed`.)
 async function spinsAMotorAndStopsItAtOnce(): Promise<void> throws Error {
   if (!motorTestsRun()) {
     return

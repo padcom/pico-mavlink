@@ -103,7 +103,7 @@ async function holdSendsTheSameShortTestAgainAndStopsOnRelease(): Promise<void> 
   const rig = new Rig()
   const release = new AbortController()
   const held = rig.test.hold(4, 12, release.signal, 100)
-  await delay(450)
+  await delay(650)
   expect(rig.sim.motors.running()).toBe(true)
   release.abort()
   const result = await held
@@ -155,7 +155,8 @@ async function aStartThatIsNotAcknowledgedIsStoppedAnyway(): Promise<void> throw
   expect(result.first).toBe(-1)
   expect(result.stopped).toBe(true)
   expect(rig.sim.motors.starts).toBe(1)
-  expect(rig.sim.motors.stops).toBe(1)
+  // the start may still be acknowledged: the stop is sent once more, so that an ack after it is the stop's
+  expect(rig.sim.motors.stops).toBe(2)
   expect(rig.sim.motors.running()).toBe(false)
 }
 
@@ -196,9 +197,50 @@ async function aReleaseDoesNotWaitForTheAckOfAStart(): Promise<void> throws Erro
   const result = await held
   rig.close()
   expect(before).toBe(0)
-  // the start was never acknowledged (1 s), but the release did not wait for that second: the stop went out at once
+  // the start was never acknowledged (1 s), but the release did not wait for that second: the stop went out at once, and (the
+  // start's ack could still come) once more
   expect(result.stopped).toBe(true)
-  expect(rig.sim.motors.stops).toBe(1)
+  expect(rig.sim.motors.stops).toBe(2)
+}
+
+async function aLateAckOfAStartIsNotTheAckOfTheStop(): Promise<void> throws Error {
+  const rig = new Rig(1000)
+  // the start is acknowledged 200 ms after it was sent ...
+  rig.sim.motors.delayNextAckMs = 200
+  const release = new AbortController()
+  const held = rig.test.hold(1, 10, release.signal, 100)
+  await delay(40)
+  // ... and no stop is ever acknowledged
+  rig.sim.motors.swallowAcks = 100
+  release.abort()
+  const result = await held
+  rig.close()
+  // the start's ack came during the stop, and was not taken for the stop's: the stop was sent again, and never confirmed
+  expect(result.stopped).toBe(false)
+  expect(rig.sim.motors.stops >= 2).toBe(true)
+}
+
+async function theRepeatTimeIsHeldToItsLimits(): Promise<void> throws Error {
+  const rig = new Rig()
+  const release = new AbortController()
+  // 5 ms is held to 100: in 700 ms there are a handful of tests (each wait is a few 20 ms steps), not the 30 of a repeat of 5 ms
+  const held = rig.test.hold(1, 10, release.signal, 5)
+  await delay(700)
+  release.abort()
+  const result = await held
+  rig.close()
+  expect(result.starts >= 3).toBe(true)
+  expect(result.starts <= 9).toBe(true)
+  // 60 s is held to 1 s: a test of 1.5 s is still running when the next is sent
+  const slow = new Rig()
+  const stop = new AbortController()
+  const slowHeld = slow.test.hold(1, 10, stop.signal, 60_000)
+  await delay(2300)
+  stop.abort()
+  const slowResult = await slowHeld
+  slow.close()
+  // (a repeat of 60 s would have sent one)
+  expect(slowResult.starts >= 2).toBe(true)
 }
 
 async function aVehicleThatIsNotLandedRefusesAndAnArmedOneDoesNot(): Promise<void> throws Error {
@@ -229,6 +271,8 @@ describe("the motor test", () => {
   it("sends a stop that is not acknowledged again", aStopThatIsNotAcknowledgedIsSentAgain)
   it("says when no stop was acknowledged, after sending it three times", aStopTheVehicleNeverAcknowledgesIsAnErrorTheHoldSurvives)
   it("sends the stop on release without waiting for the ack of a start", aReleaseDoesNotWaitForTheAckOfAStart)
+  it("does not take a start's late ack for the ack of the stop", aLateAckOfAStartIsNotTheAckOfTheStop)
+  it("holds the repeat time to 100 ms .. 1 s", theRepeatTimeIsHeldToItsLimits)
   it("shows the vehicle's refusal when it is not landed as its answer; an armed vehicle accepts, as ArduPilot's", aVehicleThatIsNotLandedRefusesAndAnArmedOneDoesNot)
 })
 
@@ -255,7 +299,23 @@ async function servoMonitorKeepsTheLatestOfEachPort(): Promise<void> throws Erro
   monitor.stop()
 }
 
+async function theTimeWrapsAfterAnHourAndAHalf(): Promise<void> throws Error {
+  const rig = new Rig()
+  const monitor = new ServoMonitor(rig.gcs, { system: 1, component: 1 })
+  // booted 80 minutes ago: 4.8e9 µs does not fit 32 bits (the vehicle's own time wraps, and a cast of it would stop the program)
+  rig.sim.bootedAt = (Date.now() as int) - 4_800_000
+  rig.sim.sendServo()
+  await delay(40)
+  rig.close()
+  monitor.stop()
+  expect(monitor.count).toBe(1)
+  const usec = monitor.ports[0]!.timeUsec
+  // 4 800 000 000 - 2^32 = 505 032 704 (and the test's few milliseconds)
+  expect(usec >= 505_000_000 && usec < 507_000_000).toBe(true)
+}
+
 describe("SERVO_OUTPUT_RAW", () => {
+  it("wraps its time at 32 bits instead of stopping the program", theTimeWrapsAfterAnHourAndAHalf)
   it("is read as the pulses of the 16 outputs of a port, 0 where not used", () => {
     const m = new ServoOutputRaw()
     m.timeUsec = 4200000

@@ -28,6 +28,8 @@ export class SimMotors {
   public refuseWhileArmed: bool = false
   /// How many of the next DO_MOTOR_TEST commands are carried out and not acknowledged.
   public swallowAcks: int = 0
+  /// The ack of the NEXT command is sent this long (ms) after it (a late ack), and then it is 0 again.
+  public delayNextAckMs: int = 0
   /// How many DO_MOTOR_TEST commands came, how many started a test and how many stopped one.
   public commands: int = 0
   public starts: int = 0
@@ -98,6 +100,17 @@ export class SimMotors {
       swallowAcks -= 1
       return
     }
+    if (delayNextAckMs > 0) {
+      // (a late ack: of this command only)
+      const wait = delayNextAckMs
+      delayNextAckMs = 0
+      const _timer = setTimeout(() => this.ack(result), wait)
+      return
+    }
+    ack(result)
+  }
+
+  ack(result: int): void {
     const a = new CommandAck()
     a.command = MavCmd.DO_MOTOR_TEST as u16
     a.result = result as u8

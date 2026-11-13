@@ -153,7 +153,8 @@ export class SimulatedAutopilot {
   downTimer: int = -1
   /// One timer per message that has an interval of its own.
   readonly timers: Map<int, int> = new Map<int, int>()
-  bootedAt: int = 0
+  /// When the vehicle booted (ms since 1970): a test sets it back to see what a long uptime does to the 32-bit times.
+  public bootedAt: int = 0
   /// Whether it is quiet (after a reboot, or set by hand): it sends nothing and hears nothing.
   public down: bool = false
   /// Whether it has MAVLink FTP (the capability bit in AUTOPILOT_VERSION, and the server for "@PARAM/param.pck"). A vehicle
@@ -202,7 +203,7 @@ export class SimulatedAutopilot {
   /// The pulses (µs) of the channels of the radio, one for each: sent as RC_CHANNELS at each tick when `rcStream` is on (off: nothing).
   public rc: int[] = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
   public rcStream: bool = false
-  /// The motor test (MAV_CMD_DO_MOTOR_TEST): see simmotor.pi. Refused while armed or when not landed.
+  /// The motor test (MAV_CMD_DO_MOTOR_TEST): see simmotor.pi. Refused when not landed; accepted while armed, as ArduPilot does.
   public readonly motors: SimMotors
   /// SERVO_OUTPUT_RAW (the outputs of the motors, `motors.outputs()`) at each tick when on (off: nothing).
   public servoStream: bool = false
@@ -368,7 +369,9 @@ export class SimulatedAutopilot {
   /// SERVO_OUTPUT_RAW: the pulses of the 8 outputs of the main port (`motors.outputs()`).
   public sendServo(): void {
     const m = new ServoOutputRaw()
-    m.timeUsec = (((Date.now() as int) - bootedAt) * 1000) as u32
+    // 32 bits of microseconds wrap after 71.6 minutes, as the vehicle's does: the remainder is taken before the cast (a cast of a
+    // number that does not fit stops the program).
+    m.timeUsec = ((((Date.now() as int) - bootedAt) * 1000) % 4294967296) as u32
     m.port = 0
     const o = motors.outputs()
     m.servo1Raw = o[0] as u16

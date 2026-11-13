@@ -135,7 +135,9 @@ export {
   HoldResult,
   MAX_TEST_MOTORS,
   MAX_TEST_SECONDS,
+  MAX_REPEAT_MS,
   MAX_TEST_THROTTLE,
+  MIN_REPEAT_MS,
   MotorTest,
 } from "./src/motortest"
 export { UP_AFTER_MS, waitUntilUp } from "./src/ready"
