@@ -66,6 +66,16 @@ async function readsTheRecordingMavproxyWrote(): Promise<void> throws Error {
     expect(p.bytesFed).toBe(105916)
     expect(p.bytesInRecords).toBe(105916)
     expect(p.byId.size).toBe(33)
+    // The exact set of message ids with their counts: a regenerated fixture changes this line, and what changed is to be reviewed.
+    const ids: int[] = []
+    for (const id of p.byId.keys()) {
+      ids.push(id)
+    }
+    ids.sort((a, b) => a - b)
+    expect(ids.map((id) => `${id}x${p.byId.get(id)}`).join(" ")).toBe(
+      "0x53 1x95 2x94 22x25 24x94 27x95 29x95 30x95 33x95 36x95 42x95 49x1 62x95 65x95 66x2 74x95 111x2 116x95 125x95 129x95 " +
+        "133x38 136x94 137x95 147x94 152x95 163x95 164x94 178x87 193x90 241x94 242x1 253x17 11030x80",
+    )
     // The messages the Flights view draws from, and the vehicle's and MAVProxy's heartbeats.
     expect(p.byId.get(0)).toBe(53)
     expect(p.byId.get(30)).toBe(95)
