@@ -75,13 +75,21 @@ export class RcMonitor {
   }
 }
 
+/// The shortest and the longest pulse (µs) that is taken for a channel's: a receiver gives 1000 to 2000 (800 to 2200 for the ends of an
+/// extended range). A pulse outside them (a glitch of 1 µs, a 9000 µs spike) is not a reading, and never becomes an RCn_MIN or RCn_MAX.
+export const MIN_PULSE: int = 800
+export const MAX_PULSE: int = 2200
+
 /// The least and the greatest pulse of each channel over the readings it is given: what the radio calibration captures while the user
-/// moves the sticks and the switches. A pulse of 0 (no pulse) is not a reading.
+/// moves the sticks and the switches. A pulse of 0 (no pulse) is not a reading, and a pulse outside 800 to 2200 µs is a glitch that is
+/// counted in `glitches` and kept out of the extremes (the values come from a vehicle, and are written to its parameters).
 export class RcExtremes {
   public readonly mins: int[] = []
   public readonly maxs: int[] = []
   /// How many readings it has had.
   public readings: int = 0
+  /// How many pulses were outside 800 to 2200 µs (not counting channels with no pulse), and kept out.
+  public glitches: int = 0
 
   /// Takes a reading in.
   public observe(r: RcReading): void {
@@ -89,6 +97,10 @@ export class RcExtremes {
     for (let i = 0; i < r.count; i++) {
       const p = r.pulses[i]
       if (p <= 0) {
+        continue
+      }
+      if (p < MIN_PULSE || p > MAX_PULSE) {
+        glitches += 1
         continue
       }
       while (mins.length <= i) {

@@ -101,5 +101,21 @@ describe("the extremes of the channels", () => {
     expect(x.travel(7)).toBe(0)
     expect(x.travel(-1)).toBe(0)
     expect(x.readings).toBe(4)
+    expect(x.glitches).toBe(0)
+  })
+})
+
+describe("the extremes of the channels and a glitch", () => {
+  it("keeps a pulse of 1 us or 9000 us out, and counts it", () => {
+    const x = new RcExtremes()
+    x.observe(reading([1500, 1500]))
+    x.observe(reading([1, 9000]))
+    x.observe(reading([2201, 799]))
+    x.observe(reading([1200, 1800]))
+    x.observe(reading([800, 2200]))   // the ends of the range are readings
+    expect(x.mins.join(",")).toBe("800,1500")
+    expect(x.maxs.join(",")).toBe("1500,2200")
+    expect(x.glitches).toBe(4)
+    expect(x.travel(0)).toBe(700)
   })
 })

@@ -13,6 +13,15 @@
 //  - MAV_CMD_DO_ACCEPT_MAG_CAL (param1 the compasses, 0 for all) keeps the result: the offsets are written to COMPASS_OFS*, and the new
 //    values are used after a reboot. MAV_CMD_DO_CANCEL_MAG_CAL (param1, 0 for all) stops a calibration and drops a result not accepted;
 //    the vehicle acks it ACCEPTED.
+//  - What accepting keeps (a page must say so before it accepts): not only the offsets but the diagonals, the off-diagonals and the scale
+//    factor of each compass, and, when the vehicle's COMPASS_AUTO_ROT is 2 or more, the orientation of the compass the calibration found
+//    (the report's `oldOrientation` and `newOrientation`: show both before accepting).
+//  - A start with the mask 0 (all compasses) first makes the vehicle SAVE the removal of a compass that is missing from its priority list
+//    (COMPASS_PRIO*_ID). So "nothing is kept unless accepted" holds for the calibration, not for that housekeeping.
+//  - `run` ends, with no cancel, when every compass has reported. The vehicle goes on repeating the reports until the result is accepted
+//    or cancelled, or the vehicle reboots: a caller that leaves after `run` MUST cancel (`cancel`), or accept. `calibration` does.
+//  - A compass id is 0 to 7: a progress or a report with a bigger one (the vehicle's byte, used as it came it would shift out of range) is
+//    not taken for an event.
 //  - The vehicle sends MAG_CAL_PROGRESS and MAG_CAL_REPORT in its stream EXTRA3 (SR*_EXTRA3, libraries/GCS_MAVLink/GCS_MAVLink_Parameters.cpp), which
 //    a link made by a ground station may not have at a rate: ask for both (message ids 191 and 192) with `TelemetryRates` (or
 //    MAV_CMD_SET_MESSAGE_INTERVAL) before the calibration, or nothing comes and the run ends `silent`.
@@ -349,14 +358,28 @@ function keep(reports: CompassReport[], r: CompassReport): void {
 function covers(reports: CompassReport[], mask: int): bool {
   let have = 0
   for (const r of reports) {
-    have = have | (1 << r.compassId)
+    if (r.compassId < MAX_COMPASSES) {
+      have = have | (1 << r.compassId)
+    }
   }
   (mask & have) == mask
 }
 
-/// A MAG_CAL_PROGRESS or MAG_CAL_REPORT from the vehicle.
+/// The most compasses a vehicle has: the ids are 0 to 7 (the masks are a byte).
+export const MAX_COMPASSES: int = 8
+
+/// A MAG_CAL_PROGRESS or MAG_CAL_REPORT from the vehicle, for a compass id that is one.
 function isEvent(r: Received, target: Target): bool {
   const m = r.message
   const mine = r.packet.header.sysid == target.system && (target.component == 0 || r.packet.header.compid == target.component)
-  mine && ((m instanceof MagCalProgress) || (m instanceof MagCalReport))
+  if (!mine) {
+    return false
+  }
+  if (m instanceof MagCalProgress) {
+    return (m.compassId as int) < MAX_COMPASSES
+  }
+  if (m instanceof MagCalReport) {
+    return (m.compassId as int) < MAX_COMPASSES
+  }
+  false
 }
