@@ -1,0 +1,312 @@
+// The logs of the simulated autopilot, as an ArduPilot serves them over the MAVLink log protocol (see logprotocol.pi for the
+// behaviour it follows and where it is in the ArduPilot source): the log files are the vehicle's file system's `/logs/NNNNNNNN.BIN`
+// (the same files MAVLink FTP serves), ids are their order from 1 (the oldest), and
+//  - every request is ignored while the vehicle is armed, and while another transfer runs on the link;
+//  - nothing is sent without a heartbeat from the ground station in the last 3 seconds (`heartbeatRule`, on by default);
+//  - a list is one LOG_ENTRY for each log (one with id 0 and no logs when there are none), a transfer is LOG_DATA of 90 bytes, the
+//    last one short (none when the size is a multiple of 90), paced a few dozen packets at a time, never all at once;
+//  - LOG_ERASE erases all the logs, with no answer; LOG_REQUEST_END stops a transfer.
+// Faults for tests: `loss` (percent of LOG_ENTRY / LOG_DATA dropped on their way out, from a seeded sequence), `stallAfter` (a transfer
+// stops after that many packets, as a link that did not drain), `dropOnce` (the one LOG_DATA at that offset is not sent the first
+// time), `silent` (nothing is answered), `corrupt` (the data of every packet is flipped: the log arrives, and is not the log).
+// `simulatedLog` makes a valid DataFlash log (with the encoder the tests use) of any length.
+import { DfEncoder } from "./dataflash"
+import { MavLinkConnection, Received } from "./connection"
+import { Heartbeat } from "./dialects/minimal"
+import { LogData, LogEntry, LogErase, LogRequestData, LogRequestEnd, LogRequestList } from "./dialects/common"
+
+/// A valid DataFlash log: banner, a MODE, and `rows` ATT messages (roll and pitch from a seeded sequence), about 19 bytes each.
+export function simulatedLog(rows: int, seed: int = 1): Uint8Array {
+  const e = new DfEncoder()
+  e.define(59, "MSG", "QZ", "TimeUS,Message")
+  e.define(72, "ATT", "Qff", "TimeUS,Roll,Pitch")
+  e.define(73, "MODE", "QMBB", "TimeUS,Mode,ModeNum,Rsn")
+  e.add(59, [1000.0, 0.0], ["", "ArduCopter V4.5.7 (simulated)"])
+  e.add(73, [2000.0, 0.0, 0.0, 0.0], ["", "", "", ""])
+  let x = seed
+  for (let i = 0; i < rows; i++) {
+    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+    const roll = ((x >> 8) % 3600) as f64 / 100.0 - 18.0
+    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+    const pitch = ((x >> 8) % 3600) as f64 / 100.0 - 18.0
+    e.add(72, [(10000 + i * 100000) as f64, roll, pitch], ["", "", ""])
+  }
+  e.bytes()
+}
+
+/// The transfer that runs: which log, where it is, how much is left.
+class Sending {
+  public readonly id: int
+  public readonly bytes: Uint8Array
+  public offset: int
+  public remaining: int
+  public packets: int = 0
+
+  constructor(id: int, bytes: Uint8Array, offset: int, remaining: int) {
+    this.id = id
+    this.bytes = bytes
+    this.offset = offset
+    this.remaining = remaining
+  }
+}
+
+/// The log protocol of the simulated autopilot.
+export class SimLogs {
+  readonly conn: MavLinkConnection
+  readonly files: Map<string, Uint8Array>
+  readonly times: Map<string, int>
+  readonly armed: () => bool
+  readonly forMe: (system: int, component: int) => bool
+  /// Whether it answers at all (the same switch as a vehicle without logging).
+  public enabled: bool = true
+  /// Ignore requests unless a heartbeat of a ground station came in the last 3 s, as ArduPilot does.
+  public heartbeatRule: bool = true
+  public loss: int = 0
+  public stallAfter: int = 0
+  public dropOnce: int = -1
+  public silent: bool = false
+  public corrupt: bool = false
+  /// How many LOG_DATA go out at a time, and how often (ms): a transfer takes time.
+  public perPump: int = 40
+  public pumpMs: int = 5
+  /// What was asked, one line each ("list 1-65535", "data id=1 ofs=0 count=...", "erase", "end").
+  public readonly log: string[] = []
+  /// How many LOG_DATA and LOG_ENTRY were sent (those lost included), and how many requests were dropped because of a transfer.
+  public sentData: int = 0
+  public sentEntries: int = 0
+  public busyDrops: int = 0
+  sending: Sending? = null
+  timer: int = -1
+  lastHeartbeat: int = 0
+  seed: int = 777
+
+  constructor(conn: MavLinkConnection, files: Map<string, Uint8Array>, times: Map<string, int>, armed: () => bool, forMe: (system: int, component: int) => bool) {
+    this.conn = conn
+    this.files = files
+    this.times = times
+    this.armed = armed
+    this.forMe = forMe
+  }
+
+  /// Notes the heartbeat of a ground station (any sender that is not the vehicle itself).
+  public heard(): void {
+    lastHeartbeat = Date.now() as int
+  }
+
+  /// Stops pumping (the simulator stops).
+  public stop(): void {
+    clearInterval(timer)
+    timer = -1
+    sending = null
+  }
+
+  /// The paths of the logs, oldest first: id 1 is the first.
+  public paths(): string[] {
+    const out: string[] = []
+    for (const path of files.keys()) {
+      if (path.startsWith("/logs/") && path.endsWith(".BIN") && path.length == 18) {
+        out.push(path)
+      }
+    }
+    out.sort()
+    out
+  }
+
+  isArmed(): bool {
+    const f = armed
+    f()
+  }
+
+  mine(system: int, component: int): bool {
+    const f = forMe
+    f(system, component)
+  }
+
+  random(n: int): int {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+    (seed >> 8) % n
+  }
+
+  lost(): bool {
+    loss > 0 && random(100) < loss
+  }
+
+  /// Whether a request is to be ignored: it is not for this vehicle, it is not enabled, silent, armed, or there is no heartbeat.
+  ignored(): bool {
+    if (!enabled || silent || isArmed()) {
+      return true
+    }
+    heartbeatRule && (Date.now() as int) - lastHeartbeat > 3000
+  }
+
+  /// Handles one message; whether it was one of the log protocol's.
+  public handle(r: Received): bool {
+    const m = r.message
+    if (m instanceof Heartbeat) {
+      if (r.packet.header.sysid != 0) {
+        heard()
+      }
+      return false
+    }
+    if (m instanceof LogRequestList) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
+        list(m.start as int, m.end as int)
+      }
+      return true
+    }
+    if (m instanceof LogRequestData) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
+        data(m.id as int, m.ofs as int, m.count as int)
+      }
+      return true
+    }
+    if (m instanceof LogErase) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
+        erase()
+      }
+      return true
+    }
+    if (m instanceof LogRequestEnd) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
+        log.push("end")
+        end()
+      }
+      return true
+    }
+    false
+  }
+
+  /// A listing: one LOG_ENTRY for each log from `start` to `end` (clamped as ArduPilot does), or the one entry of no logs.
+  list(start: int, endId: int): void {
+    log.push(`list ${start}-${endId}`)
+    if (ignored()) {
+      return
+    }
+    if (sending != null) {
+      busyDrops += 1
+      return
+    }
+    const found = paths()
+    const count = found.length
+    let first = start
+    let last = endId
+    if (count == 0) {
+      first = 0
+      last = 0
+    } else {
+      if (last > count) {
+        last = count
+      }
+      if (first < 1) {
+        first = 1
+      }
+    }
+    for (let id = first; id <= last; id++) {
+      const e = new LogEntry()
+      e.id = id as u16
+      e.numLogs = count as u16
+      e.lastLogNum = last as u16
+      if (id >= 1) {
+        const path = found[id - 1]
+        e.size = (files.get(path) ?? new Uint8Array(0)).length as u32
+        e.timeUtc = (times.get(path) ?? 0) as u32
+      }
+      sentEntries += 1
+      if (!lost()) {
+        conn.send(e)
+      }
+    }
+  }
+
+  /// A request for data: begins a transfer (dropped while one runs, and for an id that is not a log: that ends any transfer).
+  data(id: int, ofs: int, count: int): void {
+    log.push(`data id=${id} ofs=${ofs} count=${count}`)
+    if (ignored()) {
+      return
+    }
+    if (sending != null) {
+      busyDrops += 1
+      return
+    }
+    const found = paths()
+    if (id < 1 || id > found.length) {
+      end()
+      return
+    }
+    const bytes = files.get(found[id - 1]) ?? new Uint8Array(0)
+    let remaining = if (ofs >= bytes.length) 0 else bytes.length - ofs
+    if (remaining > count) {
+      remaining = count
+    }
+    sending = new Sending(id, bytes, ofs, remaining)
+    clearInterval(timer)
+    timer = setInterval(() => pump(), pumpMs)
+    pump()
+  }
+
+  /// Sends the next packets of the transfer: at most `perPump`; the transfer ends with a short packet or when nothing is left.
+  pump(): void {
+    const s = sending
+    if (s == null) {
+      return
+    }
+    for (let i = 0; i < perPump && sending != null; i++) {
+      if (ignored() || isArmed()) {
+        // Armed (or the heartbeat is gone) while it sends: it stops sending, and the transfer stays where it is.
+        return
+      }
+      if (stallAfter > 0 && s!.packets >= stallAfter) {
+        return
+      }
+      sendOne(s!)
+    }
+  }
+
+  sendOne(s: Sending): void {
+    let n = s.remaining
+    if (n > 90) {
+      n = 90
+    }
+    const p = new LogData()
+    p.id = s.id as u16
+    p.ofs = s.offset as u32
+    p.count = n as u8
+    for (let i = 0; i < 90; i++) {
+      const b = if (i < n && s.offset + i < s.bytes.length) s.bytes[s.offset + i] as int else 0
+      p.data.push((if (corrupt && i < n) b ^ 0x55 else b) as u8)
+    }
+    sentData += 1
+    s.packets += 1
+    const dropped = dropOnce >= 0 && s.offset == dropOnce
+    if (dropped) {
+      dropOnce = -1
+    }
+    if (!dropped && !lost()) {
+      conn.send(p)
+    }
+    s.offset += n
+    s.remaining -= n
+    if (n < 90 || s.remaining == 0) {
+      end()
+    }
+  }
+
+  /// Erases all the logs (not answered; ignored while armed).
+  erase(): void {
+    log.push("erase")
+    if (ignored()) {
+      return
+    }
+    for (const path of paths()) {
+      files.delete(path)
+      times.delete(path)
+    }
+  }
+
+  /// Ends the transfer that runs.
+  end(): void {
+    sending = null
+    clearInterval(timer)
+    timer = -1
+  }
+}

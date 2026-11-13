@@ -1,0 +1,480 @@
+// The MAVLink log protocol, client against the simulated autopilot (which serves it as an ArduPilot does): the list, a download that
+// is identical to the log with and without lost packets, resume from a byte offset that does not refetch what is held, cancel,
+// erase of all, and the vehicle's own rules (nothing while armed, nothing without the ground station's heartbeat).
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { Target } from "./operations"
+import { SimulatedAutopilot } from "./simulator"
+import { simulatedLog } from "./simlogs"
+import { DfDecoder } from "./dataflash"
+import { crc32Of } from "./crc32"
+import { LogInfo, LogProtocolClient, LogProtocolError, LogProtocolOptions, LogSink } from "./logprotocol"
+import { LogData, LogRequestList } from "./dialects/common"
+
+const VEHICLE: Target = { system: 1, component: 1 }
+const FAST: LogProtocolOptions = { timeoutMs: 300, retries: 2, silenceMs: 40 }
+
+class Rig {
+  public readonly gcs: MavLinkConnection
+  public readonly sim: SimulatedAutopilot
+
+  constructor(gcs: MavLinkConnection, sim: SimulatedAutopilot) {
+    this.gcs = gcs
+    this.sim = sim
+  }
+}
+
+/// A simulated vehicle that is not started (so it stays disarmed and sends no telemetry) with `count` logs of 400 messages.
+function rig(count: int = 2): Rig {
+  const ends = MemoryStream.pair()
+  const gcs = new MavLinkConnection(ends[0])
+  const sim = new SimulatedAutopilot(ends[1])
+  gcs.run()
+  sim.conn.run()
+  for (let i = 1; i <= count; i++) {
+    sim.addLog(i, simulatedLog(400 * i, i), 1700000000 + i * 3600)
+  }
+  new Rig(gcs, sim)
+}
+
+/// The bytes written, in order.
+class MemorySink implements LogSink {
+  public bytes: Uint8Array = new Uint8Array(0)
+  public writes: int = 0
+
+  public async write(chunk: Uint8Array): Promise<void> throws Error {
+    const joined = new Uint8Array(bytes.length + chunk.length)
+    joined.setAll(bytes, 0)
+    joined.setAll(chunk, bytes.length)
+    bytes = joined
+    writes += 1
+  }
+}
+
+function logOf(r: Rig, id: int): Uint8Array {
+  r.sim.fsFiles.get(`/logs/0000000${id}.BIN`) ?? new Uint8Array(0)
+}
+
+function same(a: Uint8Array, b: Uint8Array): bool {
+  if (a.length != b.length) {
+    return false
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false
+    }
+  }
+  true
+}
+
+function client(r: Rig, options: LogProtocolOptions = FAST): LogProtocolClient {
+  new LogProtocolClient(r.gcs, VEHICLE, options)
+}
+
+/// The code a call fails with, or "".
+async function listFails(c: LogProtocolClient): Promise<string> {
+  try {
+    await c.list()
+  } catch (e: LogProtocolError) {
+    return e.code
+  }
+  ""
+}
+
+async function downloadFails(c: LogProtocolClient, id: int, sink: LogSink, size: int): Promise<string> {
+  try {
+    await c.download(id, sink, 0, 0, size)
+  } catch (e: LogProtocolError) {
+    return e.code
+  }
+  ""
+}
+
+async function eraseFails(c: LogProtocolClient): Promise<string> {
+  try {
+    await c.erase()
+  } catch (e: LogProtocolError) {
+    return e.code
+  }
+  ""
+}
+
+async function listsTheLogsWithTheirSizesAndTimes(): Promise<void> throws Error {
+  const r = rig(3)
+  const logs = await client(r).list()
+
+  expect(logs.length).toBe(3)
+  expect(logs.map((l) => `${l.id}:${l.size}:${l.timeUtc}`).join(" ")).toBe(
+    `1:${logOf(r, 1).length}:1700003600 2:${logOf(r, 2).length}:1700007200 3:${logOf(r, 3).length}:1700010800`,
+  )
+  r.sim.stop()
+}
+
+async function listsNothingForAVehicleWithNoLogs(): Promise<void> throws Error {
+  const r = rig(0)
+  const logs = await client(r).list()
+
+  // One LOG_ENTRY with id 0 and no logs, as ArduPilot answers: an empty list.
+  expect(logs.length).toBe(0)
+  expect(r.sim.logs.sentEntries).toBe(1)
+  r.sim.stop()
+}
+
+async function listsAllTheLogsThoughEntriesAreLost(): Promise<void> throws Error {
+  const r = rig(8)
+  r.sim.logs.loss = 40
+  const logs = await client(r, { timeoutMs: 300, retries: 15, silenceMs: 40 }).list()
+
+  expect(logs.length).toBe(8)
+  expect(logs[7].id).toBe(8)
+  r.sim.stop()
+}
+
+async function downloadsALogIdenticalToTheLog(): Promise<void> throws Error {
+  const r = rig(2)
+  const sink = new MemorySink()
+  const seen: int[] = []
+  const done = await client(r).download(2, sink, 0, 0, logOf(r, 2).length, (bytes: int, _total: int) => { seen.push(bytes) })
+
+  expect(same(sink.bytes, logOf(r, 2))).toBe(true)
+  expect(done.size).toBe(logOf(r, 2).length)
+  expect(done.crc).toBe(crc32Of(logOf(r, 2)))
+  // The protocol has no CRC: a download is never verified, and says why.
+  expect(done.verified).toBe(false)
+  expect(done.crcError.includes("no CRC")).toBe(true)
+  expect(done.rounds).toBe(1)
+  // Progress only goes forward and ends at the size.
+  expect(seen[seen.length - 1]).toBe(logOf(r, 2).length)
+  let forward = true
+  for (let i = 1; i < seen.length; i++) {
+    forward = forward && seen[i] > seen[i - 1]
+  }
+  expect(forward).toBe(true)
+  // And what it holds is a log: the DataFlash reader reads every message in it.
+  const d = new DfDecoder()
+  d.push(sink.bytes)
+  let n = 0
+  while (d.next() != null) {
+    n += 1
+  }
+  expect(n > 800).toBe(true)
+  expect(d.problems.count).toBe(0)
+  r.sim.stop()
+}
+
+async function aLogThatIsAMultipleOfNinetyEndsWhereTheListingSays(): Promise<void> throws Error {
+  const r = rig(1)
+  // 90 * 50 bytes: there is no short packet, the transfer just ends (ArduPilot lines 342-344).
+  const exact = new Uint8Array(4500)
+  for (let i = 0; i < exact.length; i++) {
+    exact.set(i, (i * 7) % 251)
+  }
+  r.sim.addLog(1, exact)
+  const sink = new MemorySink()
+  // A silence of 5 s: the end is not waited for (the size says where it is), so the download does not take it.
+  const done = await client(r, { timeoutMs: 1000, retries: 2, silenceMs: 5000 }).download(1, sink, 0, 0, 4500)
+
+  expect(same(sink.bytes, exact)).toBe(true)
+  expect(done.size).toBe(4500)
+  expect(done.elapsedMs < 2000).toBe(true)
+  r.sim.stop()
+}
+
+async function fillsTheGapsThatLostPacketsLeave(): Promise<void> throws Error {
+  const r = rig(2)
+  r.sim.logs.loss = 15
+  const sink = new MemorySink()
+  const done = await client(r, { timeoutMs: 400, retries: 12, silenceMs: 40 }).download(2, sink, 0, 0, logOf(r, 2).length)
+
+  expect(same(sink.bytes, logOf(r, 2))).toBe(true)
+  expect(done.rounds > 1).toBe(true)
+  expect(done.crc).toBe(crc32Of(logOf(r, 2)))
+  r.sim.stop()
+}
+
+async function fillsOneDroppedPacket(): Promise<void> throws Error {
+  const r = rig(2)
+  r.sim.logs.dropOnce = 90 * 30
+  const sink = new MemorySink()
+  const done = await client(r).download(2, sink, 0, 0, logOf(r, 2).length)
+
+  expect(same(sink.bytes, logOf(r, 2))).toBe(true)
+  expect(done.rounds).toBe(2)
+  // The second request began at the packet that was missing, not at the start.
+  expect(r.sim.logs.log.filter((l) => l.startsWith("data")).map((l) => l.split(" ")[2]).join(",")).toBe(`ofs=0,ofs=${90 * 30}`)
+  r.sim.stop()
+}
+
+async function goesOnWhereATransferStalls(): Promise<void> throws Error {
+  const r = rig(2)
+  r.sim.logs.stallAfter = 25
+  const sink = new MemorySink()
+  const done = await client(r, { timeoutMs: 400, retries: 5, silenceMs: 40 }).download(2, sink, 0, 0, logOf(r, 2).length)
+
+  expect(same(sink.bytes, logOf(r, 2))).toBe(true)
+  expect(done.rounds > 3).toBe(true)
+  r.sim.stop()
+}
+
+async function resumesFromTheOffsetWithoutRefetchingWhatItHolds(): Promise<void> throws Error {
+  const r = rig(2)
+  const whole = logOf(r, 2)
+  const held = 90 * 40 + 17
+  const sink = new MemorySink()
+  sink.bytes = whole.slice(0, held)
+  const crcAtStart = crc32Of(sink.bytes)
+  const done = await client(r).download(2, sink, held, crcAtStart, whole.length)
+
+  expect(same(sink.bytes, whole)).toBe(true)
+  expect(done.resumedFrom).toBe(held)
+  expect(done.crc).toBe(crc32Of(whole))
+  // It asked for the log from the offset on, once, and the vehicle sent only what was missing.
+  expect(r.sim.logs.log.filter((l) => l.startsWith("data"))[0]).toBe(`data id=2 ofs=${held} count=${whole.length - held}`)
+  const expected = (whole.length - held + 89) / 90
+  expect(r.sim.logs.sentData).toBe(expected)
+  r.sim.stop()
+}
+
+async function aCancelKeepsWhatCameInOrderAndTheNextOneGoesOn(): Promise<void> throws Error {
+  const r = rig(2)
+  r.sim.logs.perPump = 5
+  r.sim.logs.pumpMs = 10
+  const stop = new AbortController()
+  const sink = new MemorySink()
+  const first = client(r, { timeoutMs: 400, retries: 2, silenceMs: 40, signal: stop.signal })
+  const run = first.download(2, sink, 0, 0, logOf(r, 2).length, (bytes: int, _total: int) => {
+    if (bytes > 2000) {
+      stop.abort()
+    }
+  })
+  let code = ""
+  try {
+    await run
+  } catch (e: LogProtocolError) {
+    code = e.code
+  }
+
+  expect(code).toBe("LOG_ABORTED")
+  // What is held is a prefix of the log: whole packets, in order.
+  expect(sink.bytes.length >= 2000).toBe(true)
+  expect(same(sink.bytes, logOf(r, 2).slice(0, sink.bytes.length))).toBe(true)
+  // A second download goes on from it, and the vehicle was told to stop (it takes the next request).
+  r.sim.logs.perPump = 40
+  const held = sink.bytes.length
+  const done = await client(r).download(2, sink, held, crc32Of(sink.bytes), logOf(r, 2).length)
+  expect(same(sink.bytes, logOf(r, 2))).toBe(true)
+  expect(done.resumedFrom).toBe(held)
+  r.sim.stop()
+}
+
+async function refusesALogOfAnotherSizeThanExpected(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const code = await downloadFails(client(r), 1, sink, logOf(r, 1).length + 500)
+
+  expect(code).toBe("LOG_SIZE")
+  r.sim.stop()
+}
+
+async function aLogThatIsNotThereGivesNothingAndIsATimeout(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const code = await downloadFails(client(r, { timeoutMs: 100, retries: 1, silenceMs: 30 }), 9, sink, 1000)
+
+  expect(code).toBe("LOG_TIMEOUT")
+  expect(sink.bytes.length).toBe(0)
+  expect(r.sim.logs.sentData).toBe(0)
+  r.sim.stop()
+}
+
+async function theVehicleIgnoresEverythingWhileArmed(): Promise<void> throws Error {
+  const r = rig(2)
+  // The simulated vehicle arms at its third tick.
+  r.sim.ticks = 3
+  const code = await listFails(client(r, { timeoutMs: 100, retries: 1, silenceMs: 30 }))
+  expect(code).toBe("LOG_TIMEOUT")
+  expect(r.sim.logs.sentEntries).toBe(0)
+  const sink = new MemorySink()
+  const data = await downloadFails(client(r, { timeoutMs: 100, retries: 1, silenceMs: 30 }), 1, sink, logOf(r, 1).length)
+  expect(data).toBe("LOG_TIMEOUT")
+  expect(r.sim.logs.sentData).toBe(0)
+  r.sim.stop()
+}
+
+async function theVehicleSendsNothingToAGroundStationThatSendsNoHeartbeat(): Promise<void> throws Error {
+  const r = rig(2)
+  // A request by hand, with no heartbeat before it: ArduPilot waits for one (3 s).
+  const m = new LogRequestList()
+  m.targetSystem = 1
+  m.targetComponent = 1
+  m.end = 0xFFFF
+  await r.gcs.send(m)
+  await delay(100)
+  expect(r.sim.logs.sentEntries).toBe(0)
+  // The client sends its heartbeat first, and is answered.
+  expect((await client(r).list()).length).toBe(2)
+  r.sim.stop()
+}
+
+async function erasesAllTheLogsAndSaysHowManyAreLeft(): Promise<void> throws Error {
+  const r = rig(3)
+  const left = await client(r, { timeoutMs: 200, retries: 2, silenceMs: 40 }).erase()
+
+  expect(left).toBe(0)
+  expect(r.sim.logs.paths().length).toBe(0)
+  r.sim.stop()
+}
+
+async function anEraseThatIsIgnoredWhileArmedLeavesTheLogsAndSaysSo(): Promise<void> throws Error {
+  const r = rig(3)
+  r.sim.ticks = 3
+  const code = await eraseFails(client(r, { timeoutMs: 100, retries: 1, silenceMs: 30 }))
+
+  // The vehicle answers nothing while armed (not even a list): the logs are all still there.
+  expect(code).toBe("LOG_TIMEOUT")
+  expect(r.sim.logs.paths().length).toBe(3)
+  r.sim.stop()
+}
+
+/// A LOG_DATA as a vehicle sends it, whatever it holds.
+function logData(id: int, ofs: int, count: int): LogData {
+  const p = new LogData()
+  p.id = id as u16
+  p.ofs = ofs as u32
+  p.count = count as u8
+  for (let i = 0; i < 90; i++) {
+    p.data.push((i + 1) as u8)
+  }
+  p
+}
+
+/// Starts a download of log 1 from a vehicle that says nothing itself, sends what `packets` are, and gives the code it ends with.
+async function downloadWhileSent(r: Rig, packets: LogData[], size: int, sink: LogSink): Promise<string> throws Error {
+  r.sim.logs.silent = true
+  const code = downloadFails(client(r, { timeoutMs: 400, retries: 1, silenceMs: 60 }), 1, sink, size)
+  await delay(40)
+  for (const p of packets) {
+    await r.sim.conn.send(p)
+  }
+  await code
+}
+
+async function refusesALogDataOfMoreThanNinetyBytes(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const code = await downloadWhileSent(r, [logData(1, 0, 255)], 4000, sink)
+
+  expect(code).toBe("LOG_PROTOCOL")
+  expect(sink.bytes.length).toBe(0)
+  r.sim.stop()
+}
+
+async function refusesAnOffsetOutsideTheRequest(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const code = await downloadWhileSent(r, [logData(1, 2147483648, 90)], 4000, sink)
+
+  expect(code).toBe("LOG_PROTOCOL")
+  expect(sink.bytes.length).toBe(0)
+  const past = new MemorySink()
+  expect(await downloadWhileSent(r, [logData(1, 3990, 90)], 4000, past)).toBe("LOG_PROTOCOL")
+  r.sim.stop()
+}
+
+async function dropsDuplicatesAndKeepsNothingFarAhead(): Promise<void> throws Error {
+  const r = rig(1)
+  const sink = new MemorySink()
+  const packets: LogData[] = []
+  // The first packet over and over (once it is in order it is below the front, and dropped), and a thousand far ahead.
+  for (let i = 0; i < 500; i++) {
+    packets.push(logData(1, 0, 90))
+  }
+  for (let i = 0; i < 1000; i++) {
+    packets.push(logData(1, 5_000_000 + i * 90, 90))
+  }
+  // No size: nothing says where the log ends, so what is far ahead is dropped, not kept and not an error.
+  const code = await downloadWhileSent(r, packets, -1, sink)
+
+  expect(code).toBe("LOG_TIMEOUT")
+  expect(sink.bytes.length).toBe(90)
+  expect(sink.writes).toBe(1)
+  r.sim.stop()
+}
+
+async function refusesOffsetsAndSizesPastThirtyTwoBits(): Promise<void> throws Error {
+  const r = rig(1)
+  const c = client(r)
+  const sink = new MemorySink()
+  let code = ""
+  try {
+    await c.download(1, sink, 4294967296)
+  } catch (e: LogProtocolError) {
+    code = e.code
+  }
+  expect(code).toBe("LOG_RANGE")
+  code = await downloadFails(c, 1, sink, 4294967296)
+  expect(code).toBe("LOG_RANGE")
+  expect(r.sim.logs.log.length).toBe(0)
+  r.sim.stop()
+}
+
+async function anEraseThatIsVetoedSendsNothing(): Promise<void> throws Error {
+  const r = rig(3)
+  const seen = [0]
+  let code = ""
+  try {
+    await client(r).erase((logs: LogInfo[]) => {
+      seen[0] = logs.length
+      true
+    })
+  } catch (e: LogProtocolError) {
+    code = e.code
+  }
+
+  expect(code).toBe("LOG_VETOED")
+  expect(seen[0]).toBe(3)
+  expect(r.sim.logs.paths().length).toBe(3)
+  const left = await client(r).erase((_logs: LogInfo[]) => false)
+  expect(left).toBe(0)
+  r.sim.stop()
+}
+
+async function aCorruptLinkIsNotCaughtByTheProtocol(): Promise<void> throws Error {
+  const r = rig(1)
+  r.sim.logs.corrupt = true
+  const sink = new MemorySink()
+  const done = await client(r).download(1, sink, 0, 0, logOf(r, 1).length)
+
+  // Same size, other bytes: the protocol has no CRC, so it cannot know. That is why `verified` is false, always.
+  expect(done.size).toBe(logOf(r, 1).length)
+  expect(same(sink.bytes, logOf(r, 1))).toBe(false)
+  expect(done.verified).toBe(false)
+  r.sim.stop()
+}
+
+describe("the MAVLink log protocol", () => {
+  it("lists the logs with their sizes and times", listsTheLogsWithTheirSizesAndTimes)
+  it("lists nothing for a vehicle with no logs (its one entry has id 0)", listsNothingForAVehicleWithNoLogs)
+  it("lists every log though entries are lost", listsAllTheLogsThoughEntriesAreLost)
+  it("downloads a log identical to the log, never verified, in order, with progress", downloadsALogIdenticalToTheLog)
+  it("ends a log whose size is a multiple of 90 where the listing says", aLogThatIsAMultipleOfNinetyEndsWhereTheListingSays)
+  it("fills the gaps that lost packets leave and gives identical bytes", fillsTheGapsThatLostPacketsLeave)
+  it("asks again from the packet that was missing, not from the start", fillsOneDroppedPacket)
+  it("goes on where a transfer stalls", goesOnWhereATransferStalls)
+  it("resumes from a byte offset and does not refetch what it holds", resumesFromTheOffsetWithoutRefetchingWhatItHolds)
+  it("keeps what came in order on a cancel, and the next download goes on from it", aCancelKeepsWhatCameInOrderAndTheNextOneGoesOn)
+  it("refuses a log of another size than expected", refusesALogOfAnotherSizeThanExpected)
+  it("gets nothing for a log that is not there, and says timeout", aLogThatIsNotThereGivesNothingAndIsATimeout)
+  it("gets nothing while the vehicle is armed (it ignores every request)", theVehicleIgnoresEverythingWhileArmed)
+  it("is not answered without the ground station's heartbeat, and sends one", theVehicleSendsNothingToAGroundStationThatSendsNoHeartbeat)
+  it("erases all the logs and says how many are left", erasesAllTheLogsAndSaysHowManyAreLeft)
+  it("leaves the logs and says so when the erase is ignored while armed", anEraseThatIsIgnoredWhileArmedLeavesTheLogsAndSaysSo)
+  it("refuses a LOG_DATA of more than 90 bytes", refusesALogDataOfMoreThanNinetyBytes)
+  it("refuses a LOG_DATA outside what was asked for", refusesAnOffsetOutsideTheRequest)
+  it("drops duplicates and what is far ahead, keeping no more than a window", dropsDuplicatesAndKeepsNothingFarAhead)
+  it("refuses an offset or a size past 32 bits", refusesOffsetsAndSizesPastThirtyTwoBits)
+  it("sends no LOG_ERASE when the check says no, and gives it the list", anEraseThatIsVetoedSendsNothing)
+  it("does not catch a corrupt link: no CRC, so never verified", aCorruptLinkIsNotCaughtByTheProtocol)
+})
