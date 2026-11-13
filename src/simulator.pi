@@ -16,6 +16,7 @@ import { PackedParam, ParamPackError, encodeParamPack } from "./parampack"
 import { Crc32 } from "./crc32"
 import { FTP_MAX_DATA, FtpError, FtpNack, FtpOpcode, FtpPacket, ftpMessage, ftpPacketOf } from "./ftp"
 import { ByteStream } from "./stream"
+import { SimLogs } from "./simlogs"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
 import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
@@ -188,6 +189,9 @@ export class SimulatedAutopilot {
   readonly ftpSessions: Map<int, FtpSession> = new Map<int, FtpSession>()
   ftpSeed: int = 4242
   readonly ftpCache: Map<string, FtpCached> = new Map<string, FtpCached>()
+  /// The MAVLink log protocol (LOG_REQUEST_LIST ...) over the same `/logs/NNNNNNNN.BIN` files as FTP: see simlogs.pi, which has its
+  /// faults (loss, a stall, one packet dropped once, silence, corruption) and the rule that it is ignored while armed.
+  public readonly logs: SimLogs
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -195,7 +199,18 @@ export class SimulatedAutopilot {
     this.bootedAt = Date.now() as int
     this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(sysid, compid) })
     this.params = params
+    this.logs = new SimLogs(conn, fsFiles, fsTimes, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
     conn.on((r: Received) => this.handle(r))
+  }
+
+  /// Puts log `number` (1 and up) in the vehicle's `/logs` directory: what FTP lists and the log protocol serves. `timeUtc` is when it
+  /// was made (seconds since 1970; 0 for none).
+  public addLog(number: int, bytes: Uint8Array, timeUtc: int = 0): void {
+    const path = `/logs/${"00000000".slice(0, 8 - `${number}`.length)}${number}.BIN`
+    fsFiles.set(path, bytes)
+    if (timeUtc > 0) {
+      fsTimes.set(path, timeUtc)
+    }
   }
 
   /// Whether a request with this target is for this vehicle.
@@ -221,6 +236,7 @@ export class SimulatedAutopilot {
   }
 
   public stop(): void {
+    logs.stop()
     clearInterval(timer)
     clearTimeout(downTimer)
     stopTimers()
@@ -333,6 +349,9 @@ export class SimulatedAutopilot {
 
   handle(r: Received): void {
     if (down) {
+      return
+    }
+    if (logs.handle(r)) {
       return
     }
     const m = r.message

@@ -25,6 +25,12 @@ Status: **in development (MV1).**
 - **Done:** `SimulatedAutopilot`, an ArduPilot Copter-like vehicle on the far end of any byte
   stream. It sends heartbeats and telemetry and answers parameter requests, with deterministic
   data, for trying an application without hardware or SITL.
+- **Done:** the MAVLink log protocol (src/logprotocol.pi): `LogProtocolClient` lists the vehicle's logs
+  (`LOG_REQUEST_LIST`/`LOG_ENTRY`, re-asking for entries that were lost), downloads one (`LOG_REQUEST_DATA`/`LOG_DATA`) into a
+  sink with gaps filled, a stall chased, progress, cancellation and resume from a byte offset, and erases all logs (`LOG_ERASE`).
+  The protocol has no CRC, so a download is never "verified"; it sends the ground-station heartbeat ArduPilot needs, and the vehicle
+  ignores every request while armed. `SimulatedAutopilot.logs` (src/simlogs.pi) serves the same `/logs/NNNNNNNN.BIN` files as FTP
+  over this protocol, with loss, stall, a dropped packet, silence and corruption as faults; `simulatedLog` makes a valid DataFlash log.
 - **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte
   big-endian microsecond timestamp and one MAVLink 1 or 2 frame per record). Bounded memory (a chunk and a record), CRC-checked
   against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,

@@ -1,0 +1,507 @@
+// The MAVLink log protocol (LOG_REQUEST_LIST / LOG_ENTRY, LOG_REQUEST_DATA / LOG_DATA, LOG_ERASE, LOG_REQUEST_END): how a flight
+// log is listed, downloaded and erased where MAVLink FTP is not there (a small board, `BRD_OPTIONS` bit 1) or fails. It is slower
+// than FTP (90 bytes in a packet) and weaker: there is NO CRC to check a log against, so a download by this protocol is checked by
+// its size only and is never `verified`; and erasing is ALL the logs at once, there is no way to erase one.
+//
+// What an ArduPilot does (libraries/AP_Logger/AP_Logger_MAVLinkLogTransfer.cpp, ArduPilot master), which this client is built to:
+//  - every request is ignored while the vehicle is armed (it says "Disarm for log download", lines 40-46) and while another transfer
+//    runs on the link (a request for data while one is sending is dropped, 111-120; a listing request too, 72-75);
+//  - it sends only while it has had a heartbeat from the ground station in the last 3 seconds (lines 270 and 307): the client sends
+//    one with every operation, and one a second during it;
+//  - the list: ids run 1 to `num_logs`; LOG_REQUEST_LIST gives `start` and `end` (0 and 0xFFFF for all; start under 1 is 1, end over
+//    the count is the count, 89-94); with no logs it sends ONE LOG_ENTRY with id 0 and num_logs 0 (82-85); every LOG_ENTRY says
+//    `num_logs`, `last_log_num` (the last it will send), the time (0 when it has none) and the size ("may be approximate");
+//  - the data: LOG_REQUEST_DATA(id, ofs, count) is answered with LOG_DATA of at most 90 bytes each, from `ofs`, up to `count` bytes
+//    or the end of the log (144-152, 316-345); a packet with fewer than 90 bytes is the end of the log; a log whose size is a
+//    multiple of 90 has NO short packet (the transfer just ends), so the size of the listing is what says where it ends; an id
+//    that is not a log cancels the transfer with no answer (128-133);
+//  - LOG_REQUEST_END stops a transfer (174-190); LOG_ERASE erases all logs and is not answered (163-169).
+// Packets are lost, so gaps are filled: a round asks for the rest from the first byte missing, after a LOG_REQUEST_END (a transfer
+// that was left running would drop the new request).
+import { delay } from "std/timers"
+import { Crc32 } from "./crc32"
+import { Received } from "./connection"
+import { MavLinkConnection } from "./connection"
+import { MavLinkData } from "./data"
+import { Target } from "./operations"
+import { Heartbeat, MavAutopilot, MavType } from "./dialects/minimal"
+import { LogData, LogEntry, LogErase, LogRequestData, LogRequestEnd, LogRequestList } from "./dialects/common"
+
+/// The most bytes a LOG_DATA carries.
+export const LOG_DATA_BYTES: int = 90
+
+/// Why an operation failed: `LOG_ABORTED` (cancelled), `LOG_TIMEOUT` (nothing came), `LOG_PROTOCOL` (the vehicle contradicts itself, or
+/// cannot be reached), `LOG_SIZE` (the log is not the size that was expected), `LOG_SINK` (the sink failed), `LOG_CALLBACK`, `LOG_BAD_ID`.
+export class LogProtocolError extends Error {
+  public readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.code = code
+  }
+}
+
+/// A log on the vehicle, as a LOG_ENTRY says.
+export class LogInfo {
+  /// The log's id: 1 to the number of logs.
+  public readonly id: int
+  /// Its size in bytes (may be approximate while it is being written).
+  public readonly size: int
+  /// When it began, seconds since 1970; 0 when the vehicle has no time.
+  public readonly timeUtc: int
+
+  constructor(id: int, size: int, timeUtc: int) {
+    this.id = id
+    this.size = size
+    this.timeUtc = timeUtc
+  }
+}
+
+/// A download, and how it went. `verified` is always false: the protocol has no CRC.
+export class LogProtocolDownload {
+  /// The size of the log now in the sink (bytes).
+  public readonly size: int
+  /// Where this download began: the bytes the sink held before it.
+  public readonly resumedFrom: int
+  /// The CRC-32 of the whole log (see `Crc32`), computed here over the bytes written.
+  public readonly crc: int
+  public readonly verified: bool = false
+  public readonly crcError: string = "the MAVLink log protocol has no CRC to check a log against: its size is all that was checked"
+  /// How many requests for data were made, how many LOG_DATA arrived (duplicates included), and how long it took.
+  public readonly rounds: int
+  public readonly packets: int
+  public readonly elapsedMs: int
+
+  constructor(size: int, resumedFrom: int, crc: int, rounds: int, packets: int, elapsedMs: int) {
+    this.size = size
+    this.resumedFrom = resumedFrom
+    this.crc = crc
+    this.rounds = rounds
+    this.packets = packets
+    this.elapsedMs = elapsedMs
+  }
+}
+
+/// Where the bytes of a log go, in order (the same shape as `FileSink` of the FTP download).
+export interface LogSink {
+  write(bytes: Uint8Array): Promise<void, Error>
+}
+
+export struct LogProtocolOptions {
+  /// How long to wait for the first answer to a request (default 1000 ms).
+  timeoutMs?: int
+  /// How many times to ask again when nothing came (default 3).
+  retries?: int
+  /// How long without anything new ends a transfer (default 300 ms).
+  silenceMs?: int
+  /// Cancels the operation that is running: it fails with `LOG_ABORTED`.
+  signal?: AbortSignal
+}
+
+/// Waits `ms` (a timer that cannot fail here).
+async function pause(ms: int): Promise<void> {
+  try {
+    await delay(ms)
+  } catch (e: Error) {
+  }
+}
+
+function clamp(v: int, lo: int, hi: int): int {
+  if (v < lo) lo else if (v > hi) hi else v
+}
+
+/// What has arrived of a log: its packets by offset, and where it ends.
+class Arrived {
+  public readonly id: int
+  public readonly target: Target
+  public readonly chunks: Map<int, Uint8Array> = new Map<int, Uint8Array>()
+  /// Where the log ends: the size expected, or the end of a short packet (-1 until known).
+  public end: int
+  public packets: int = 0
+  /// The top of the farthest packet.
+  public top: int = 0
+  /// When something new last arrived (ms since 1970).
+  public lastNew: int = 0
+  /// Whether this request's transfer is over (a short packet, or the end that was expected).
+  public over: bool = false
+
+  constructor(id: int, target: Target, end: int) {
+    this.id = id
+    this.target = target
+    this.end = end
+  }
+
+  /// Takes a message, if it is a LOG_DATA of this log from this vehicle.
+  public take(r: Received): void {
+    const m = r.message
+    const h = r.packet.header
+    if (!(m instanceof LogData) || m.id as int != id || h.sysid != target.system || (target.component != 0 && h.compid != target.component)) {
+      return
+    }
+    packets += 1
+    const n = m.count as int
+    const ofs = m.ofs as int
+    if (n < LOG_DATA_BYTES) {
+      // The end of the log (or of what is there): even with no bytes.
+      if (end < 0 || ofs + n < end) {
+        end = ofs + n
+      }
+      over = true
+    }
+    if (n > 0 && !chunks.has(ofs)) {
+      const bytes = new Uint8Array(n)
+      for (let i = 0; i < n && i < m.data.length; i++) {
+        bytes.set(i, m.data[i] as int)
+      }
+      chunks.set(ofs, bytes)
+      lastNew = Date.now() as int
+      if (ofs + n > top) {
+        top = ofs + n
+      }
+    }
+  }
+}
+
+/// A download as it flows into the sink: what is written, the CRC of it, where the front is, and the progress callback.
+class Flow {
+  public readonly a: Arrived
+  public readonly sink: LogSink
+  public readonly crc: Crc32
+  public readonly progress: (bytes: int, total: int) => void throws Error
+  public readonly expected: int
+  /// How many bytes of the log the sink holds: the log in order up to here.
+  public front: int
+
+  constructor(a: Arrived, sink: LogSink, crc: Crc32, progress: (bytes: int, total: int) => void throws Error, expected: int, front: int) {
+    this.a = a
+    this.sink = sink
+    this.crc = crc
+    this.progress = progress
+    this.expected = expected
+    this.front = front
+  }
+
+  /// Writes every packet that is next in order, and lets it go; tells the progress.
+  public async flush(): Promise<void> throws LogProtocolError {
+    let at = front
+    while (true) {
+      const c = a.chunks.get(at)
+      if (c == null) {
+        break
+      }
+      try {
+        await sink.write(c!)
+      } catch (e: Error) {
+        throw new LogProtocolError("LOG_SINK", `writing the log: ${e.message}`)
+      }
+      crc.update(c!)
+      a.chunks.delete(at)
+      at += c!.length
+    }
+    if (at != front) {
+      front = at
+      try {
+        const report = progress
+        report(at, if (expected >= 0) expected else a.end)
+      } catch (e: Error) {
+        throw new LogProtocolError("LOG_CALLBACK", `the progress callback failed: ${e.message}`)
+      }
+    }
+  }
+}
+
+/// A client for the log protocol of one vehicle: one operation at a time. `conn.run()` must be running.
+export class LogProtocolClient {
+  public readonly conn: MavLinkConnection
+  public readonly target: Target
+  public readonly timeoutMs: int
+  public readonly retries: int
+  public readonly silenceMs: int
+  public readonly signal: AbortSignal?
+  heartbeatAt: int = 0
+
+  constructor(conn: MavLinkConnection, target: Target, options: LogProtocolOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.timeoutMs = clamp(options.timeoutMs ?? 1000, 1, 3_600_000)
+    this.retries = clamp(options.retries ?? 3, 0, 100)
+    this.silenceMs = clamp(options.silenceMs ?? 300, 1, 3_600_000)
+    this.signal = options.signal
+  }
+
+  public aborted(): bool {
+    signal != null && signal!.aborted
+  }
+
+  /// Sends the ground station's heartbeat when a second has passed since the last (the vehicle sends nothing without one in 3 s).
+  async beat(): Promise<void> throws LogProtocolError {
+    const now = Date.now() as int
+    if (now - heartbeatAt < 1000) {
+      return
+    }
+    heartbeatAt = now
+    const h = new Heartbeat()
+    h.type = MavType.GCS as u8
+    h.autopilot = MavAutopilot.INVALID as u8
+    h.mavlinkVersion = 3
+    await sent(h)
+  }
+
+  /// Sends a message; a link that fails is `LOG_PROTOCOL`.
+  async sent(m: MavLinkData): Promise<void> throws LogProtocolError {
+    try {
+      await conn.send(m)
+    } catch (e: Error) {
+      throw new LogProtocolError("LOG_PROTOCOL", `could not send (${e.message})`)
+    }
+  }
+
+  /// Stops a transfer that may be running on the vehicle (no answer).
+  public async end(): Promise<void> throws LogProtocolError {
+    const m = new LogRequestEnd()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    await sent(m)
+  }
+
+  /// The logs on the vehicle, in order of their ids; none when it has none. An entry that did not arrive is asked for again, up to
+  /// `retries` times.
+  public async list(): Promise<LogInfo[]> throws LogProtocolError {
+    const l = new Listing()
+    const id = conn.on((r: Received) => l.take(r, target))
+    try {
+      await asking(l)
+    } finally {
+      conn.off(id)
+    }
+    const out: LogInfo[] = []
+    for (let i = 1; i <= l.last; i++) {
+      const e = l.got.get(i)
+      if (e != null) {
+        out.push(e!)
+      }
+    }
+    out
+  }
+
+  /// Asks for the list, and again for what is missing, until every entry from 1 to the last is here, or the tries are used.
+  async asking(l: Listing): Promise<void> throws LogProtocolError {
+    let tries = 0
+    while (!l.whole()) {
+      if (aborted()) {
+        throw new LogProtocolError("LOG_ABORTED", "listing the logs: cancelled")
+      }
+      if (tries > retries) {
+        throw new LogProtocolError("LOG_TIMEOUT", `the vehicle's list of logs is not whole after ${tries} requests (${l.got.size} of ${l.last})`)
+      }
+      await beat()
+      const from = l.firstMissing()
+      await request(if (from < 0) 0 else from, 0xFFFF)
+      tries += 1
+      await hear(l)
+    }
+  }
+
+  /// Waits for entries: until the list is whole, or nothing new has come for `silenceMs` (the first one is given `timeoutMs`).
+  async hear(l: Listing): Promise<void> throws LogProtocolError {
+    const began = Date.now() as int
+    l.lastNew = began
+    while (!aborted() && !l.whole()) {
+      const idle = (Date.now() as int) - l.lastNew
+      if (idle >= (if (l.got.size == 0 && l.last < 0) timeoutMs else silenceMs)) {
+        return
+      }
+      await pause(5)
+      await beat()
+    }
+  }
+
+  async request(start: int, endId: int): Promise<void> throws LogProtocolError {
+    const m = new LogRequestList()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    m.start = start as u16
+    m.end = endId as u16
+    await sent(m)
+  }
+
+  /// Downloads log `id` into `sink`, in order, from the byte `startAt` on (the bytes the sink holds already). `expectedSize` is the
+  /// size the listing gave: the log ends there (a log whose size is a multiple of 90 has no packet that says so), and one that ends
+  /// elsewhere is `LOG_SIZE`; -1 trusts the short packet at the end of the log. `crcAtStart` is the CRC-32 of the first `startAt`
+  /// bytes. `progress(bytes, total)` is told how far the log has come in order. `deadlineMs` bounds the whole download (0: none).
+  public async download(
+    id: int,
+    sink: LogSink,
+    startAt: int = 0,
+    crcAtStart: int = 0,
+    expectedSize: int = -1,
+    progress: (bytes: int, total: int) => void throws Error = (_bytes: int, _total: int) => {},
+    deadlineMs: int = 0,
+  ): Promise<LogProtocolDownload> throws LogProtocolError {
+    const started = Date.now() as int
+    if (id < 1 || id > 65535 || startAt < 0) {
+      throw new LogProtocolError("LOG_BAD_ID", `log ${id} from ${startAt}: not a log of the vehicle`)
+    }
+    const a = new Arrived(id, target, expectedSize)
+    const crc = new Crc32(crcAtStart)
+    const flow = new Flow(a, sink, crc, progress, expectedSize, startAt)
+    const counts = [0]
+    const hear = conn.on((r: Received) => a.take(r))
+    try {
+      await rounds(flow, counts, if (deadlineMs > 0) started + deadlineMs else 0)
+    } catch (e: Error) {
+      conn.off(hear)
+      try {
+        await end()
+      } catch (x: LogProtocolError) {
+      }
+      if (e instanceof LogProtocolError) {
+        throw e
+      }
+      throw new LogProtocolError("LOG_PROTOCOL", `downloading log ${id}: ${e.message}`)
+    }
+    conn.off(hear)
+    await end()
+    if (expectedSize >= 0 && flow.front != expectedSize) {
+      throw new LogProtocolError("LOG_SIZE", `log ${id} has ${flow.front} bytes, not the ${expectedSize} that were expected`)
+    }
+    new LogProtocolDownload(flow.front, startAt, crc.crc, counts[0], a.packets, (Date.now() as int) - started)
+  }
+
+  /// Rounds of a request from the first byte missing and the wait for what comes, until the log is whole.
+  async rounds(f: Flow, counts: int[], deadline: int): Promise<void> throws LogProtocolError {
+    const a = f.a
+    let stalls = 0
+    while (!finished(a, f.front)) {
+      if (aborted()) {
+        throw new LogProtocolError("LOG_ABORTED", `log ${a.id}: cancelled`)
+      }
+      if (deadline > 0 && (Date.now() as int) >= deadline) {
+        throw new LogProtocolError("LOG_TIMEOUT", `log ${a.id} is not whole after the time given for it (${f.front} bytes)`)
+      }
+      const before = f.front
+      await transfer(f)
+      counts[0] += 1
+      await f.flush()
+      stalls = if (f.front == before) stalls + 1 else 0
+      if (stalls > retries) {
+        throw new LogProtocolError("LOG_TIMEOUT", `no progress downloading log ${a.id} at ${f.front} after ${stalls} requests`)
+      }
+    }
+  }
+
+  /// Asks for the rest of the log from `from` and waits until the transfer is over (a short packet, the end that was expected, or
+  /// silence), then stops it on the vehicle, so that the next request is not dropped.
+  async transfer(f: Flow): Promise<void> throws LogProtocolError {
+    const a = f.a
+    const from = f.front
+    const expected = f.expected
+    await beat()
+    const m = new LogRequestData()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    m.id = a.id as u16
+    m.ofs = from as u32
+    m.count = (if (expected >= 0 && expected > from) expected - from else 0xFFFFFFFF) as u32
+    a.over = false
+    a.lastNew = Date.now() as int
+    const began = a.lastNew
+    try {
+      await conn.send(m)
+    } catch (e: Error) {
+      throw new LogProtocolError("LOG_PROTOCOL", `could not send (${e.message})`)
+    }
+    // Over when the end is in, or nothing new for `silenceMs` (the first answer is given `timeoutMs`).
+    while (!aborted() && !a.over && !reachedEnd(a, from)) {
+      const idle = (Date.now() as int) - a.lastNew
+      if (idle >= (if (a.top <= from && a.lastNew == began) timeoutMs else silenceMs)) {
+        break
+      }
+      await pause(2)
+      await beat()
+      // What has come in order goes to the sink while the rest is coming (and the progress is told, and a cancel is seen).
+      await f.flush()
+    }
+    await end()
+  }
+
+  /// Whether the packets that arrived reach the end of the log, with nothing missing in between.
+  reachedEnd(a: Arrived, from: int): bool {
+    if (a.end < 0) {
+      return false
+    }
+    let at = from
+    while (at < a.end) {
+      const c = a.chunks.get(at)
+      if (c == null) {
+        return false
+      }
+      at += c!.length
+    }
+    true
+  }
+
+  /// Whether the log is whole: the end is known and the front is there.
+  finished(a: Arrived, front: int): bool {
+    a.end >= 0 && front >= a.end
+  }
+
+  /// Erases ALL the logs on the vehicle (the protocol has no way to erase one; the vehicle does not answer, and ignores it while it
+  /// is armed), and lists again: how many logs it still has. 0 when the erase took.
+  public async erase(): Promise<int> throws LogProtocolError {
+    await beat()
+    const m = new LogErase()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    await sent(m)
+    // The erase takes a moment on a card: asked about until it says none, a few times.
+    let remaining = -1
+    for (let i = 0; i <= retries; i++) {
+      await pause(timeoutMs / 4)
+      remaining = (await list()).length
+      if (remaining == 0 || aborted()) {
+        break
+      }
+    }
+    remaining
+  }
+}
+
+/// What has arrived of the list.
+class Listing {
+  public readonly got: Map<int, LogInfo> = new Map<int, LogInfo>()
+  /// The last id the vehicle will send and how many logs it has (-1 until an entry came).
+  public last: int = -1
+  public count: int = -1
+  public lastNew: int = 0
+
+  /// Takes a message, if it is a LOG_ENTRY from this vehicle.
+  public take(r: Received, target: Target): void {
+    const m = r.message
+    const h = r.packet.header
+    if (!(m instanceof LogEntry) || h.sysid != target.system || (target.component != 0 && h.compid != target.component)) {
+      return
+    }
+    count = m.numLogs as int
+    last = m.lastLogNum as int
+    lastNew = Date.now() as int
+    if (m.id as int >= 1 && !got.has(m.id as int)) {
+      got.set(m.id as int, new LogInfo(m.id as int, m.size as int, m.timeUtc as int))
+    }
+  }
+
+  /// The first id from 1 to the last that has not arrived, or -1.
+  public firstMissing(): int {
+    for (let i = 1; i <= last; i++) {
+      if (!got.has(i)) {
+        return i
+      }
+    }
+    -1
+  }
+
+  /// Whether the list is whole: an entry came, and nothing from 1 to the last is missing (a vehicle with no logs says so in one entry).
+  public whole(): bool {
+    last >= 0 && firstMissing() < 0
+  }
+}

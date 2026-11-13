@@ -21,6 +21,7 @@ import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
 import { FtpClient, FtpEntry, FtpError, hexOf } from "./ftp"
 import { Crc32, crc32Of } from "./crc32"
 import { FileDownload, FileSink, downloadFile } from "./logdownload"
+import { LogProtocolClient, LogSink } from "./logprotocol"
 import { DfDecoder } from "./dataflash"
 import { TLOG_TIMESTAMP_LENGTH, TlogReader, TlogWriter } from "./tlog"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
@@ -312,7 +313,7 @@ async function listsTheFileSystem(): Promise<void> throws Error {
 }
 
 /// A sink in memory.
-class CollectSink implements FileSink {
+class CollectSink implements FileSink, LogSink {
   public readonly parts: Uint8Array[] = []
   public total: int = 0
   /// The CRC-32 of what was written.
@@ -608,9 +609,36 @@ async function writesALogWhereFtpCanSeeIt(): Promise<void> throws Error {
     expect(got!.verified).toBe(true)
     expect(got!.size >= size).toBe(true)
     readsTheRealLog(sink.bytes())
+    await protocolMatchesFtp(s, sink.bytes())
   } finally {
     await s.stop()
   }
+}
+
+/// The same log over the MAVLink log protocol (LOG_REQUEST_LIST / DATA): listed, downloaded whole, and the bytes are those FTP gave
+/// (whose CRC the vehicle checked), as far as both go: the file may have grown between the two downloads, never changed.
+async function protocolMatchesFtp(s: Sitl, viaFtp: Uint8Array): Promise<void> throws Error {
+  const lp = new LogProtocolClient(s.conn, s.target, { timeoutMs: 2000, retries: 4, silenceMs: 500 })
+  const logs = await lp.list()
+  println(`SPIKE log protocol lists ${logs.length} logs`)
+  expect(logs.length >= 1).toBe(true)
+  const first = logs[0]
+  println(`SPIKE log protocol: id ${first.id}, ${first.size} bytes, time ${first.timeUtc}`)
+  const sink = new CollectSink()
+  const got = await lp.download(first.id, sink)
+  println(`SPIKE log protocol downloaded ${got.size} bytes in ${got.elapsedMs} ms, ${got.rounds} rounds, ${got.packets} packets`)
+  expect(got.size >= first.size).toBe(true)
+  const bytes = sink.bytes()
+  const common = if (bytes.length < viaFtp.length) bytes.length else viaFtp.length
+  let differs = -1
+  for (let i = 0; i < common && differs < 0; i++) {
+    if (bytes[i] != viaFtp[i]) {
+      differs = i
+    }
+  }
+  println(`SPIKE log protocol against FTP: ${common} bytes compared, first difference ${differs}`)
+  expect(differs).toBe(-1)
+  readsTheRealLog(bytes)
 }
 
 /// What a tlog holds, as one line: the records by version, the messages by id, and what was skipped or cut.

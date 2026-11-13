@@ -69,6 +69,16 @@ export { FtpFileResult, readFile } from "./src/ftpread"
 export { Crc32, crc32Of } from "./src/crc32"
 export { FileDownload, FileSink, downloadFile } from "./src/logdownload"
 export {
+  LOG_DATA_BYTES,
+  LogInfo,
+  LogProtocolClient,
+  LogProtocolDownload,
+  LogProtocolError,
+  LogProtocolOptions,
+  LogSink,
+} from "./src/logprotocol"
+export { SimLogs, simulatedLog } from "./src/simlogs"
+export {
   DF_FMT_LENGTH,
   DF_FMT_TYPE,
   DF_MAX_MESSAGE,
