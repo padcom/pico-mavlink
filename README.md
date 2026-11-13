@@ -35,7 +35,8 @@ Status: **in development (MV1).**
   `AccelCalKind`: full, level, simple, accept) and RC-flag (`rcCalibrating`) calibrations with `MAV_CMD_PREFLIGHT_CALIBRATION`. In the full
   accelerometer calibration the vehicle asks the ground station, by a `COMMAND_LONG` of its own (`ACCELCAL_VEHICLE_POS`, repeated every
   second), to place it level, left, right, nose down, nose up and on its back, and ends with a success or failure code: `prompt` receives
-  the next request, `confirm` answers it, `run` does the whole walk. There is no cancel in the protocol. `SimulatedAutopilot.calibration`
+  the next request, `confirm` answers it, `run` does the whole walk. A command that calibrates is sent once and its ack waited for
+  (30 s), never sent again; `rcCalibration(work)` sets the RC flag and clears it however `work` ends. There is no cancel in the protocol. `SimulatedAutopilot.calibration`
   (src/simcal.pi) does the vehicle's side, with a failure at a chosen position, a failed gyro and silence as faults; it refuses while armed.
   The compass flow and `RC_CHANNELS` come next.
 - **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte

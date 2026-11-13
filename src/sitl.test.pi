@@ -16,6 +16,7 @@ import { TcpStream } from "./stream"
 import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
 import { Heartbeat } from "./dialects/minimal"
 import { MavCmd, MavParamType, MavResult, RequestDataStream, StatusText } from "./dialects/common"
+import { AccelCalKind, Calibration } from "./accelcal"
 import { GlobalPositionInt } from "./dialects/standard"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
 import { FtpClient, FtpEntry, FtpError, hexOf } from "./ftp"
@@ -780,6 +781,96 @@ async function readsARecordingAnotherProgramWrote(): Promise<void> throws Error 
   }
 }
 
+/// Whether the calibration tests run: they need a SITL (a minute to start) and, for the armed one, a flight, so with `SITL_FLIGHT=1`.
+/// They have not been run against a SITL by their author (none was at hand): what they claim is what the ArduPilot source says.
+function calibrationTestsRun(): bool {
+  const flight = env.get("SITL_FLIGHT")
+  if (flight == null || flight! != "1") {
+    println("SITL calibration test skipped: set SITL_FLIGHT=1 to run it")
+    return false
+  }
+  true
+}
+
+/// The full accelerometer calibration against ArduCopter: it asks for the six positions in order, one after the other, and ends with
+/// a result. SITL's accelerometer is not moved between the positions, so the result may well be a failure (the samples do not
+/// fit); the prompts and the answers are what is checked.
+async function calibratesTheAccelerometerInSixPositions(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    const cal = new Calibration(s.conn, s.target, { timeoutMs: 2000 }, 30_000)
+    const result = await cal.run((_p: int) => true, 30_000)
+    println(`SITL accel calibration: ok ${result.ok}, reason "${result.reason}", positions ${result.positions.join(",")}`)
+    expect(result.result).toBe(MavResult.ACCEPTED)
+    expect(result.positions.join(",")).toBe("1,2,3,4,5,6")
+    expect(result.ok || result.reason == "failed").toBe(true)
+  } finally {
+    await s.stop()
+  }
+}
+
+/// The level calibration and the gyro calibration are answered by one command each.
+async function calibratesTheLevelAndTheGyro(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    const cal = new Calibration(s.conn, s.target, { timeoutMs: 2000 }, 30_000)
+    expect(await cal.gyro()).toBe(MavResult.ACCEPTED)
+    expect(await cal.startAccel(AccelCalKind.LEVEL)).toBe(MavResult.ACCEPTED)
+    // the RC flag is noted, and ArduPilot answers UNSUPPORTED to a command that carries only it
+    expect(await cal.rcCalibrating(true)).toBe(MavResult.UNSUPPORTED)
+    expect(await cal.rcCalibrating(false)).toBe(MavResult.UNSUPPORTED)
+  } finally {
+    await s.stop()
+  }
+}
+
+/// An armed vehicle refuses a calibration: FAILED, and "Disarm to allow calibration".
+async function refusesToCalibrateWhileArmed(): Promise<void> throws Error {
+  if (!calibrationTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  const deadline = (Date.now() as int) + FLIGHT_BUDGET_MS
+  try {
+    const f = watchFlight(s)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    let armed = false
+    for (let i = 0; i < 90 && !armed && (Date.now() as int) < deadline; i++) {
+      const mode = await cmd.run(MavCmd.DO_SET_MODE, [1.0, 4.0])
+      const res = if (mode == MavResult.ACCEPTED) await cmd.run(MavCmd.COMPONENT_ARM_DISARM, [1.0]) else mode
+      armed = res == MavResult.ACCEPTED && await until(() => f.armed, 3, deadline)
+      if (!armed) {
+        await delay(1000)
+      }
+    }
+    expect(armed).toBe(true)
+    const cal = new Calibration(s.conn, s.target, { timeoutMs: 2000 }, 30_000)
+    expect(await cal.startAccel(AccelCalKind.FULL)).toBe(MavResult.FAILED)
+    expect(await cal.gyro()).toBe(MavResult.FAILED)
+    expect(f.texts.indexOf("Disarm to allow calibration") >= 0).toBe(true)
+  } finally {
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
   it("writes a log that FTP can see: where, when, and what it looks like (the spike; SITL_FLIGHT=1)", writesALogWhereFtpCanSeeIt)
   it("downloads a file by FTP, in order, and the vehicle's CRC-32 is ours; going on from the middle gives the same file", downloadsAFileAndMatchesItsCrc)
@@ -788,4 +879,7 @@ describe("ArduCopter SITL", () => {
   it("lists its file system, with a time where it has one", listsTheFileSystem)
   it("gives the whole parameter list by file transfer in under 2 s, the same as the list", ftpGivesTheListFastAndTheSame)
   it("falls back to the list when FTP is disabled by BRD_OPTIONS", disabledFtpFallsBackToTheList)
+  it("calibrates the accelerometer: six prompts in order, answered, and a result (SITL_FLIGHT=1)", calibratesTheAccelerometerInSixPositions)
+  it("calibrates the gyro and the level, and notes the RC flag (SITL_FLIGHT=1)", calibratesTheLevelAndTheGyro)
+  it("refuses to calibrate while armed (SITL_FLIGHT=1)", refusesToCalibrateWhileArmed)
 })

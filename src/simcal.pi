@@ -4,14 +4,14 @@
 //    command with param4 only sets the RC calibration flag and is answered UNSUPPORTED, as ArduPilot answers it.
 //  - The full calibration asks for the six positions with a COMMAND_LONG of MAV_CMD_ACCELCAL_VEHICLE_POS to everyone, again every
 //    `repeatMs` until the position is answered with the same command (acked ACCEPTED; FAILED when it is not the position that is
-//    asked for), which takes the sample, says so in STATUSTEXT and asks for the next. After the sixth it says "Calibration successful"
+//    asked for, or `rejectPositions`), which takes the sample, says so in STATUSTEXT and asks for the next. After the sixth it says "Calibration successful"
 //    and sends 16777215 (16777216 for a failure) every `repeatMs`, until the next calibration starts.
 // Faults for tests: `failAt` (the position at which the calibration fails, 0 for none), `gyroFails` (the gyro calibration is answered FAILED: the vehicle was
 // moved), `silent` (the full calibration is accepted and the vehicle never asks for a position).
 import { MavLinkConnection, Received } from "./connection"
 import { CommandAck, CommandLong, MavCmd, MavResult, MavSeverity, StatusText } from "./dialects/common"
 import { MavCmd as ApmCmd } from "./dialects/ardupilotmega"
-import { AccelPosition } from "./accelcal"
+import { AccelPosition, wholeNumber } from "./accelcal"
 
 /// The calibration commands of the simulated autopilot.
 export class SimCalibration {
@@ -23,6 +23,14 @@ export class SimCalibration {
   public failAt: int = 0
   public gyroFails: bool = false
   public silent: bool = false
+  /// The vehicle does not accept the answers for a position (it acks them FAILED and does not go on).
+  public rejectPositions: bool = false
+  /// How long the vehicle takes to ack a command that calibrates (ms): ArduPilot calibrates inside the command and acks after.
+  public ackDelayMs: int = 0
+  /// How many of the next PREFLIGHT_CALIBRATION commands are carried out and not acked (an ack lost on the link).
+  public swallowAcks: int = 0
+  /// How many PREFLIGHT_CALIBRATION commands came (a command sent again is counted again).
+  public preflightCommands: int = 0
   /// What the vehicle was asked, and what it did.
   public gyroRuns: int = 0
   public accelRuns: int = 0
@@ -73,7 +81,7 @@ export class SimCalibration {
     }
     if (m.command as int == ApmCmd.ACCELCAL_VEHICLE_POS) {
       if (mine(m.targetSystem as int, m.targetComponent as int)) {
-        position(m._param1 as int)
+        position(wholeNumber(m._param1 as f64))
       }
       return true
     }
@@ -87,6 +95,17 @@ export class SimCalibration {
     conn.send(a)
   }
 
+  /// The ack of a command that calibrates: late when `ackDelayMs` says so, never when it is to be swallowed.
+  answer(command: int, result: int): void {
+    if (swallowAcks > 0) {
+      swallowAcks -= 1
+    } else if (ackDelayMs > 0) {
+      const _timer = setTimeout(() => this.ack(command, result), ackDelayMs)
+    } else {
+      ack(command, result)
+    }
+  }
+
   say(text: string): void {
     const s = new StatusText()
     s.severity = MavSeverity.INFO as u8
@@ -96,31 +115,32 @@ export class SimCalibration {
 
   preflight(m: CommandLong): void {
     const command = m.command as int
+    preflightCommands += 1
     if (isArmed()) {
       say("Disarm to allow calibration")
-      ack(command, MavResult.FAILED)
+      answer(command, MavResult.FAILED)
       return
     }
     rcCalibrating = m._param4 as f64 > 0.0
-    if (m._param1 as int == 1) {
+    if (wholeNumber(m._param1 as f64) == 1) {
       gyroRuns += 1
-      ack(command, if (gyroFails) MavResult.FAILED else MavResult.ACCEPTED)
+      answer(command, if (gyroFails) MavResult.FAILED else MavResult.ACCEPTED)
       return
     }
-    const kind = m._param5 as int
+    const kind = wholeNumber(m._param5 as f64)
     if (kind == 1) {
       gyroRuns += 1
       accelRuns += 1
-      ack(command, MavResult.ACCEPTED)
+      answer(command, MavResult.ACCEPTED)
       beginFull()
     } else if (kind == 2) {
       levelRuns += 1
-      ack(command, MavResult.ACCEPTED)
+      answer(command, MavResult.ACCEPTED)
     } else if (kind == 4) {
       simpleRuns += 1
-      ack(command, MavResult.ACCEPTED)
+      answer(command, MavResult.ACCEPTED)
     } else {
-      ack(command, MavResult.UNSUPPORTED)
+      answer(command, MavResult.UNSUPPORTED)
     }
   }
 
@@ -153,7 +173,7 @@ export class SimCalibration {
 
   /// The ground station says the vehicle is in `p`.
   position(p: int): void {
-    if (waiting == 0 || p != waiting) {
+    if (waiting == 0 || p != waiting || rejectPositions) {
       ack(ApmCmd.ACCELCAL_VEHICLE_POS, MavResult.FAILED)
       return
     }

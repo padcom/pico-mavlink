@@ -4,6 +4,9 @@
 //    positions (it calibrates the gyros first); 2: the level (trim) of the vehicle; 4: the simple, one-position accelerometer
 //    calibration; 76: accept the calibration the vehicle has as valid. param4 > 0 tells the vehicle the RC calibration has begun,
 //    0 that it ended. A vehicle that is armed answers FAILED ("Disarm to allow calibration").
+//  - The vehicle calibrates INSIDE the command (the gyro: seconds, with the vehicle still) and acks after it, so the command is sent
+//    ONCE and its ack waited for (30 s by default, `ackMs`): a command sent again restarts the calibration, or is answered
+//    TEMPORARILY_REJECTED. A timeout is a `TIMEOUT` MavLinkError, and says nothing about what the vehicle did.
 //  - The full accelerometer calibration is the vehicle asking the ground station, by a COMMAND_LONG of its own (MAV_CMD_ACCELCAL_VEHICLE_POS,
 //    42429, addressed to everyone) which way to place it: param1 is 1 level, 2 left side, 3 right side, 4 nose down, 5 nose up, 6 on its back, and,
 //    when it is over, 16777215 (success) or 16777216 (failed). It asks again every second until it is answered. The answer is the same
@@ -12,6 +15,8 @@
 //    what it does ("Place vehicle level and press any key.", "Calibration successful", "Calibration FAILED").
 //  - Nothing in the protocol cancels a calibration: the vehicle ends it by itself (a position that does not come, a movement while it
 //    samples), by the result, or by a reboot.
+//  - The RC calibration flag (param4) is the vehicle's: while it is set the vehicle records the extremes of the RC channels. It is set
+//    for the time of the calibration, and `rcCalibration` clears it however that ends.
 import { MavLinkConnection, Received } from "./connection"
 import { MavLinkError } from "./protocol"
 import { CommandLong, MavCmd, MavResult } from "./dialects/common"
@@ -67,18 +72,35 @@ export class AccelPosition {
   }
 }
 
+/// The whole number a parameter of a command from the vehicle holds, or -1 when it holds none: NaN, an infinity, a fraction, or a
+/// number outside 0 .. 2^24 (a float holds whole numbers exactly up to there). A vehicle's float is checked before it is made an integer.
+export function wholeNumber(value: f64): int {
+  if (value != value || value < 0.0 || value > 16777216.0) {
+    return -1
+  }
+  const n = value as int
+  if (n as f64 != value) {
+    return -1
+  }
+  n
+}
+
 /// What a full accelerometer calibration came to.
 export struct AccelCalResult {
   /// Whether the vehicle said it succeeded.
   ok: bool
-  /// The positions it asked for, in order, each once (the vehicle repeats a request until it is answered).
+  /// The positions it asked for, in order (one after the other the same is one: the vehicle repeats a request until it is answered).
   positions: int[]
   /// Why it did not succeed (`""` when it did): `refused` (the vehicle did not take the command; `result` has what it said), `failed` (the
-  /// vehicle said so), `silent` (no request for a position in time), `abandoned` (the caller did not place the vehicle).
+  /// vehicle said so), `silent` (no request for a position in time), `abandoned` (the caller did not place the vehicle), `notaccepted`
+  /// (the vehicle did not accept the answers for a position, three in a row).
   reason: string
   /// The MAV_RESULT of the command that started it.
   result: int
 }
+
+/// How many answers in a row a vehicle may not accept before `run` gives up.
+const NOT_ACCEPTED_LIMIT: int = 3
 
 /// The calibrations the vehicle is asked for with MAV_CMD_PREFLIGHT_CALIBRATION, and the accelerometer calibration that goes on from there.
 /// `conn.run()` must be running.
@@ -86,18 +108,27 @@ export class Calibration {
   readonly conn: MavLinkConnection
   readonly target: Target
   readonly options: ParamOptions
-  readonly calls: CommandCall
+  /// How long a command that calibrates waits for its ack (ms).
+  readonly ackMs: int
+  /// For the commands that are answered at once: sent once.
+  readonly quick: CommandCall
+  /// For the commands that calibrate: sent once, and waited for for `ackMs`.
+  readonly slow: CommandCall
+  /// Whether the last `rcCalibration` could not clear the vehicle's RC calibration flag (it may still be set).
+  public rcFlagStuck: bool = false
 
-  constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
+  constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}, ackMs: int = 30_000) {
     this.conn = conn
     this.target = target
     this.options = options
-    this.calls = new CommandCall(conn, target, options)
+    this.ackMs = ackMs
+    this.quick = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0, signal: options.signal })
+    this.slow = new CommandCall(conn, target, { timeoutMs: ackMs, retries: 0, signal: options.signal })
   }
 
-  /// MAV_RESULT of MAV_CMD_PREFLIGHT_CALIBRATION with `p1` .. `p5` (the rest are zero).
+  /// MAV_RESULT of MAV_CMD_PREFLIGHT_CALIBRATION with `p1` .. `p5` (the rest are zero), sent once and waited for for `ackMs`.
   public async preflight(p1: f64, p2: f64, p3: f64, p4: f64, p5: f64): Promise<int> throws Error {
-    await calls.run(MavCmd.PREFLIGHT_CALIBRATION, [p1, p2, p3, p4, p5])
+    await slow.run(MavCmd.PREFLIGHT_CALIBRATION, [p1, p2, p3, p4, p5])
   }
 
   /// Calibrates the gyroscopes (the vehicle must be still): ACCEPTED when it has, FAILED when it was moved or is armed.
@@ -111,13 +142,50 @@ export class Calibration {
     await preflight(0.0, 0.0, 0.0, 0.0, kind as f64)
   }
 
-  /// Tells the vehicle the RC calibration begins (`true`) or ends. A vehicle that has nothing else to do with the command answers
-  /// UNSUPPORTED (ArduPilot does), though it noted the flag: the answer is not a failure.
+  /// Tells the vehicle the RC calibration begins (`true`) or ends; the vehicle that has nothing else to do with the command answers
+  /// UNSUPPORTED (ArduPilot does), though it noted the flag: the answer is not a failure. Use `rcCalibration` to be sure it ends.
   public async rcCalibrating(on: bool): Promise<int> throws Error {
-    await preflight(0.0, 0.0, 0.0, if (on) 1.0 else 0.0, 0.0)
+    await quick.run(MavCmd.PREFLIGHT_CALIBRATION, [0.0, 0.0, 0.0, if (on) 1.0 else 0.0, 0.0])
   }
 
-  /// The next position the vehicle asks for (`AccelPosition`), or null when it asked for none in `timeoutMs`.
+  /// The RC calibration: the flag is set, `work` runs, and the flag is cleared however that ends: `work` returns, it throws, it is
+  /// aborted (its signal), or the set was not answered (the vehicle may have set it). The clear is sent without the abort signal, and
+  /// again once when it is not answered; if that fails too, `rcFlagStuck` is set. What went wrong in the set or in `work` is thrown
+  /// after the clear; a clear that failed is thrown when nothing else went wrong.
+  public async rcCalibration(work: () => Promise<void, Error>): Promise<void> throws Error {
+    let failure: Error? = null
+    rcFlagStuck = false
+    try {
+      await rcCalibrating(true)
+      await work()
+    } catch (e: Error) {
+      failure = e
+    }
+    const cleared = await clearRcFlag()
+    if (failure != null) {
+      throw failure!
+    }
+    if (!cleared) {
+      throw new MavLinkError("TIMEOUT", "the vehicle did not answer the end of the RC calibration: its flag may still be set")
+    }
+  }
+
+  /// Clears the RC flag, with one more try; whether the vehicle answered.
+  async clearRcFlag(): Promise<bool> {
+    const calls = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0 })
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await calls.run(MavCmd.PREFLIGHT_CALIBRATION, [0.0, 0.0, 0.0, 0.0, 0.0])
+        return true
+      } catch (e: Error) {
+      }
+    }
+    rcFlagStuck = true
+    false
+  }
+
+  /// The next position the vehicle asks for (`AccelPosition`), or null when it asked for none in `timeoutMs`. A request that holds
+  /// no whole number in range (NaN, 1e30) is not one.
   public async prompt(timeoutMs: int): Promise<int?> throws Error {
     const r = await conn.waitFor((r: Received) => isPrompt(r, target), timeoutMs, options.signal)
     if (r == null) {
@@ -125,19 +193,33 @@ export class Calibration {
     }
     const m = r!.message
     if (m instanceof CommandLong) {
-      return m._param1 as int
+      return wholeNumber(m._param1 as f64)
     }
     null
   }
 
-  /// Tells the vehicle it is in `position`; MAV_RESULT (FAILED when the vehicle was not asking for it).
+  /// Tells the vehicle it is in `position`, once; MAV_RESULT (FAILED when the vehicle was not asking for it).
   public async confirm(position: int): Promise<int> throws Error {
-    await calls.run(ApmCmd.ACCELCAL_VEHICLE_POS, [position as f64])
+    await quick.run(ApmCmd.ACCELCAL_VEHICLE_POS, [position as f64])
   }
 
-  /// The whole full calibration: starts it, and for each position the vehicle asks for calls `place` (which returns once the vehicle is in that
-  /// position, `false` for a user who gives up; a caller that has to wait for a person drives `prompt` and `confirm` itself), then answers the vehicle. Ends with the vehicle's result. `waitMs` is how long to wait
-  /// for a request (the vehicle asks every second, and gives up itself after a minute or so with nothing).
+  /// Whether the vehicle accepted `position`: false for any other answer, and for none.
+  async accepted(position: int): Promise<bool> throws Error {
+    try {
+      return await confirm(position) == MavResult.ACCEPTED
+    } catch (e: MavLinkError) {
+      if (e.code == "TIMEOUT") {
+        return false
+      }
+      throw e
+    }
+  }
+
+  /// The whole full calibration: starts it, and for each position the vehicle asks for calls `place` (which returns once the vehicle is
+  /// in that position, `false` for a user who gives up; a caller that has to wait for a person drives `prompt` and `confirm` itself), then
+  /// answers the vehicle. A position is answered once, and taken as answered when the vehicle accepts it; a vehicle that does not accept
+  /// the answers (three in a row) ends it with `notaccepted`. Ends with the vehicle's result. `waitMs` is how long to wait for a request
+  /// (the vehicle asks every second, and gives up itself after a minute or so with nothing).
   public async run(place: (position: int) => bool, waitMs: int = 30_000): Promise<AccelCalResult> throws Error {
     const positions: int[] = []
     const started = await startAccel(AccelCalKind.FULL)
@@ -145,6 +227,7 @@ export class Calibration {
       return { ok: false, positions: positions, reason: "refused", result: started }
     }
     let answered = 0
+    let notAccepted = 0
     while (true) {
       const position = await prompt(waitMs)
       if (position == null) {
@@ -158,22 +241,31 @@ export class Calibration {
       if (!AccelPosition.isPlacement(p) || p == answered) {
         continue
       }
-      positions.push(p)
+      if (positions.length == 0 || positions[positions.length - 1] != p) {
+        positions.push(p)
+      }
       if (!place(p)) {
         return { ok: false, positions: positions, reason: "abandoned", result: started }
       }
-      await confirm(p)
-      answered = p
+      if (await accepted(p)) {
+        answered = p
+        notAccepted = 0
+      } else {
+        notAccepted += 1
+        if (notAccepted >= NOT_ACCEPTED_LIMIT) {
+          return { ok: false, positions: positions, reason: "notaccepted", result: started }
+        }
+      }
     }
   }
 }
 
-/// A COMMAND_LONG for MAV_CMD_ACCELCAL_VEHICLE_POS from the vehicle.
+/// A COMMAND_LONG for MAV_CMD_ACCELCAL_VEHICLE_POS from the vehicle that holds a whole number.
 function isPrompt(r: Received, target: Target): bool {
   const m = r.message
   if (m instanceof CommandLong) {
     return m.command as int == ApmCmd.ACCELCAL_VEHICLE_POS && r.packet.header.sysid == target.system
-      && (target.component == 0 || r.packet.header.compid == target.component)
+      && (target.component == 0 || r.packet.header.compid == target.component) && wholeNumber(m._param1 as f64) >= 0
   }
   false
 }
