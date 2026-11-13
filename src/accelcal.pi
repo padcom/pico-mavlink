@@ -7,6 +7,10 @@
 //  - The vehicle calibrates INSIDE the command (the gyro: seconds, with the vehicle still) and acks after it, so the command is sent
 //    ONCE and its ack waited for (30 s by default, `ackMs`): a command sent again restarts the calibration, or is answered
 //    TEMPORARILY_REJECTED. A timeout is a `TIMEOUT` MavLinkError, and says nothing about what the vehicle did.
+//    (SITL, speedup 1: the gyro command is acked about 0.5 s after it is sent, the level about 1 s). A vehicle that has just booted does
+//    not answer it at all, and then goes silent (no heartbeat either) until it is restarted: in the first seconds after the link is made
+//    (SITL boots when it is connected) the vehicle is still calibrating itself. Calibrate only a vehicle that is up (SITL: "AHRS: EKF3
+//    active" in STATUSTEXT, about 3.5 s after the link; the level calibration is answered TEMPORARILY_REJECTED before that).
 //  - The full accelerometer calibration is the vehicle asking the ground station, by a COMMAND_LONG of its own (MAV_CMD_ACCELCAL_VEHICLE_POS,
 //    42429, addressed to everyone) which way to place it: param1 is 1 level, 2 left side, 3 right side, 4 nose down, 5 nose up, 6 on its back, and,
 //    when it is over, 16777215 (success) or 16777216 (failed). It asks again every second until it is answered. The answer is the same

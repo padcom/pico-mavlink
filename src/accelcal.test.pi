@@ -22,6 +22,7 @@ class Rig {
     this.gcs = new MavLinkConnection(ends[0])
     this.cal = new Calibration(this.gcs, { system: 1, component: 1 }, { timeoutMs: 100, signal: signal }, ackMs)
     this.sim.calibration.repeatMs = 15
+    this.sim.calibration.takesMs = 0
     this.gcs.on((r: Received) => {
       const m = r.message
       if (m instanceof StatusText) {
@@ -168,7 +169,7 @@ async function theOtherCalibrations(): Promise<void> throws Error {
 async function sendsACalibratingCommandOnceAndWaitsForTheAck(): Promise<void> throws Error {
   // The vehicle calibrates inside the command and acks after: slower than the ack wait of a quick command.
   const rig = new Rig(1000)
-  rig.sim.calibration.ackDelayMs = 250
+  rig.sim.calibration.takesMs = 250
   expect(await rig.cal.gyro()).toBe(MavResult.ACCEPTED)
   expect(rig.sim.calibration.preflightCommands).toBe(1)
   expect(rig.sim.calibration.gyroRuns).toBe(1)
@@ -177,7 +178,7 @@ async function sendsACalibratingCommandOnceAndWaitsForTheAck(): Promise<void> th
 
 async function doesNotAskAgainWhenTheAckIsLate(): Promise<void> throws Error {
   const rig = new Rig(60)
-  rig.sim.calibration.ackDelayMs = 250
+  rig.sim.calibration.takesMs = 250
   let code = "acked"
   try {
     await rig.cal.gyro()
