@@ -1,0 +1,176 @@
+// The calibration of the simulated autopilot, as ArduPilot does it (see accelcal.pi for the protocol and where it is in the source):
+//  - MAV_CMD_PREFLIGHT_CALIBRATION is refused (FAILED, "Disarm to allow calibration") while the vehicle is armed. param1 = 1 calibrates
+//    the gyros (ACCEPTED), param5 = 1 starts the full accelerometer calibration, 2 the level, 4 the simple one (all ACCEPTED), and a
+//    command with param4 only sets the RC calibration flag and is answered UNSUPPORTED, as ArduPilot answers it.
+//  - The full calibration asks for the six positions with a COMMAND_LONG of MAV_CMD_ACCELCAL_VEHICLE_POS to everyone, again every
+//    `repeatMs` until the position is answered with the same command (acked ACCEPTED; FAILED when it is not the position that is
+//    asked for), which takes the sample, says so in STATUSTEXT and asks for the next. After the sixth it says "Calibration successful"
+//    and sends 16777215 (16777216 for a failure) every `repeatMs`, until the next calibration starts.
+// Faults for tests: `failAt` (the position at which the calibration fails, 0 for none), `gyroFails` (the gyro calibration is answered FAILED: the vehicle was
+// moved), `silent` (the full calibration is accepted and the vehicle never asks for a position).
+import { MavLinkConnection, Received } from "./connection"
+import { CommandAck, CommandLong, MavCmd, MavResult, MavSeverity, StatusText } from "./dialects/common"
+import { MavCmd as ApmCmd } from "./dialects/ardupilotmega"
+import { AccelPosition } from "./accelcal"
+
+/// The calibration commands of the simulated autopilot.
+export class SimCalibration {
+  readonly conn: MavLinkConnection
+  readonly armed: () => bool
+  readonly forMe: (system: int, component: int) => bool
+  /// How often the vehicle asks for a position again (the real one: every second).
+  public repeatMs: int = 1000
+  public failAt: int = 0
+  public gyroFails: bool = false
+  public silent: bool = false
+  /// What the vehicle was asked, and what it did.
+  public gyroRuns: int = 0
+  public accelRuns: int = 0
+  public levelRuns: int = 0
+  public simpleRuns: int = 0
+  /// The RC calibration flag (MAV_CMD_PREFLIGHT_CALIBRATION param4).
+  public rcCalibrating: bool = false
+  /// The positions it was told the vehicle is in, in order.
+  public confirmed: int[] = []
+  /// The position it waits for now: 1 .. 6, 0 when no full calibration runs.
+  public waiting: int = 0
+  /// How the last full calibration ended: 0 not yet, `AccelPosition.SUCCESS` or `AccelPosition.FAILED`.
+  public ended: int = 0
+  timer: int = -1
+
+  constructor(conn: MavLinkConnection, armed: () => bool, forMe: (system: int, component: int) => bool) {
+    this.conn = conn
+    this.armed = armed
+    this.forMe = forMe
+  }
+
+  isArmed(): bool {
+    const f = armed
+    f()
+  }
+
+  mine(system: int, component: int): bool {
+    const f = forMe
+    f(system, component)
+  }
+
+  public stop(): void {
+    clearInterval(timer)
+    timer = -1
+  }
+
+  /// Handles one message; whether it was one of the calibration's.
+  public handle(r: Received): bool {
+    const m = r.message
+    if (!(m instanceof CommandLong)) {
+      return false
+    }
+    if (m.command as int == MavCmd.PREFLIGHT_CALIBRATION) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
+        preflight(m)
+      }
+      return true
+    }
+    if (m.command as int == ApmCmd.ACCELCAL_VEHICLE_POS) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
+        position(m._param1 as int)
+      }
+      return true
+    }
+    false
+  }
+
+  ack(command: int, result: int): void {
+    const a = new CommandAck()
+    a.command = command as u16
+    a.result = result as u8
+    conn.send(a)
+  }
+
+  say(text: string): void {
+    const s = new StatusText()
+    s.severity = MavSeverity.INFO as u8
+    s.text = text
+    conn.send(s)
+  }
+
+  preflight(m: CommandLong): void {
+    const command = m.command as int
+    if (isArmed()) {
+      say("Disarm to allow calibration")
+      ack(command, MavResult.FAILED)
+      return
+    }
+    rcCalibrating = m._param4 as f64 > 0.0
+    if (m._param1 as int == 1) {
+      gyroRuns += 1
+      ack(command, if (gyroFails) MavResult.FAILED else MavResult.ACCEPTED)
+      return
+    }
+    const kind = m._param5 as int
+    if (kind == 1) {
+      gyroRuns += 1
+      accelRuns += 1
+      ack(command, MavResult.ACCEPTED)
+      beginFull()
+    } else if (kind == 2) {
+      levelRuns += 1
+      ack(command, MavResult.ACCEPTED)
+    } else if (kind == 4) {
+      simpleRuns += 1
+      ack(command, MavResult.ACCEPTED)
+    } else {
+      ack(command, MavResult.UNSUPPORTED)
+    }
+  }
+
+  /// A full calibration begins: the first position is asked for now and every `repeatMs`.
+  beginFull(): void {
+    clearInterval(timer)
+    confirmed = []
+    ended = 0
+    waiting = 1
+    if (silent) {
+      waiting = 0
+      return
+    }
+    say("Place vehicle level and press any key.")
+    ask()
+    timer = setInterval(() => this.ask(), repeatMs)
+  }
+
+  /// Asks for the position it waits for, or says how it ended.
+  ask(): void {
+    const value = if (waiting > 0) waiting else ended
+    if (value == 0) {
+      return
+    }
+    const c = new CommandLong()
+    c.command = ApmCmd.ACCELCAL_VEHICLE_POS as u16
+    c._param1 = value as f32
+    conn.send(c)
+  }
+
+  /// The ground station says the vehicle is in `p`.
+  position(p: int): void {
+    if (waiting == 0 || p != waiting) {
+      ack(ApmCmd.ACCELCAL_VEHICLE_POS, MavResult.FAILED)
+      return
+    }
+    ack(ApmCmd.ACCELCAL_VEHICLE_POS, MavResult.ACCEPTED)
+    confirmed.push(p)
+    if (p == failAt) {
+      say("Calibration FAILED")
+      waiting = 0
+      ended = AccelPosition.FAILED
+    } else if (p == AccelPosition.BACK) {
+      say("Calibration successful")
+      waiting = 0
+      ended = AccelPosition.SUCCESS
+    } else {
+      waiting = p + 1
+      say(`Place vehicle ${AccelPosition.nameOf(waiting) ?? ""} and press any key.`)
+    }
+    ask()
+  }
+}

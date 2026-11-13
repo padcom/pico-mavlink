@@ -31,6 +31,13 @@ Status: **in development (MV1).**
   The protocol has no CRC, so a download is never "verified"; it sends the ground-station heartbeat ArduPilot needs, and the vehicle
   ignores every request while armed. `SimulatedAutopilot.logs` (src/simlogs.pi) serves the same `/logs/NNNNNNNN.BIN` files as FTP
   over this protocol, with loss, stall, a dropped packet, silence and corruption as faults; `simulatedLog` makes a valid DataFlash log.
+- **Done:** calibration, part 1 (src/accelcal.pi): `Calibration` asks the vehicle for the gyro (`gyro`), accelerometer (`startAccel` with an
+  `AccelCalKind`: full, level, simple, accept) and RC-flag (`rcCalibrating`) calibrations with `MAV_CMD_PREFLIGHT_CALIBRATION`. In the full
+  accelerometer calibration the vehicle asks the ground station, by a `COMMAND_LONG` of its own (`ACCELCAL_VEHICLE_POS`, repeated every
+  second), to place it level, left, right, nose down, nose up and on its back, and ends with a success or failure code: `prompt` receives
+  the next request, `confirm` answers it, `run` does the whole walk. There is no cancel in the protocol. `SimulatedAutopilot.calibration`
+  (src/simcal.pi) does the vehicle's side, with a failure at a chosen position, a failed gyro and silence as faults; it refuses while armed.
+  The compass flow and `RC_CHANNELS` come next.
 - **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte
   big-endian microsecond timestamp and one MAVLink 1 or 2 frame per record). Bounded memory (a chunk and a record), CRC-checked
   against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,
