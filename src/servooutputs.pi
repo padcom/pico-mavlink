@@ -1,0 +1,75 @@
+// The outputs of the autopilot's servo and motor ports, from SERVO_OUTPUT_RAW (ArduPilot: libraries/GCS_MAVLink/GCS_Common.cpp
+// `send_servo_output_raw`: the pulse in µs of each output of a port of 8, 0 for an output that is not used; port 0 is MAIN, 1 AUX; a
+// vehicle with more outputs sends the next port as another message): what the Motors page draws, and what a motor test is seen in.
+import { MavLinkConnection, Received } from "./connection"
+import { ServoOutputRaw } from "./dialects/common"
+import { Target } from "./operations"
+
+/// How many outputs a SERVO_OUTPUT_RAW carries (the 8 of the message and the 8 of its extension).
+export const SERVO_OUTPUTS: int = 16
+
+/// One SERVO_OUTPUT_RAW.
+export struct ServoReading {
+  /// Microseconds since the vehicle booted (the message's own, 32 bits: it wraps after about 71 minutes).
+  timeUsec: int
+  /// The port: 0 MAIN, 1 AUX.
+  port: int
+  /// The pulse of each of the 16 outputs of the port in µs; 0 where the output is not used.
+  pulses: int[]
+}
+
+/// The reading `m` says: output i (0 to 15) of its port is `pulses[i]`.
+export function servoReadingOf(m: ServoOutputRaw): ServoReading {
+  const pulses: int[] = [
+    m.servo1Raw as int, m.servo2Raw as int, m.servo3Raw as int, m.servo4Raw as int, m.servo5Raw as int, m.servo6Raw as int,
+    m.servo7Raw as int, m.servo8Raw as int, m.servo9Raw as int, m.servo10Raw as int, m.servo11Raw as int, m.servo12Raw as int,
+    m.servo13Raw as int, m.servo14Raw as int, m.servo15Raw as int, m.servo16Raw as int,
+  ]
+  const reading: ServoReading = { timeUsec: m.timeUsec as int, port: m.port as int, pulses: pulses }
+  reading
+}
+
+/// Keeps the latest SERVO_OUTPUT_RAW of each port of a vehicle. `conn.run()` must be running; `stop()` ends it.
+export class ServoMonitor {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly listener: int
+  /// The latest reading of each port heard, by port number (null: not heard).
+  public readonly ports: ServoReading?[] = []
+  /// How many readings came.
+  public count: int = 0
+
+  constructor(conn: MavLinkConnection, target: Target) {
+    this.conn = conn
+    this.target = target
+    this.listener = conn.on((r: Received) => this.heard(r))
+  }
+
+  heard(r: Received): void {
+    if (r.packet.header.sysid != target.system || (target.component != 0 && r.packet.header.compid != target.component)) {
+      return
+    }
+    const m = r.message
+    if (m instanceof ServoOutputRaw) {
+      const reading = servoReadingOf(m)
+      while (ports.length <= reading.port) {
+        ports.push(null)
+      }
+      ports[reading.port] = reading
+      count += 1
+    }
+  }
+
+  /// The latest pulse (µs) of output `output` (1 based) of port `port`, or 0 when it was not heard or the output is not used.
+  public pulse(port: int, output: int): int {
+    if (port < 0 || port >= ports.length || output < 1 || output > SERVO_OUTPUTS) {
+      return 0
+    }
+    const reading = ports[port]
+    if (reading == null) 0 else reading!.pulses[output - 1]
+  }
+
+  public stop(): void {
+    conn.off(listener)
+  }
+}

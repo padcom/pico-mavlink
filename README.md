@@ -48,6 +48,15 @@ Status: **in development (MV1).**
   `waitUntilUp` is the one rule for "can this vehicle be calibrated now": it said "AHRS: EKF3 active", or has been up for 10 s (ATTITUDE). The simulator
   (`SimulatedAutopilot.compass`, `.rc`) does the vehicle's side with failure statuses, lost acks and a mute link as faults. SITL (calibration model,
   `SITL_FLIGHT=1`): the compass calibrates with the vehicle turned as MAVProxy's `sitl_magcal` does, is kept only when accepted, and is cancelled when left.
+- **Done:** the motor test and the servo outputs (src/motortest.pi, src/servooutputs.pi). `MotorTest` sends `MAV_CMD_DO_MOTOR_TEST` and **never a timeout above
+  2 s or a throttle above 20 %** (it throws instead): the vehicle takes 600 s, arms its motors and disables the throttle, GCS and EKF failsafes until the test
+  ends. `hold` spins a motor by sending the same 1.5 s test every 800 ms until a signal is aborted, and ends with a stop (timeout 0) however it ends: released,
+  refused, a start with no ack, an error; a stop that is not acknowledged is sent again, and a release does not wait for the ack of a start. The test number is
+  the vehicle's TEST ORDER (A is 1), not the output (SITL quad X: test 1 spins output 3). **A vehicle that is armed (and landed) accepts the test** (SITL
+  checked): the caller must not ask when the vehicle is armed or not known to be disarmed. `ServoMonitor`/`servoReadingOf` decode `SERVO_OUTPUT_RAW` (16
+  outputs per port, 0 for an unused one). `SimulatedAutopilot.motors` does the vehicle's side (a motor that stops by itself when the timeout runs out, outputs
+  in `sendServo`, faults: not landed, a refusal, lost acks). SITL (`SITL_FLIGHT=1`): a motor spins at the throttle asked and shows in `SERVO_OUTPUT_RAW`, a
+  stop ends it at once, a held test goes on past one test's length and stops on release.
 - **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte
   big-endian microsecond timestamp and one MAVLink 1 or 2 frame per record). Bounded memory (a chunk and a record), CRC-checked
   against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,

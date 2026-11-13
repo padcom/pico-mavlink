@@ -18,6 +18,8 @@ import { Heartbeat } from "./dialects/minimal"
 import { MavCmd, MavParamType, MavResult, RequestDataStream, StatusText } from "./dialects/common"
 import { AccelCalKind, AccelPosition, Calibration } from "./accelcal"
 import { CompassCalibration, CompassProgress, CompassReport, CompassStatus } from "./compasscal"
+import { MotorTest } from "./motortest"
+import { ServoMonitor } from "./servooutputs"
 import { SimState } from "./dialects/ardupilotmega"
 import { GlobalPositionInt } from "./dialects/standard"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
@@ -1232,7 +1234,147 @@ async function refusesToCalibrateWhileArmed(): Promise<void> throws Error {
   }
 }
 
+/// Whether the motor test runs: like the calibrations, a SITL that boots for a minute, so with `SITL_FLIGHT=1`.
+function motorTestsRun(): bool {
+  const flight = env.get("SITL_FLIGHT")
+  if (flight == null || flight! != "1") {
+    println("SITL motor test skipped: set SITL_FLIGHT=1 to run it")
+    return false
+  }
+  true
+}
+
+/// Waits until output `output` of the main port is above (`above`) or at most (`!above`) `pulse` µs, up to `seconds`.
+async function outputIs(monitor: ServoMonitor, output: int, pulse: int, above: bool, seconds: int): Promise<bool> throws AbortError {
+  for (let i = 0; i < seconds * 20; i++) {
+    const p = monitor.pulse(0, output)
+    if (p > 0 && (if (above) p > pulse else p <= pulse)) {
+      return true
+    }
+    await delay(50)
+  }
+  false
+}
+
+/// The outputs (1 to 4, as digits in order, "" for none) of the main port that are more than 50 µs above `rest`.
+async function spinning(monitor: ServoMonitor, rest: int): Promise<string> throws AbortError {
+  await delay(0)
+  let out = ""
+  for (let output = 1; output <= 4; output++) {
+    if (monitor.pulse(0, output) > rest + 50) {
+      out = `${out}${output}`
+    }
+  }
+  out
+}
+
+/// Waits (up to `seconds`) until exactly the outputs `which` spin, as `spinning` says.
+async function spinsOnly(monitor: ServoMonitor, rest: int, which: string, seconds: int): Promise<bool> throws AbortError {
+  for (let i = 0; i < seconds * 20; i++) {
+    if (await spinning(monitor, rest) == which) {
+      return true
+    }
+    await delay(50)
+  }
+  false
+}
+
+/// The motor test in ArduPilot itself: a motor spins at the throttle asked and shows in SERVO_OUTPUT_RAW, a stop (timeout 0) ends it at once,
+/// and a held test (a short test sent again) ends when it is released, with the stop. The vehicle arms its motors for the test and disarms
+/// them when it ends. (It does NOT refuse a vehicle that is armed: see `acceptsTheMotorTestWhileArmed`.)
+async function spinsAMotorAndStopsItAtOnce(): Promise<void> throws Error {
+  if (!motorTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  const monitor = new ServoMonitor(s.conn, s.target)
+  try {
+    const f = await afterBoot(s, (Date.now() as int) + 60_000)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    // SERVO_OUTPUT_RAW ten times a second
+    expect(await cmd.run(MavCmd.SET_MESSAGE_INTERVAL, [36.0, 100000.0])).toBe(MavResult.ACCEPTED)
+    expect(await outputIs(monitor, 1, 0, true, 5)).toBe(true)
+    // at rest the four motors of a quad are at the same pulse (1000 µs, disarmed)
+    const rest = monitor.pulse(0, 1)
+    expect(await spinning(monitor, rest)).toBe("")
+    const test = new MotorTest(s.conn, s.target, { timeoutMs: 2000 })
+    // one test: the motor spins at the throttle asked (1000 µs + 10 per percent), and no other does. The test number is the TEST order
+    // (A, B, C, D), not the output: of this frame, test 1 spins output 3, 2 output 1, 3 output 4 and 4 output 2
+    expect(await test.start(1, 15, 2.0)).toBe(MavResult.ACCEPTED)
+    expect(await spinsOnly(monitor, rest, "3", 3)).toBe(true)
+    expect(monitor.pulse(0, 3)).toBe(rest + 150)
+    expect(f.texts.indexOf("starting motor test") >= 0).toBe(true)
+    // a stop ends it at once: well before the 2 s of the test
+    const stopAt = Date.now() as int
+    expect(await test.stop()).toBe(MavResult.ACCEPTED)
+    expect(await spinsOnly(monitor, rest, "", 1)).toBe(true)
+    expect((Date.now() as int) - stopAt < 1500).toBe(true)
+    // a held one: it spins for as long as it is held (more than the 1.5 s of one test), and the release stops it
+    const release = new AbortController()
+    const held = test.hold(2, 10, release.signal)
+    expect(await spinsOnly(monitor, rest, "1", 3)).toBe(true)
+    await delay(2500)
+    expect(await spinning(monitor, rest)).toBe("1")
+    release.abort()
+    const result = await held
+    expect(result.why).toBe("")
+    expect(result.stopped).toBe(true)
+    expect(result.starts >= 3).toBe(true)
+    expect(await spinsOnly(monitor, rest, "", 2)).toBe(true)
+  } finally {
+    monitor.stop()
+    await s.stop()
+  }
+}
+
+/// An ARMED vehicle (landed) accepts the motor test: it does not refuse. A ground station must not send one to a vehicle that is armed.
+async function acceptsTheMotorTestWhileArmed(): Promise<void> throws Error {
+  if (!motorTestsRun()) {
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  const deadline = (Date.now() as int) + FLIGHT_BUDGET_MS
+  try {
+    const f = await afterBoot(s, deadline)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    let armed = false
+    for (let i = 0; i < 90 && !armed && (Date.now() as int) < deadline; i++) {
+      const mode = await cmd.run(MavCmd.DO_SET_MODE, [1.0, 4.0])
+      const res = if (mode == MavResult.ACCEPTED) await cmd.run(MavCmd.COMPONENT_ARM_DISARM, [1.0]) else mode
+      armed = res == MavResult.ACCEPTED && await until(() => f.armed, 3, deadline)
+      if (!armed) {
+        await delay(1000)
+      }
+    }
+    expect(armed).toBe(true)
+    const test = new MotorTest(s.conn, s.target, { timeoutMs: 2000 })
+    // (a single short test, and the stop below whatever happens: never an open-ended hold on a vehicle whose answer is not known)
+    // THE FINDING: a vehicle that is ARMED (and landed) ACCEPTS the motor test ("starting motor test"): ArduPilot does not refuse it.
+    // The refusal of a ground station that tests only a disarmed vehicle is the ground station's own.
+    const answer = await test.start(1, 10, 1.0)
+    expect(answer).toBe(MavResult.ACCEPTED)
+    expect(f.texts.indexOf("starting motor test") >= 0).toBe(true)
+    expect(await test.stop()).toBe(MavResult.ACCEPTED)
+  } finally {
+    try {
+      const _stopped = await new MotorTest(s.conn, s.target, { timeoutMs: 1000 }).stop()
+    } catch (e: Error) {
+    }
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
+  it("spins a motor, shows it in SERVO_OUTPUT_RAW, and stops it at once and on release (SITL_FLIGHT=1)", spinsAMotorAndStopsItAtOnce)
+  it("accepts the motor test while armed: the refusal is the ground station's (SITL_FLIGHT=1)", acceptsTheMotorTestWhileArmed)
   it("writes a log that FTP can see: where, when, and what it looks like (the spike; SITL_FLIGHT=1)", writesALogWhereFtpCanSeeIt)
   it("downloads a file by FTP, in order, and the vehicle's CRC-32 is ours; going on from the middle gives the same file", downloadsAFileAndMatchesItsCrc)
   it("is recorded as a tlog and read back: every frame, whole and the same", recordsTheLinkAndReadsItBack)

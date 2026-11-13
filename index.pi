@@ -128,6 +128,18 @@ export {
   sectionsLit,
 } from "./src/compasscal"
 export { MAX_PULSE, MIN_PULSE, RcExtremes, RcMonitor, RcReading, rcReadingOf } from "./src/rcchannels"
+export { SERVO_OUTPUTS, ServoMonitor, ServoReading, servoReadingOf } from "./src/servooutputs"
+export {
+  HOLD_REPEAT_MS,
+  HOLD_TEST_SECONDS,
+  HoldResult,
+  MAX_TEST_MOTORS,
+  MAX_TEST_SECONDS,
+  MAX_REPEAT_MS,
+  MAX_TEST_THROTTLE,
+  MIN_REPEAT_MS,
+  MotorTest,
+} from "./src/motortest"
 export { UP_AFTER_MS, waitUntilUp } from "./src/ready"
 export {
   AutopilotVersionRead,

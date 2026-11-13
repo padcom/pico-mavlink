@@ -19,8 +19,9 @@ import { ByteStream } from "./stream"
 import { SimLogs } from "./simlogs"
 import { SimCalibration } from "./simcal"
 import { SimCompass } from "./simcompass"
+import { SimMotors } from "./simmotor"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, SysStatus, SystemTime } from "./dialects/common"
+import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
 
 /// An FTP request and who sent it.
@@ -152,7 +153,8 @@ export class SimulatedAutopilot {
   downTimer: int = -1
   /// One timer per message that has an interval of its own.
   readonly timers: Map<int, int> = new Map<int, int>()
-  bootedAt: int = 0
+  /// When the vehicle booted (ms since 1970): a test sets it back to see what a long uptime does to the 32-bit times.
+  public bootedAt: int = 0
   /// Whether it is quiet (after a reboot, or set by hand): it sends nothing and hears nothing.
   public down: bool = false
   /// Whether it has MAVLink FTP (the capability bit in AUTOPILOT_VERSION, and the server for "@PARAM/param.pck"). A vehicle
@@ -201,6 +203,10 @@ export class SimulatedAutopilot {
   /// The pulses (µs) of the channels of the radio, one for each: sent as RC_CHANNELS at each tick when `rcStream` is on (off: nothing).
   public rc: int[] = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
   public rcStream: bool = false
+  /// The motor test (MAV_CMD_DO_MOTOR_TEST): see simmotor.pi. Refused when not landed; accepted while armed, as ArduPilot does.
+  public readonly motors: SimMotors
+  /// SERVO_OUTPUT_RAW (the outputs of the motors, `motors.outputs()`) at each tick when on (off: nothing).
+  public servoStream: bool = false
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -211,6 +217,7 @@ export class SimulatedAutopilot {
     this.logs = new SimLogs(conn, fsFiles, fsTimes, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
     this.calibration = new SimCalibration(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
     this.compass = new SimCompass(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
+    this.motors = new SimMotors(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
     conn.on((r: Received) => this.handle(r))
   }
 
@@ -353,7 +360,29 @@ export class SimulatedAutopilot {
     if (rcStream) {
       sendRc()
     }
+    if (servoStream) {
+      sendServo()
+    }
     ticks += 1
+  }
+
+  /// SERVO_OUTPUT_RAW: the pulses of the 8 outputs of the main port (`motors.outputs()`).
+  public sendServo(): void {
+    const m = new ServoOutputRaw()
+    // 32 bits of microseconds wrap after 71.6 minutes, as the vehicle's does: the remainder is taken before the cast (a cast of a
+    // number that does not fit stops the program).
+    m.timeUsec = ((((Date.now() as int) - bootedAt) * 1000) % 4294967296) as u32
+    m.port = 0
+    const o = motors.outputs()
+    m.servo1Raw = o[0] as u16
+    m.servo2Raw = o[1] as u16
+    m.servo3Raw = o[2] as u16
+    m.servo4Raw = o[3] as u16
+    m.servo5Raw = o[4] as u16
+    m.servo6Raw = o[5] as u16
+    m.servo7Raw = o[6] as u16
+    m.servo8Raw = o[7] as u16
+    conn.send(m)
   }
 
   /// RC_CHANNELS: the pulses of `rc` (the first 18), 65535 for the channels past them, rssi 100 %.
@@ -395,7 +424,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (logs.handle(r) || calibration.handle(r) || compass.handle(r)) {
+    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r)) {
       return
     }
     const m = r.message
