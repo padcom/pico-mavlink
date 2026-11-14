@@ -642,6 +642,74 @@ async function aDoubleReleaseAfterOtherChangesAsksForNothing(): Promise<void> th
   rig.close()
 }
 
+async function aLeaseNeverSlowsABaseThatIsFaster(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 50.0)
+  // a lease asks for 25 Hz: the base is faster, and stays (a lease raises, it does not slow)
+  const slow = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  expect(await slow.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  // a base that is slower is raised, and given back; and a base that is off limits nothing
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const fast = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await fast.release()).toBe(true)
+  await rig.rates.off(Attitude.MSG_ID)
+  const over = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(`${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40000")
+  expect(await over.release()).toBe(true)
+  expect(`${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("-1")
+  rig.close()
+}
+
+/// A link that is down: nothing is read, and a write fails.
+class DeadStream implements ByteStream {
+  public read(): Promise<Uint8Array?, Error> {
+    Promise.resolve<Uint8Array?>(null)
+  }
+
+  public async write(_bytes: Uint8Array): Promise<void> throws Error {
+    throw new Error("the link is down")
+  }
+
+  public close(): void {}
+}
+
+async function aBorrowThatFailsHoldsNothingAfterwards(): Promise<void> throws Error {
+  const gcs = new MavLinkConnection(new DeadStream())
+  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, FAST)
+  // the request fails (the link is down): the lease is not kept
+  let failed = false
+  try {
+    await rates.borrow(Attitude.MSG_ID, 25.0)
+  } catch (e: Error) {
+    failed = true
+  }
+  expect(failed).toBe(true)
+  // nothing is held, nothing is watched, and so nothing would be asked for again after a reboot
+  expect(`${rates.held().length} ${rates.watching()}`).toBe("0 false")
+  // with a base held, the failed borrow leaves the base alone
+  let again = false
+  try {
+    await rates.set(Attitude.MSG_ID, 4.0)
+  } catch (e: Error) {
+    again = true
+  }
+  expect(again).toBe(true)
+  expect(`${rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250000")
+  try {
+    await rates.borrow(Attitude.MSG_ID, 25.0)
+  } catch (e: Error) {
+    again = false
+  }
+  expect(again).toBe(false)
+  expect(`${rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250000")
+  rates.stop()
+  gcs.close()
+}
+
 async function borrowedRateReleaseAfterStopDoesNotThrow(): Promise<void> throws Error {
   const rig = new Rig(250, FAST)
   await delay(50)
@@ -699,6 +767,8 @@ describe("telemetry rates", () => {
   it("keeps a change of the rate made during a lease, and gives that back", aChangeOfTheBaseDuringALeaseSurvivesTheRelease)
   it("gives the vehicle its own rate after a lease that a reset came in during", aResetDuringALeaseGivesTheVehicleItsOwnRateAfterTheRelease)
   it("does not put an old rate back over a newer one on a second release", aDoubleReleaseAfterOtherChangesAsksForNothing)
+  it("never slows a base that is faster than the lease, raises one that is slower, and an off base limits nothing", aLeaseNeverSlowsABaseThatIsFaster)
+  it("holds nothing after a borrow that failed", aBorrowThatFailsHoldsNothingAfterwards)
   it("does not throw when the release finds the vehicle gone", borrowedRateReleaseAfterStopDoesNotThrow)
   it("has the scripted actual roll rate in ATTITUDE", scriptedRollRateComesInAttitude)
   it("refuses rates that make no sense", refusesRatesThatMakeNoSense)
