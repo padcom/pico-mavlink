@@ -294,7 +294,8 @@ async function countsAReturnOnceWhicheverMessageComesFirst(): Promise<void> thro
   const ends = MemoryStream.pair()
   const gcs = new MavLinkConnection(ends[0])
   const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(1, 1) })
-  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 20, retries: 0, settleMs: 10, silenceMs: 100 })
+  // (silenceMs is wide against the short gaps below, so that a busy machine, which stretches a 20 ms wait, does not make a silence of one)
+  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 20, retries: 0, settleMs: 10, silenceMs: 300 })
   gcs.run()
   vehicle.run()
   await say(vehicle, 5000, true)
@@ -302,12 +303,12 @@ async function countsAReturnOnceWhicheverMessageComesFirst(): Promise<void> thro
   expect(rates.rebootCount()).toBe(0)
   // Silent for longer than silenceMs, then back with a clock that starts again: the heartbeat first, which has
   // no boot time, and then the attitude, which has. One return, not two.
-  await delay(200)
+  await delay(400)
   await say(vehicle, 30, true)
   await delay(50)
   expect(rates.rebootCount()).toBe(1)
   // And the other way round.
-  await delay(200)
+  await delay(400)
   await say(vehicle, 20, false)
   await delay(50)
   expect(rates.rebootCount()).toBe(2)
@@ -577,6 +578,70 @@ async function borrowedRateOfAMessageNothingHeldIsGivenBack(): Promise<void> thr
   rig.close()
 }
 
+async function overlappingLeasesGoBackToTheOriginalInAnyOrder(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  // A (25 Hz) then B (50 Hz): the fastest is asked for, while both are out
+  const a = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  const b = await rig.rates.borrow(Attitude.MSG_ID, 50.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  // A first: B is still shown, so the vehicle stays at B's rate
+  expect(await a.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  // B last: the original 4 Hz is back, and nothing is left at 25
+  expect(await b.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250 250000")
+  // the other order
+  const c = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  const d = await rig.rates.borrow(Attitude.MSG_ID, 50.0)
+  expect(await d.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await c.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250 250000")
+  rig.close()
+}
+
+async function aChangeOfTheBaseDuringALeaseSurvivesTheRelease(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  // someone else sets 10 Hz meanwhile: the lease is still the fastest, and 10 Hz is what is given back
+  await rig.rates.set(Attitude.MSG_ID, 10.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await lease.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("100 100000")
+  rig.close()
+}
+
+async function aResetDuringALeaseGivesTheVehicleItsOwnRateAfterTheRelease(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  await rig.rates.reset(Attitude.MSG_ID)
+  // the lease is still out: the vehicle stays at its rate, and it is still held (asked for again after a reboot)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await lease.release()).toBe(true)
+  // not 4 Hz back: the reset was asked for, so the vehicle's own rate it is, and nothing is held
+  expect(`${rig.sim.intervals.has(Attitude.MSG_ID)} ${rig.rates.held().length}`).toBe("false 0")
+  rig.close()
+}
+
+async function aDoubleReleaseAfterOtherChangesAsksForNothing(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(await lease.release()).toBe(true)
+  await rig.rates.set(Attitude.MSG_ID, 10.0)
+  // the second release must not put the 4 Hz of before the borrow back over the 10 Hz that was set since
+  expect(await lease.release()).toBe(false)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("100 100000")
+  rig.close()
+}
+
 async function borrowedRateReleaseAfterStopDoesNotThrow(): Promise<void> throws Error {
   const rig = new Rig(250, FAST)
   await delay(50)
@@ -630,6 +695,10 @@ describe("telemetry rates", () => {
   it("stops watching when stopped", stopsWatching)
   it("puts back what was held when a borrowed rate is released, once", borrowedRateGoesBackToWhatWasHeld)
   it("gives back to the vehicle a message that nothing was held for, and the scripted desired rate comes", borrowedRateOfAMessageNothingHeldIsGivenBack)
+  it("puts back the original when overlapping leases are released, in either order", overlappingLeasesGoBackToTheOriginalInAnyOrder)
+  it("keeps a change of the rate made during a lease, and gives that back", aChangeOfTheBaseDuringALeaseSurvivesTheRelease)
+  it("gives the vehicle its own rate after a lease that a reset came in during", aResetDuringALeaseGivesTheVehicleItsOwnRateAfterTheRelease)
+  it("does not put an old rate back over a newer one on a second release", aDoubleReleaseAfterOtherChangesAsksForNothing)
   it("does not throw when the release finds the vehicle gone", borrowedRateReleaseAfterStopDoesNotThrow)
   it("has the scripted actual roll rate in ATTITUDE", scriptedRollRateComesInAttitude)
   it("refuses rates that make no sense", refusesRatesThatMakeNoSense)

@@ -16,7 +16,7 @@ export struct RcReading {
   count: int
   /// The pulse of each of the `count` channels in µs; 0 where the message says "not used" (65535) or the channel is past `count`.
   pulses: int[]
-  /// 0 to 100 (%), or -1 when the vehicle does not know it (255).
+  /// The signal strength as the vehicle gives it, 0 to 254 (not a percentage: what the receiver reports), or -1 when it does not know it (255).
   rssi: int
 }
 

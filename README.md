@@ -74,9 +74,10 @@ Status: **in development (MV1).**
 - **Done:** `TelemetryRates`: the rate of each message, asked for in one place and held. It uses
   `MAV_CMD_SET_MESSAGE_INTERVAL`, falls back to `REQUEST_DATA_STREAM` where the vehicle refuses or does not
   answer, and asks again for everything after the vehicle reboots or comes back after a silence.
-  `borrow(messageId, hz)` lends a rate for a while (a screen that wants a message faster only while it is shown): it keeps what was held for the
-  message (nothing, off, or an interval), and `release()` of the lease puts that back once (nothing held: the vehicle's own rate again), without
-  throwing when the vehicle is gone. `SimulatedAutopilot.rateScript` gives the simulator a roll rate to measure: ATTITUDE's `rollspeed` (actual) and
+  `borrow(messageId, hz)` lends a rate for a while (a screen that wants a message faster only while it is shown): a message has a base rate
+  (what `set`, `off` and `reset` gave it) and the leases that are out, and what is asked of the vehicle is the base, or the fastest lease while some
+  are out. Leases may be released in any order, and a `set` or `reset` made while they are out is kept. `release()` of a lease takes only that lease
+  out, once; the last one out gives the base back (no base: the vehicle's own rate again). It does not throw when the vehicle is gone. `SimulatedAutopilot.rateScript` gives the simulator a roll rate to measure: ATTITUDE's `rollspeed` (actual) and
   ATTITUDE_TARGET's `bodyRollRate` (desired; sent only when asked for with `SET_MESSAGE_INTERVAL`, as ArduPilot sends it in no stream), a square wave of 1 rad/s
   every 2 s that the actual rate follows with a second-order response (damping 0.5, 15 rad/s: 16 % overshoot, 10 to 90 % in about 0.11 s; src/simrate.pi).
 - **Next:** ArduPilot SITL over UDP/TCP (MV2).
