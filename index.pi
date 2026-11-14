@@ -158,6 +158,7 @@ export {
 } from "./src/operations"
 export { StatusMessage, StatusTextAssembler, StatusTextReader, splitStatusText, statusTextFields } from "./src/statustext"
 export { LinkInfo, MavLinkRouter, RouterOptions } from "./src/router"
-export { HeldRate, RateResult, RatesOptions, TelemetryRates } from "./src/rates"
+export { HeldRate, RateLease, RateResult, RatesOptions, TelemetryRates } from "./src/rates"
 export { SimParam, SimulatedAutopilot, defaultSimParams } from "./src/simulator"
+export { DAMPING, NATURAL_RAD_S, OVERSHOOT, RATE_STEP, STEP_PERIOD_MS, actualRate, desiredRate } from "./src/simrate"
 export * from "./src/dialects/all"

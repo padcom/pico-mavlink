@@ -20,8 +20,9 @@ import { SimLogs } from "./simlogs"
 import { SimCalibration } from "./simcal"
 import { SimCompass } from "./simcompass"
 import { SimMotors } from "./simmotor"
+import { actualRate, desiredRate } from "./simrate"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime } from "./dialects/common"
+import { Attitude, AttitudeTarget, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime } from "./dialects/common"
 import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
 
 /// An FTP request and who sent it.
@@ -139,6 +140,10 @@ export class SimulatedAutopilot {
   /// false for an ArduPilot on a new link, which sends only heartbeats until it is asked, and forgets what it was
   /// asked when it reboots.
   public streaming: bool = true
+  /// Whether the roll rate follows a script (simrate.pi): ATTITUDE says the actual roll rate in `rollspeed`, and ATTITUDE_TARGET (which
+  /// comes only when it was asked for, with SET_MESSAGE_INTERVAL: ArduPilot sends it in no stream) says the desired one. Off, `rollspeed`
+  /// is 0 and ATTITUDE_TARGET has a rate of 0.
+  public rateScript: bool = false
   /// How many times SYSTEM_TIME was asked for with MAV_CMD_REQUEST_MESSAGE.
   public systemTimeRequests: int = 0
   /// The intervals it was asked for, by message id: milliseconds between messages, -1 for off. A message
@@ -319,6 +324,8 @@ export class SimulatedAutopilot {
       sendStatus()
     } else if (id == Attitude.MSG_ID) {
       sendAttitude()
+    } else if (id == AttitudeTarget.MSG_ID) {
+      sendAttitudeTarget()
     }
   }
 
@@ -335,7 +342,21 @@ export class SimulatedAutopilot {
     a.roll = (Math.sin(ticks as f64 / 5.0) * 0.0524) as f32
     a.pitch = (Math.cos(ticks as f64 / 7.0) * 0.0349) as f32
     a.yaw = (((ticks * 3) % 360) as f64 * Math.PI / 180.0) as f32
+    if (rateScript) {
+      a.rollspeed = actualRate(a.timeBootMs as int) as f32
+    }
     conn.send(a)
+  }
+
+  /// ATTITUDE_TARGET: the desired roll rate (the script's, when there is one) and a level attitude.
+  sendAttitudeTarget(): void {
+    const t = new AttitudeTarget()
+    t.timeBootMs = ((Date.now() as int) - bootedAt) as u32
+    t.q = [1.0 as f32, 0.0 as f32, 0.0 as f32, 0.0 as f32]
+    if (rateScript) {
+      t.bodyRollRate = desiredRate(t.timeBootMs as int) as f32
+    }
+    conn.send(t)
   }
 
   tick(): void {
@@ -444,10 +465,10 @@ export class SimulatedAutopilot {
         return
       }
       if (m.command as int == MavCmd.SET_MESSAGE_INTERVAL) {
-        // Honoured for the two messages it sends on its own, unless it is set to refuse.
+        // Honoured for the messages it sends on its own (ATTITUDE_TARGET only when asked for), unless it is set to refuse.
         const id = m._param1 as int
         const microseconds = m._param2 as int
-        const accepted = !rejectIntervals && (id == SysStatus.MSG_ID || id == Attitude.MSG_ID)
+        const accepted = !rejectIntervals && (id == SysStatus.MSG_ID || id == Attitude.MSG_ID || id == AttitudeTarget.MSG_ID)
         if (accepted) {
           const ms = if (microseconds < 0) -1 else if (microseconds == 0) 0 else if (microseconds < 1000) 1 else microseconds / 1000
           applyInterval(id, ms)

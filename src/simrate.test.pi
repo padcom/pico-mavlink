@@ -1,0 +1,67 @@
+// The scripted roll rate of the simulated autopilot (simrate.pi): the desired rate is a square wave, and the actual rate is the response of a
+// second-order system to each step, with the overshoot and the rise time that the file says, because a ground station measures them.
+import { describe, it, expect } from "std/test"
+import { DAMPING, NATURAL_RAD_S, OVERSHOOT, RATE_STEP, STEP_PERIOD_MS, actualRate, desiredRate } from "./simrate"
+
+function near(a: f64, b: f64, tolerance: f64): bool {
+  Math.abs(a - b) <= tolerance
+}
+
+function theDesiredRateIsASquareWave(): void {
+  expect(desiredRate(0)).toBe(0.0)
+  expect(desiredRate(STEP_PERIOD_MS - 1)).toBe(0.0)
+  expect(desiredRate(STEP_PERIOD_MS)).toBe(RATE_STEP)
+  expect(desiredRate(2 * STEP_PERIOD_MS - 1)).toBe(RATE_STEP)
+  expect(desiredRate(2 * STEP_PERIOD_MS)).toBe(0.0)
+  expect(desiredRate(3 * STEP_PERIOD_MS)).toBe(RATE_STEP)
+  expect(desiredRate(-5)).toBe(0.0)
+}
+
+function theActualRateStartsAtRestAndSettlesOnTheDesiredRate(): void {
+  expect(actualRate(0)).toBe(0.0)
+  expect(actualRate(-1)).toBe(0.0)
+  // 1.9 s into the step the response has settled
+  expect(near(actualRate(STEP_PERIOD_MS + 1900), RATE_STEP, 0.0005)).toBe(true)
+  // and back down on the falling edge
+  expect(near(actualRate(2 * STEP_PERIOD_MS + 1900), 0.0, 0.0005)).toBe(true)
+}
+
+function theActualRateOvershootsAsTheFileSays(): void {
+  let top = 0.0
+  let bottom = 0.0
+  for (let ms = STEP_PERIOD_MS; ms < 2 * STEP_PERIOD_MS; ms++) {
+    top = if (actualRate(ms) > top) actualRate(ms) else top
+  }
+  for (let ms = 2 * STEP_PERIOD_MS; ms < 3 * STEP_PERIOD_MS; ms++) {
+    bottom = if (actualRate(ms) < bottom) actualRate(ms) else bottom
+  }
+  expect(near(top, RATE_STEP * (1.0 + OVERSHOOT), 0.002)).toBe(true)
+  // the same on the way down: it undershoots zero by the same fraction of the step
+  expect(near(bottom, -RATE_STEP * OVERSHOOT, 0.002)).toBe(true)
+}
+
+function theActualRateRisesInAboutAnEighthOfASecond(): void {
+  // 10 % to 90 % of the step, as the second-order response with these numbers gives it
+  let tenAt = -1
+  let ninetyAt = -1
+  for (let ms = STEP_PERIOD_MS; ms < STEP_PERIOD_MS + 500; ms++) {
+    const y = actualRate(ms) / RATE_STEP
+    if (tenAt < 0 && y >= 0.1) {
+      tenAt = ms
+    }
+    if (ninetyAt < 0 && y >= 0.9) {
+      ninetyAt = ms
+    }
+  }
+  const rise = (ninetyAt - tenAt) as f64 / 1000.0
+  expect(rise > 0.09 && rise < 0.14).toBe(true)
+  expect(DAMPING).toBe(0.5)
+  expect(NATURAL_RAD_S).toBe(15.0)
+}
+
+describe("the scripted roll rate of the simulator", () => {
+  it("is a square wave for the desired rate", theDesiredRateIsASquareWave)
+  it("starts at rest and settles on the desired rate", theActualRateStartsAtRestAndSettlesOnTheDesiredRate)
+  it("overshoots as the file says, up and down", theActualRateOvershootsAsTheFileSays)
+  it("rises in about an eighth of a second", theActualRateRisesInAboutAnEighthOfASecond)
+})

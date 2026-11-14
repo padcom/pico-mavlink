@@ -1,0 +1,42 @@
+// The roll rate of the simulated autopilot, when it is asked to script one (`SimulatedAutopilot.rateScript`): what ArduPilot's rate
+// controller is asked for (ATTITUDE_TARGET's body roll rate: the DESIRED rate) and what the vehicle does about it (ATTITUDE's roll
+// speed: the ACTUAL rate). So a ground station that draws the two, and measures the step between them, has something known to measure.
+//
+// The desired rate is a square wave: 0 rad/s, then `RATE_STEP` rad/s for `STEP_PERIOD_MS`, then 0 again, and so on (a step every
+// `STEP_PERIOD_MS`, up and down). The actual rate is the response of a second-order system to each step, from the rate it had at the
+// edge: a natural frequency of `NATURAL_RAD_S` and a damping of `DAMPING`, which overshoots by `OVERSHOOT` (a fraction of the step) and
+// rises (10 % to 90 %) in about 0.11 s. The numbers are written down because a test measures them.
+// There is no noise: a test that wants noise adds it to what it reads.
+
+/// The size of the step (rad/s).
+export const RATE_STEP: f64 = 1.0
+
+/// How long the desired rate stays at each of its two values (ms).
+export const STEP_PERIOD_MS: int = 2000
+
+/// The response of the actual rate to a step: natural frequency (rad/s) and damping ratio.
+export const NATURAL_RAD_S: f64 = 15.0
+export const DAMPING: f64 = 0.5
+
+/// How far the actual rate overshoots a step, as a fraction of the step: exp(-pi * damping / sqrt(1 - damping^2)).
+export const OVERSHOOT: f64 = 0.1630
+
+/// The desired roll rate (rad/s) `ms` after the vehicle booted: 0 for the first period, `RATE_STEP` for the second, and so on.
+export function desiredRate(ms: int): f64 {
+  if (ms >= 0 && (ms / STEP_PERIOD_MS) % 2 == 1) RATE_STEP else 0.0
+}
+
+/// The actual roll rate (rad/s) `ms` after the vehicle booted: the response to the last step of the desired rate, from where the rate was.
+export function actualRate(ms: int): f64 {
+  if (ms < 0) {
+    return 0.0
+  }
+  const edge = (ms / STEP_PERIOD_MS) * STEP_PERIOD_MS
+  const now = desiredRate(ms)
+  const before = if (edge == 0) 0.0 else desiredRate(edge - 1)
+  const seconds = ((ms - edge) as f64) / 1000.0
+  const wd = NATURAL_RAD_S * Math.sqrt(1.0 - DAMPING * DAMPING)
+  const decay = Math.exp(-DAMPING * NATURAL_RAD_S * seconds)
+  const step = 1.0 - decay * (Math.cos(wd * seconds) + (DAMPING / Math.sqrt(1.0 - DAMPING * DAMPING)) * Math.sin(wd * seconds))
+  before + (now - before) * step
+}

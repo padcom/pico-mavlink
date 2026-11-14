@@ -9,7 +9,7 @@ import { MavLinkRouter } from "./router"
 import { RateResult, RatesOptions, TelemetryRates } from "./rates"
 import { SimulatedAutopilot, defaultSimParams } from "./simulator"
 import { Heartbeat } from "./dialects/minimal"
-import { Attitude, MavDataStream, SysStatus } from "./dialects/common"
+import { Attitude, AttitudeTarget, MavDataStream, SysStatus } from "./dialects/common"
 
 const FAST: RatesOptions = { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 5000 }
 
@@ -294,7 +294,8 @@ async function countsAReturnOnceWhicheverMessageComesFirst(): Promise<void> thro
   const ends = MemoryStream.pair()
   const gcs = new MavLinkConnection(ends[0])
   const vehicle = new MavLinkConnection(ends[1], { protocol: new MavLinkProtocolV2(1, 1) })
-  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 20, retries: 0, settleMs: 10, silenceMs: 100 })
+  // (silenceMs is wide against the short gaps below, so that a busy machine, which stretches a 20 ms wait, does not make a silence of one)
+  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, { timeoutMs: 20, retries: 0, settleMs: 10, silenceMs: 300 })
   gcs.run()
   vehicle.run()
   await say(vehicle, 5000, true)
@@ -302,12 +303,12 @@ async function countsAReturnOnceWhicheverMessageComesFirst(): Promise<void> thro
   expect(rates.rebootCount()).toBe(0)
   // Silent for longer than silenceMs, then back with a clock that starts again: the heartbeat first, which has
   // no boot time, and then the attitude, which has. One return, not two.
-  await delay(200)
+  await delay(400)
   await say(vehicle, 30, true)
   await delay(50)
   expect(rates.rebootCount()).toBe(1)
   // And the other way round.
-  await delay(200)
+  await delay(400)
   await say(vehicle, 20, false)
   await delay(50)
   expect(rates.rebootCount()).toBe(2)
@@ -532,6 +533,213 @@ async function managesEachVehicleOnARouter(): Promise<void> throws Error {
   gcs.close()
 }
 
+async function borrowedRateGoesBackToWhatWasHeld(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(show(lease.result)).toBe("interval true 0")
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await lease.release()).toBe(true)
+  // what was held is back, on the vehicle and in the manager (so it is also what is asked for again after a reboot)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250 250000")
+  // once: a second release asks for nothing
+  expect(await lease.release()).toBe(false)
+  rig.close()
+}
+
+async function borrowedRateOfAMessageNothingHeldIsGivenBack(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  rig.sim.rateScript = true
+  await delay(50)
+  let seen = 0
+  let top = 0.0
+  rig.gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof AttitudeTarget) {
+      seen += 1
+      if (m.bodyRollRate as f64 > top) {
+        top = m.bodyRollRate as f64
+      }
+    }
+  })
+  const lease = await rig.rates.borrow(AttitudeTarget.MSG_ID, 50.0)
+  expect(`${rig.sim.intervals.get(AttitudeTarget.MSG_ID) ?? -2} ${rig.rates.held().length}`).toBe("20 1")
+  await delay(2600)
+  // ATTITUDE_TARGET comes at 50 Hz, and the scripted desired rate has stepped up (after the first 2 s): 1 rad/s
+  expect(seen > 50).toBe(true)
+  expect(top).toBe(1.0)
+  expect(await lease.release()).toBe(true)
+  // nothing was held before, so nothing is held now, and the vehicle's own rate is asked for (its interval is gone)
+  expect(`${rig.sim.intervals.has(AttitudeTarget.MSG_ID)} ${rig.rates.held().length}`).toBe("false 0")
+  const before = seen
+  await delay(300)
+  expect(seen).toBe(before)
+  rig.close()
+}
+
+async function overlappingLeasesGoBackToTheOriginalInAnyOrder(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  // A (25 Hz) then B (50 Hz): the fastest is asked for, while both are out
+  const a = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  const b = await rig.rates.borrow(Attitude.MSG_ID, 50.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  // A first: B is still shown, so the vehicle stays at B's rate
+  expect(await a.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  // B last: the original 4 Hz is back, and nothing is left at 25
+  expect(await b.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250 250000")
+  // the other order
+  const c = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  const d = await rig.rates.borrow(Attitude.MSG_ID, 50.0)
+  expect(await d.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await c.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250 250000")
+  rig.close()
+}
+
+async function aChangeOfTheBaseDuringALeaseSurvivesTheRelease(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  // someone else sets 10 Hz meanwhile: the lease is still the fastest, and 10 Hz is what is given back
+  await rig.rates.set(Attitude.MSG_ID, 10.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await lease.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("100 100000")
+  rig.close()
+}
+
+async function aResetDuringALeaseGivesTheVehicleItsOwnRateAfterTheRelease(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  await rig.rates.reset(Attitude.MSG_ID)
+  // the lease is still out: the vehicle stays at its rate, and it is still held (asked for again after a reboot)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await lease.release()).toBe(true)
+  // not 4 Hz back: the reset was asked for, so the vehicle's own rate it is, and nothing is held
+  expect(`${rig.sim.intervals.has(Attitude.MSG_ID)} ${rig.rates.held().length}`).toBe("false 0")
+  rig.close()
+}
+
+async function aDoubleReleaseAfterOtherChangesAsksForNothing(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(await lease.release()).toBe(true)
+  await rig.rates.set(Attitude.MSG_ID, 10.0)
+  // the second release must not put the 4 Hz of before the borrow back over the 10 Hz that was set since
+  expect(await lease.release()).toBe(false)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("100 100000")
+  rig.close()
+}
+
+async function aLeaseNeverSlowsABaseThatIsFaster(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 50.0)
+  // a lease asks for 25 Hz: the base is faster, and stays (a lease raises, it does not slow)
+  const slow = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  expect(await slow.release()).toBe(true)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("20 20000")
+  // a base that is slower is raised, and given back; and a base that is off limits nothing
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const fast = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await fast.release()).toBe(true)
+  await rig.rates.off(Attitude.MSG_ID)
+  const over = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(`${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40000")
+  expect(await over.release()).toBe(true)
+  expect(`${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("-1")
+  rig.close()
+}
+
+/// A link that is down: nothing is read, and a write fails.
+class DeadStream implements ByteStream {
+  public read(): Promise<Uint8Array?, Error> {
+    Promise.resolve<Uint8Array?>(null)
+  }
+
+  public async write(_bytes: Uint8Array): Promise<void> throws Error {
+    throw new Error("the link is down")
+  }
+
+  public close(): void {}
+}
+
+async function aBorrowThatFailsHoldsNothingAfterwards(): Promise<void> throws Error {
+  const gcs = new MavLinkConnection(new DeadStream())
+  const rates = new TelemetryRates(gcs, { system: 1, component: 1 }, FAST)
+  // the request fails (the link is down): the lease is not kept
+  let failed = false
+  try {
+    await rates.borrow(Attitude.MSG_ID, 25.0)
+  } catch (e: Error) {
+    failed = true
+  }
+  expect(failed).toBe(true)
+  // nothing is held, nothing is watched, and so nothing would be asked for again after a reboot
+  expect(`${rates.held().length} ${rates.watching()}`).toBe("0 false")
+  // with a base held, the failed borrow leaves the base alone
+  let again = false
+  try {
+    await rates.set(Attitude.MSG_ID, 4.0)
+  } catch (e: Error) {
+    again = true
+  }
+  expect(again).toBe(true)
+  expect(`${rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250000")
+  try {
+    await rates.borrow(Attitude.MSG_ID, 25.0)
+  } catch (e: Error) {
+    again = false
+  }
+  expect(again).toBe(false)
+  expect(`${rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250000")
+  rates.stop()
+  gcs.close()
+}
+
+async function borrowedRateReleaseAfterStopDoesNotThrow(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  rig.sim.down = true
+  // the vehicle does not answer: the release says it did not put the rate back, and does not throw
+  expect(await lease.release()).toBe(false)
+  rig.close()
+}
+
+async function scriptedRollRateComesInAttitude(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  rig.sim.rateScript = true
+  await delay(50)
+  let top = 0.0
+  rig.gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof Attitude && m.rollspeed as f64 > top) {
+      top = m.rollspeed as f64
+    }
+  })
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 50.0)
+  await delay(2900)
+  // the actual rate rose after the step at 2 s, and overshot it
+  expect(top > 1.0).toBe(true)
+  expect(top < 1.2).toBe(true)
+  await lease.release()
+  rig.close()
+}
+
 describe("telemetry rates", () => {
   it("sets a rate with SET_MESSAGE_INTERVAL, and the vehicle keeps it", honoursARate)
   it("switches a message off, and back to the vehicle's own rate", switchesAMessageOffAndBack)
@@ -553,6 +761,16 @@ describe("telemetry rates", () => {
   it("does not ask again after being stopped, and does not undo a successor", stopCancelsAskingAgain)
   it("keeps a clock per component", keepsAClockPerComponent)
   it("stops watching when stopped", stopsWatching)
+  it("puts back what was held when a borrowed rate is released, once", borrowedRateGoesBackToWhatWasHeld)
+  it("gives back to the vehicle a message that nothing was held for, and the scripted desired rate comes", borrowedRateOfAMessageNothingHeldIsGivenBack)
+  it("puts back the original when overlapping leases are released, in either order", overlappingLeasesGoBackToTheOriginalInAnyOrder)
+  it("keeps a change of the rate made during a lease, and gives that back", aChangeOfTheBaseDuringALeaseSurvivesTheRelease)
+  it("gives the vehicle its own rate after a lease that a reset came in during", aResetDuringALeaseGivesTheVehicleItsOwnRateAfterTheRelease)
+  it("does not put an old rate back over a newer one on a second release", aDoubleReleaseAfterOtherChangesAsksForNothing)
+  it("never slows a base that is faster than the lease, raises one that is slower, and an off base limits nothing", aLeaseNeverSlowsABaseThatIsFaster)
+  it("holds nothing after a borrow that failed", aBorrowThatFailsHoldsNothingAfterwards)
+  it("does not throw when the release finds the vehicle gone", borrowedRateReleaseAfterStopDoesNotThrow)
+  it("has the scripted actual roll rate in ATTITUDE", scriptedRollRateComesInAttitude)
   it("refuses rates that make no sense", refusesRatesThatMakeNoSense)
   it("looks after each vehicle on a router", managesEachVehicleOnARouter)
 })

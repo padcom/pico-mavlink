@@ -103,8 +103,14 @@ export class TelemetryRates {
   readonly retries: int
   readonly toleranceMs: int
   readonly watchMs: int
-  /// message id -> interval in microseconds (-1: off), in the order they were asked for.
+  /// message id -> interval in microseconds (-1: off), in the order they were asked for: what is asked of the vehicle now (the
+  /// fastest borrowed rate while one is out, else the base).
   readonly wanted: Map<int, int> = new Map<int, int>()
+  /// message id -> the rate that `set`, `off`, `restore` and `reset` last gave it (microseconds, -1 off): what a message is
+  /// at when no lease of it is out. A change made while leases are out is kept here, and is what is given back after them.
+  readonly base: Map<int, int> = new Map<int, int>()
+  /// message id -> the leases of it that are out.
+  readonly leases: Map<int, RateLease[]> = new Map<int, RateLease[]>()
   readonly methods: Map<int, string> = new Map<int, string>()
   /// message id -> where time_boot_ms is in its payload, or -1 if it has none.
   readonly bootField: Map<int, int> = new Map<int, int>()
@@ -145,33 +151,139 @@ export class TelemetryRates {
 
   /// Asks for `messageId` at `hz` messages a second (0.001 to 1000), and holds the rate.
   public async set(messageId: int, hz: f64): Promise<RateResult> throws Error {
-    if (!(hz >= 0.001 && hz <= 1000.0)) {
-      throw new MavLinkError("INVALID_RATE", `a rate is 0.001 to 1000 Hz, not ${hz}`)
-    }
-    const intervalUs = Math.round(1_000_000.0 / hz) as int
-    wanted.set(messageId, if (intervalUs < 1) 1 else intervalUs)
-    startWatching()
-    await request(messageId, null)
+    base.set(messageId, intervalOf(hz))
+    await hold(messageId)
   }
 
   /// Switches `messageId` off, and holds that.
   public async off(messageId: int): Promise<RateResult> throws Error {
-    wanted.set(messageId, -1)
-    startWatching()
-    await request(messageId, null)
+    base.set(messageId, -1)
+    await hold(messageId)
   }
 
   /// Gives `messageId` back to the vehicle's own rate, and stops holding anything for it. Only
-  /// SET_MESSAGE_INTERVAL can do that; a vehicle that has only streams keeps the rate it was last given.
+  /// SET_MESSAGE_INTERVAL can do that; a vehicle that has only streams keeps the rate it was last given. While a lease
+  /// of it is out the vehicle stays at the leased rate, and gets its own rate when the last lease is released.
   public async reset(messageId: int): Promise<RateResult> throws Error {
-    wanted.delete(messageId)
-    methods.delete(messageId)
+    base.delete(messageId)
+    await hold(messageId)
+  }
+
+  /// Borrows a rate for a while: asks for `messageId` at `hz` as `set` does, until `release` of the lease. For a screen that wants
+  /// a message faster only while it is shown. The rate asked for is the base (what `set`, `off` and `reset` gave it) while no lease
+  /// is out; while some are, the shortest interval of the leases and the base (a lease raises a rate, it never slows one): they may
+  /// be released in any order, and a change of the base while they are out is not lost. The last lease to go gives the base back (or the vehicle's own rate, when there is none).
+  public async borrow(messageId: int, hz: f64): Promise<RateLease> throws Error {
+    const lease = new RateLease(this, messageId, intervalOf(hz))
+    const out = leases.get(messageId) ?? []
+    out.push(lease)
+    leases.set(messageId, out)
+    try {
+      lease.result = await hold(messageId)
+    } catch (e: Error) {
+      drop(lease)
+      throw e
+    }
+    lease
+  }
+
+  /// Puts a rate back to `intervalUs` (microseconds between messages, -1 for off), or, with null, gives the message back to the vehicle's
+  /// own rate and stops holding anything for it (`reset`): as a change of the base.
+  public async restore(messageId: int, intervalUs: int?): Promise<RateResult> throws Error {
+    if (intervalUs == null) {
+      return await reset(messageId)
+    }
+    base.set(messageId, intervalUs!)
+    await hold(messageId)
+  }
+
+  /// Takes a lease out of the leases that are out, and asks for what is wanted without it. Used by `RateLease.release`.
+  public async unlease(lease: RateLease): Promise<RateResult> throws Error {
+    drop(lease)
+    await hold(lease.messageId)
+  }
+
+  /// The interval in microseconds for `hz` (0.001 to 1000).
+  intervalOf(hz: f64): int throws Error {
+    if (!(hz >= 0.001 && hz <= 1000.0)) {
+      throw new MavLinkError("INVALID_RATE", `a rate is 0.001 to 1000 Hz, not ${hz}`)
+    }
+    const intervalUs = Math.round(1_000_000.0 / hz) as int
+    if (intervalUs < 1) {
+      return 1
+    }
+    intervalUs
+  }
+
+  /// What `messageId` is to be at: the base while no lease is out; while some are, the shortest interval of the leases and the
+  /// base (a lease only raises a rate: a base that is faster than every lease stays, and a base that is off limits nothing); with
+  /// neither, nothing.
+  effective(messageId: int): int? {
+    const out = leases.get(messageId)
+    if (out == null || out!.length == 0) {
+      return base.get(messageId)
+    }
+    const list = out!
+    let fastest = list[0].intervalUs
+    for (const lease of list) {
+      if (lease.intervalUs < fastest) {
+        fastest = lease.intervalUs
+      }
+    }
+    const own = base.get(messageId)
+    if (own != null && own! > 0 && own! < fastest) {
+      fastest = own!
+    }
+    fastest
+  }
+
+  /// Removes a lease from those that are out, and what is wanted follows (the request is `hold`'s): when nothing is wanted any more
+  /// nothing is held.
+  drop(lease: RateLease): void {
+    const out = leases.get(lease.messageId)
+    if (out != null) {
+      const rest: RateLease[] = []
+      for (const one of out!) {
+        if (one != lease) {
+          rest.push(one)
+        }
+      }
+      if (rest.length == 0) {
+        const _gone = leases.delete(lease.messageId)
+      } else {
+        const _kept = leases.set(lease.messageId, rest)
+      }
+    }
+    const now = effective(lease.messageId)
+    if (now != null) {
+      wanted.set(lease.messageId, now!)
+      return
+    }
+    // Nothing is wanted for it any more: nothing is held, and nothing is asked again after a reboot.
+    wanted.delete(lease.messageId)
+    methods.delete(lease.messageId)
     if (wanted.size == 0) {
       stopWatching()
     }
-    const r = await request(messageId, 0)
-    methods.delete(messageId)
-    r
+  }
+
+  /// Asks the vehicle for what `messageId` is to be at (see `effective`), and holds it; with nothing to hold it gives the message
+  /// back to the vehicle's own rate.
+  async hold(messageId: int): Promise<RateResult> throws Error {
+    const interval = effective(messageId)
+    if (interval == null) {
+      wanted.delete(messageId)
+      methods.delete(messageId)
+      if (wanted.size == 0) {
+        stopWatching()
+      }
+      const given = await request(messageId, 0)
+      methods.delete(messageId)
+      return given
+    }
+    wanted.set(messageId, interval!)
+    startWatching()
+    await request(messageId, null)
   }
 
   /// What is held, in the order it was asked for.
@@ -181,6 +293,11 @@ export class TelemetryRates {
       out.push({ messageId: id, intervalUs: interval, method: methods.get(id) ?? "none" })
     }
     out
+  }
+
+  /// Whether the manager is asking the vehicle for SYSTEM_TIME to see a restart (it does while something is held).
+  public watching(): bool {
+    watcher >= 0
   }
 
   /// How many reboots or reconnects were noticed.
@@ -481,5 +598,40 @@ export class TelemetryRates {
       }
     }
     running = false
+  }
+}
+
+/// A rate borrowed from a `TelemetryRates` (see `borrow`).
+export class RateLease {
+  readonly rates: TelemetryRates
+  public readonly messageId: int
+  /// The rate it asks for, in microseconds between messages.
+  public readonly intervalUs: int
+  /// How the borrowed rate was asked for.
+  public result: RateResult
+  public released: bool = false
+
+  constructor(rates: TelemetryRates, messageId: int, intervalUs: int) {
+    this.rates = rates
+    this.messageId = messageId
+    this.intervalUs = intervalUs
+    this.result = { messageId: messageId, method: "none", ok: false, result: -1 }
+  }
+
+  /// Gives the rate back: what is asked for is then what the other leases that are out need, else the base (what `set` and `off`
+  /// gave the message, also while this was out), else the vehicle's own rate. Does it once: a second call does nothing, and says
+  /// false. Never throws: false too when the vehicle did not take it, or the manager was stopped (what the vehicle sends is then
+  /// up to it, and to its own timeouts).
+  public async release(): Promise<bool> {
+    if (released) {
+      return false
+    }
+    released = true
+    try {
+      const r = await rates.unlease(this)
+      return r.ok
+    } catch (e: Error) {
+      return false
+    }
   }
 }
