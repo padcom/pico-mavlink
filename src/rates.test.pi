@@ -9,7 +9,7 @@ import { MavLinkRouter } from "./router"
 import { RateResult, RatesOptions, TelemetryRates } from "./rates"
 import { SimulatedAutopilot, defaultSimParams } from "./simulator"
 import { Heartbeat } from "./dialects/minimal"
-import { Attitude, MavDataStream, SysStatus } from "./dialects/common"
+import { Attitude, AttitudeTarget, MavDataStream, SysStatus } from "./dialects/common"
 
 const FAST: RatesOptions = { timeoutMs: 100, retries: 1, settleMs: 30, silenceMs: 5000 }
 
@@ -532,6 +532,81 @@ async function managesEachVehicleOnARouter(): Promise<void> throws Error {
   gcs.close()
 }
 
+async function borrowedRateGoesBackToWhatWasHeld(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  await rig.rates.set(Attitude.MSG_ID, 4.0)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  expect(show(lease.result)).toBe("interval true 0")
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("40 40000")
+  expect(await lease.release()).toBe(true)
+  // what was held is back, on the vehicle and in the manager (so it is also what is asked for again after a reboot)
+  expect(`${rig.sim.intervals.get(Attitude.MSG_ID) ?? -2} ${rig.rates.held().map((h) => h.intervalUs).join(",")}`).toBe("250 250000")
+  // once: a second release asks for nothing
+  expect(await lease.release()).toBe(false)
+  rig.close()
+}
+
+async function borrowedRateOfAMessageNothingHeldIsGivenBack(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  rig.sim.rateScript = true
+  await delay(50)
+  let seen = 0
+  let top = 0.0
+  rig.gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof AttitudeTarget) {
+      seen += 1
+      if (m.bodyRollRate as f64 > top) {
+        top = m.bodyRollRate as f64
+      }
+    }
+  })
+  const lease = await rig.rates.borrow(AttitudeTarget.MSG_ID, 50.0)
+  expect(`${rig.sim.intervals.get(AttitudeTarget.MSG_ID) ?? -2} ${rig.rates.held().length}`).toBe("20 1")
+  await delay(2600)
+  // ATTITUDE_TARGET comes at 50 Hz, and the scripted desired rate has stepped up (after the first 2 s): 1 rad/s
+  expect(seen > 50).toBe(true)
+  expect(top).toBe(1.0)
+  expect(await lease.release()).toBe(true)
+  // nothing was held before, so nothing is held now, and the vehicle's own rate is asked for (its interval is gone)
+  expect(`${rig.sim.intervals.has(AttitudeTarget.MSG_ID)} ${rig.rates.held().length}`).toBe("false 0")
+  const before = seen
+  await delay(300)
+  expect(seen).toBe(before)
+  rig.close()
+}
+
+async function borrowedRateReleaseAfterStopDoesNotThrow(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  await delay(50)
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 25.0)
+  rig.sim.down = true
+  // the vehicle does not answer: the release says it did not put the rate back, and does not throw
+  expect(await lease.release()).toBe(false)
+  rig.close()
+}
+
+async function scriptedRollRateComesInAttitude(): Promise<void> throws Error {
+  const rig = new Rig(250, FAST)
+  rig.sim.rateScript = true
+  await delay(50)
+  let top = 0.0
+  rig.gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof Attitude && m.rollspeed as f64 > top) {
+      top = m.rollspeed as f64
+    }
+  })
+  const lease = await rig.rates.borrow(Attitude.MSG_ID, 50.0)
+  await delay(2900)
+  // the actual rate rose after the step at 2 s, and overshot it
+  expect(top > 1.0).toBe(true)
+  expect(top < 1.2).toBe(true)
+  await lease.release()
+  rig.close()
+}
+
 describe("telemetry rates", () => {
   it("sets a rate with SET_MESSAGE_INTERVAL, and the vehicle keeps it", honoursARate)
   it("switches a message off, and back to the vehicle's own rate", switchesAMessageOffAndBack)
@@ -553,6 +628,10 @@ describe("telemetry rates", () => {
   it("does not ask again after being stopped, and does not undo a successor", stopCancelsAskingAgain)
   it("keeps a clock per component", keepsAClockPerComponent)
   it("stops watching when stopped", stopsWatching)
+  it("puts back what was held when a borrowed rate is released, once", borrowedRateGoesBackToWhatWasHeld)
+  it("gives back to the vehicle a message that nothing was held for, and the scripted desired rate comes", borrowedRateOfAMessageNothingHeldIsGivenBack)
+  it("does not throw when the release finds the vehicle gone", borrowedRateReleaseAfterStopDoesNotThrow)
+  it("has the scripted actual roll rate in ATTITUDE", scriptedRollRateComesInAttitude)
   it("refuses rates that make no sense", refusesRatesThatMakeNoSense)
   it("looks after each vehicle on a router", managesEachVehicleOnARouter)
 })

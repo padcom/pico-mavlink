@@ -174,6 +174,26 @@ export class TelemetryRates {
     r
   }
 
+  /// Borrows a rate for a while: asks for `messageId` at `hz` as `set` does, and keeps what was held for it before (nothing, off, or an
+  /// interval), so that `release` of the lease puts it back. For a screen that wants a message faster only while it is shown. The leases
+  /// of one message are put back in the order the rates were borrowed, last first (each puts back what it found).
+  public async borrow(messageId: int, hz: f64): Promise<RateLease> throws Error {
+    const before = wanted.get(messageId)
+    const result = await set(messageId, hz)
+    new RateLease(this, messageId, before, result)
+  }
+
+  /// Puts a rate back to `intervalUs` (microseconds between messages, -1 for off), or, with null, gives the message back to the vehicle's
+  /// own rate and stops holding anything for it (`reset`).
+  public async restore(messageId: int, intervalUs: int?): Promise<RateResult> throws Error {
+    if (intervalUs == null) {
+      return await reset(messageId)
+    }
+    wanted.set(messageId, intervalUs!)
+    startWatching()
+    await request(messageId, null)
+  }
+
   /// What is held, in the order it was asked for.
   public held(): HeldRate[] {
     const out: HeldRate[] = []
@@ -481,5 +501,38 @@ export class TelemetryRates {
       }
     }
     running = false
+  }
+}
+
+/// A rate borrowed from a `TelemetryRates` (see `borrow`).
+export class RateLease {
+  readonly rates: TelemetryRates
+  public readonly messageId: int
+  /// What was held for the message before: an interval in microseconds, -1 for off, or null for nothing.
+  public readonly before: int?
+  /// How the borrowed rate was asked for.
+  public readonly result: RateResult
+  public released: bool = false
+
+  constructor(rates: TelemetryRates, messageId: int, before: int?, result: RateResult) {
+    this.rates = rates
+    this.messageId = messageId
+    this.before = before
+    this.result = result
+  }
+
+  /// Puts back what was held before the borrow. Does it once: a second call does nothing, and says false. Never throws: false too when the
+  /// vehicle did not take it back, or the manager was stopped (what the vehicle sends is then up to it, and to its own timeouts).
+  public async release(): Promise<bool> {
+    if (released) {
+      return false
+    }
+    released = true
+    try {
+      const r = await rates.restore(messageId, before)
+      return r.ok
+    } catch (e: Error) {
+      return false
+    }
   }
 }
