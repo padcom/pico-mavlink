@@ -6,8 +6,10 @@
 //  - MAV_CMD_DO_SET_MODE: param1 must have the custom-mode bit (else UNSUPPORTED), param2 is the Copter mode: an unknown one, or one in
 //    `refusedModes`, is FAILED, with "Mode change failed" in STATUSTEXT.
 //  - MAV_CMD_DO_PAUSE_CONTINUE: param1 0 pauses, 1 continues (anything else is DENIED); FAILED outside AUTO and GUIDED, as Copter does.
-//  - MAV_CMD_NAV_TAKEOFF: FAILED unless the vehicle is armed, on the ground (not `flying`) and in GUIDED (4), and when param7 (the altitude
-//    above home) is not above 0, as Copter's `do_user_takeoff_U_m` does (it says nothing in STATUSTEXT either); else ACCEPTED, and the vehicle
+//  - MAV_CMD_NAV_TAKEOFF: FAILED unless the vehicle is armed, on the ground (not `flying`) and in a mode with a user takeoff that needs a
+//    position (`TAKEOFF_MODES`: GUIDED 4, LOITER 5, POSHOLD 16, ZIGZAG 24: ArduCopter mode.h `has_user_takeoff(true)`; param3 0 asks for
+//    horizontal navigation), and when param7 (the altitude above home) is not above 0, as Copter's `do_user_takeoff_U_m` does (it says
+//    nothing in STATUSTEXT either); else ACCEPTED, and the vehicle
 //    is `flying` from then on (a normal disarm is refused: `takeoffs` counts them, `takeoffAltitude` is the last param7). The simulator
 //    does not model the climb or send a position.
 //  - MAV_CMD_RUN_PREARM_CHECKS: TEMPORARILY_REJECTED while armed; else ACCEPTED, and when a check fails (`prearm`) its "PreArm: ..." text
@@ -25,6 +27,9 @@ const FORCE_DISARM: int = MAGIC_FORCE_DISARM as int
 
 /// The Copter modes (ArduCopter `Mode::Number`) the simulated vehicle knows.
 const COPTER_MODES: int[] = [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+
+/// The Copter modes that take off on NAV_TAKEOFF with param3 0 (horizontal navigation required): GUIDED, LOITER, POSHOLD, ZIGZAG.
+const TAKEOFF_MODES: int[] = [4, 5, 16, 24]
 
 /// The simulated autopilot's arming, mode and pause.
 export class SimControl {
@@ -222,10 +227,11 @@ export class SimControl {
     MavResult.ACCEPTED
   }
 
-  /// ArduPilot (takeoff.cpp `do_user_takeoff_U_m`, mode_guided.cpp): FAILED unless the vehicle is armed, on the ground and in GUIDED, and
-  /// the altitude is above 0; ACCEPTED then, and the vehicle is flying.
+  /// ArduPilot (takeoff.cpp `do_user_takeoff_U_m`, mode.h `has_user_takeoff`): FAILED unless the vehicle is armed, on the ground and in
+  /// a mode that can take off with a position (GUIDED, LOITER, POSHOLD, ZIGZAG), and the altitude is above 0; ACCEPTED then, and the
+  /// vehicle is flying.
   takeOff(altitude: f64): int {
-    if (!isArmed() || flying || mode() != 4 || !(altitude > 0.0)) {
+    if (!isArmed() || flying || !TAKEOFF_MODES.includes(mode()) || !(altitude > 0.0)) {
       return MavResult.FAILED
     }
     flying = true

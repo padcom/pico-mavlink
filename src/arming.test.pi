@@ -375,16 +375,13 @@ async function noAltitudeThatIsNotOneIsSent(): Promise<void> throws Error {
   expect(rig.sent.length).toBe(0)
 }
 
-async function aTakeoffNeedsAnArmedVehicleOnTheGroundInGuided(): Promise<void> throws Error {
+async function aTakeoffNeedsAnArmedVehicleOnTheGround(): Promise<void> throws Error {
   const rig = new Rig()
   // disarmed
   const disarmed = await rig.control.takeoff(10.0)
   expect(disarmed.accepted).toBe(false)
   expect(disarmed.name).toBe("FAILED")
   const _a = await rig.control.arm()
-  // armed, but not in GUIDED (the default armed mode is LOITER)
-  const loiter = await rig.control.takeoff(10.0)
-  expect(loiter.accepted).toBe(false)
   const _m = await rig.control.setMode(4)
   const taken = await rig.control.takeoff(10.0)
   expect(taken.accepted).toBe(true)
@@ -405,8 +402,30 @@ async function aTakeoffNeedsAnArmedVehicleOnTheGroundInGuided(): Promise<void> t
       takeoffs.push(line)
     }
   }
-  expect(takeoffs.join("|")).toBe("22 0 0 0 0 0 0 10|22 0 0 0 0 0 0 10|22 0 0 0 0 0 0 10|22 0 0 0 0 0 0 20")
+  expect(takeoffs.join("|")).toBe("22 0 0 0 0 0 0 10|22 0 0 0 0 0 0 10|22 0 0 0 0 0 0 20")
   expect(rig.magic).toBe(0)
+}
+
+/// Which Copter modes take off on a NAV_TAKEOFF that needs a position (param3 0), as ArduCopter's `has_user_takeoff(true)` has it:
+/// GUIDED, LOITER, POSHOLD and ZIGZAG do; STABILIZE, ALT_HOLD, AUTO, RTL, LAND, SPORT and the like do not. (The Drone Configurator's own
+/// rule is stricter: its Take off puts the vehicle in GUIDED first.)
+async function aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther(): Promise<void> throws Error {
+  let accepted = ""
+  let refused = ""
+  for (const mode of [0, 2, 3, 4, 5, 6, 9, 16, 24, 13]) {
+    const rig = new Rig()
+    const _a = await rig.control.arm()
+    const _m = await rig.control.setMode(mode)
+    const got = await rig.control.takeoff(10.0)
+    rig.close()
+    if (got.accepted) {
+      accepted += `${mode} `
+    } else {
+      refused += `${mode} `
+    }
+  }
+  expect(accepted).toBe("4 5 16 24 ")
+  expect(refused).toBe("0 2 3 6 9 13 ")
 }
 
 async function aTakeoffNothingAcknowledgedIsNeverSentAgain(): Promise<void> throws Error {
@@ -451,7 +470,8 @@ describe("arming, modes and pause", () => {
   it("keeps the simulator's old behaviour: armed at the third tick, disarmed again after a reboot", theVehicleArmsItselfAtItsThirdTickWhenNothingIsSet)
   it("builds a takeoff of its altitude only, and never with a magic number", aTakeoffIsOnlyItsAltitude)
   it("sends no takeoff altitude that is not above 0 and at most 1000 m", noAltitudeThatIsNotOneIsSent)
-  it("takes off only when armed, on the ground and in GUIDED, and then a disarm in flight is refused", aTakeoffNeedsAnArmedVehicleOnTheGroundInGuided)
+  it("takes off only when armed and on the ground, and then a disarm in flight is refused", aTakeoffNeedsAnArmedVehicleOnTheGround)
+  it("takes off in GUIDED, LOITER, POSHOLD and ZIGZAG and in no other mode (a position is needed)", aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther)
   it("never sends a takeoff again that nothing acknowledged", aTakeoffNothingAcknowledgedIsNeverSentAgain)
   it("names a result", () => {
     expect(resultName(MavResult.ACCEPTED)).toBe("ACCEPTED")

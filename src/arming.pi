@@ -14,8 +14,11 @@
 //  - MAV_CMD_NAV_TAKEOFF (ArduCopter GCS_MAVLink_Copter.cpp `handle_MAV_CMD_NAV_TAKEOFF`, takeoff.cpp `do_user_takeoff_U_m`): param7 is the
 //    altitude in metres ABOVE HOME (a COMMAND_LONG is taken as the relative frame), param3 0 means horizontal navigation is required
 //    (the vehicle needs a position), params 4 to 6 are not used. The vehicle answers FAILED unless it is ARMED, still on the ground and in
-//    a mode that can take off (GUIDED), and when the altitude is not above where it is; ACCEPTED starts the climb. It is the motion that
-//    begins a flight, so it is sent ONCE like the rest (a takeoff whose ack was lost may be under way).
+//    a mode that takes off by itself when a position is required (`has_user_takeoff(true)`: GUIDED, LOITER, POSHOLD and ZIGZAG; ALT_HOLD,
+//    SPORT and the like only take off without it, which param3 0 does not ask for), and when the altitude is not above where it is;
+//    ACCEPTED starts the climb. It is the motion that begins a flight, so it is sent ONCE like the rest (a takeoff whose ack was lost may
+//    be under way). THIS LIBRARY does not choose the mode: the caller's own rule may be stricter (the Drone Configurator's Take off puts
+//    the vehicle in GUIDED first).
 //  - RETRIES ARE 0, ON PURPOSE. A command that was not acknowledged may well have been carried out (an arm whose ack was lost has
 //    ARMED the vehicle): sending it again, later, could arm a vehicle somebody has since disarmed. So every command is sent ONCE and a
 //    missing ack is returned as `acknowledged: false` (the one exception is the emergency stop: `emergencyStopRetrying` sends it up to 3
@@ -165,7 +168,8 @@ export class VehicleControl {
   }
 
   /// Takes off to `altitude` metres above home (above 0, at most `MAX_TAKEOFF_M`; anything else is an `INVALID_VALUE` MavLinkError and
-  /// nothing is sent). The vehicle must be armed, on the ground and in GUIDED, else it answers FAILED. Sent once.
+  /// nothing is sent). The vehicle must be armed, on the ground and in a mode that can take off (GUIDED, LOITER, POSHOLD, ZIGZAG), else
+  /// it answers FAILED. Sent once.
   public async takeoff(altitude: f64): Promise<ControlResult> throws Error {
     await send(MavCmd.NAV_TAKEOFF, takeoffParams(altitude))
   }
