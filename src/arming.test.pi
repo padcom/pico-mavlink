@@ -407,12 +407,13 @@ async function aTakeoffNeedsAnArmedVehicleOnTheGround(): Promise<void> throws Er
 }
 
 /// Which Copter modes take off on a NAV_TAKEOFF that needs a position (param3 0), as ArduCopter's `has_user_takeoff(true)` has it:
-/// GUIDED, LOITER, POSHOLD and ZIGZAG do; STABILIZE, ALT_HOLD, AUTO, RTL, LAND, SPORT and the like do not. (The Drone Configurator's own
+/// GUIDED (and AVOID_ADSB, GUIDED_NOGPS and FOLLOW, which inherit it), LOITER, POSHOLD and ZIGZAG do; STABILIZE, ALT_HOLD, AUTO, RTL, LAND,
+/// SPORT and the like do not. (The Drone Configurator's own
 /// rule is stricter: its Take off puts the vehicle in GUIDED first.)
 async function aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther(): Promise<void> throws Error {
   let accepted = ""
   let refused = ""
-  for (const mode of [0, 2, 3, 4, 5, 6, 9, 16, 24, 13]) {
+  for (const mode of [0, 2, 3, 4, 5, 6, 9, 13, 16, 19, 20, 23, 24]) {
     const rig = new Rig()
     const _a = await rig.control.arm()
     const _m = await rig.control.setMode(mode)
@@ -424,7 +425,7 @@ async function aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther(): Promise<
       refused += `${mode} `
     }
   }
-  expect(accepted).toBe("4 5 16 24 ")
+  expect(accepted).toBe("4 5 16 19 20 23 24 ")
   expect(refused).toBe("0 2 3 6 9 13 ")
 }
 
@@ -471,7 +472,7 @@ describe("arming, modes and pause", () => {
   it("builds a takeoff of its altitude only, and never with a magic number", aTakeoffIsOnlyItsAltitude)
   it("sends no takeoff altitude that is not above 0 and at most 1000 m", noAltitudeThatIsNotOneIsSent)
   it("takes off only when armed and on the ground, and then a disarm in flight is refused", aTakeoffNeedsAnArmedVehicleOnTheGround)
-  it("takes off in GUIDED, LOITER, POSHOLD and ZIGZAG and in no other mode (a position is needed)", aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther)
+  it("takes off in GUIDED (and the guided modes), LOITER, POSHOLD and ZIGZAG and in no other mode", aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther)
   it("never sends a takeoff again that nothing acknowledged", aTakeoffNothingAcknowledgedIsNeverSentAgain)
   it("names a result", () => {
     expect(resultName(MavResult.ACCEPTED)).toBe("ACCEPTED")
