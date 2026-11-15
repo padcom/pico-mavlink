@@ -24,7 +24,7 @@ import { SimControl } from "./simcontrol"
 import { actualRate, desiredRate } from "./simrate"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
 import { Attitude, AttitudeTarget, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime } from "./dialects/common"
-import { AutopilotVersion, MavProtocolCapability } from "./dialects/standard"
+import { AutopilotVersion, GlobalPositionInt, MavProtocolCapability } from "./dialects/standard"
 
 /// An FTP request and who sent it.
 class FtpAsk {
@@ -216,6 +216,10 @@ export class SimulatedAutopilot {
   /// Arming, flight modes, pause and the pre-arm checks (COMPONENT_ARM_DISARM, DO_SET_MODE, DO_PAUSE_CONTINUE, RUN_PREARM_CHECKS): see
   /// simcontrol.pi. By itself the vehicle arms at its third tick; a `prearm` text makes an arm FAILED with "PreArm: <text>".
   public readonly control: SimControl
+  /// Whether GLOBAL_POSITION_INT (where the simulated vehicle is, `control.lat`, `control.lon`, `control.height`) is sent at each tick (off: nothing).
+  public positionStream: bool = false
+  /// The time between ticks (ms), as `start` was given it: the vehicle moves by that much at each.
+  tickMs: int = 1000
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -249,6 +253,7 @@ export class SimulatedAutopilot {
   /// Starts answering and sending telemetry every `intervalMs`.
   public start(intervalMs: int = 1000): void {
     conn.run()
+    tickMs = intervalMs
     tick()
     timer = setInterval(() => tick(), intervalMs)
   }
@@ -390,7 +395,22 @@ export class SimulatedAutopilot {
     if (servoStream) {
       sendServo()
     }
+    control.advance(tickMs as f64 / 1000.0)
+    if (positionStream) {
+      sendPosition()
+    }
     ticks += 1
+  }
+
+  /// GLOBAL_POSITION_INT: where the simulated vehicle is.
+  public sendPosition(): void {
+    const g = new GlobalPositionInt()
+    g.timeBootMs = ((Date.now() as int) - bootedAt) as u32
+    g.lat = control.lat as i32
+    g.lon = control.lon as i32
+    g.alt = Math.round(control.height * 1000.0) as i32
+    g.relativeAlt = Math.round(control.height * 1000.0) as i32
+    conn.send(g)
   }
 
   /// SERVO_OUTPUT_RAW: the pulses of the 8 outputs of the main port (`motors.outputs()`).

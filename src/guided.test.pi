@@ -1,0 +1,244 @@
+// Guided control: DO_REPOSITION and DO_SET_HOME as COMMAND_INT, DO_CHANGE_SPEED, the change of altitude, and the simulated vehicle that flies to a
+// target (arming.pi has the protocol and the ArduCopter source it comes from).
+import { describe, it, expect } from "std/test"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError } from "./protocol"
+import { SimulatedAutopilot } from "./simulator"
+import { MAX_REPOSITION_M, MAX_SPEED_MS, VehicleControl, degreesE7, homeHereParams, repositionParams, speedParams } from "./arming"
+import { CommandInt, CommandLong } from "./dialects/common"
+
+/// The home of the simulated vehicle, as `SimControl` starts it, in degrees.
+const HOME_LAT: f64 = 52.2297
+const HOME_LON: f64 = 21.0122
+
+/// A ground station and an armed vehicle in GUIDED (or not), that records what it was sent.
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly control: VehicleControl
+  /// The COMMAND_INTs it was sent, as "command frame param1 param2 param3 param4 x y z".
+  public readonly ints: string[] = []
+  /// The COMMAND_LONGs it was sent, as "command p1 p2 p3 p4 p5 p6 p7".
+  public readonly longs: string[] = []
+
+  constructor(armed: bool, mode: int) {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.sim.control.armedSet = if (armed) 1 else 0
+    this.sim.control.modeSet = mode
+    this.gcs = new MavLinkConnection(ends[0])
+    this.control = new VehicleControl(this.gcs, { system: 1, component: 1 }, { timeoutMs: 150 })
+    this.sim.conn.on((r: Received) => {
+      const m = r.message
+      if (m instanceof CommandInt) {
+        this.ints.push(`${m.command} ${m.frame} ${m._param1} ${m._param2} ${m._param3} ${m._param4} ${m._param5} ${m._param6} ${m._param7}`)
+      } else if (m instanceof CommandLong) {
+        this.longs.push(`${m.command} ${m._param1} ${m._param2} ${m._param3} ${m._param4} ${m._param5} ${m._param6} ${m._param7}`)
+      }
+    })
+    this.gcs.run()
+    this.sim.start(1000)
+  }
+
+  public close(): void {
+    sim.stop()
+    gcs.close()
+  }
+}
+
+/// One of the calls that must be refused before anything is sent: the number says which.
+async function badCall(rig: Rig, which: int): Promise<void> throws Error {
+  const nan = 0.0 / 0.0
+  const c = rig.control
+  if (which == 0) {
+    const _r = await c.reposition(91.0, 21.0, 10.0)
+  } else if (which == 1) {
+    const _r = await c.reposition(-91.0, 21.0, 10.0)
+  } else if (which == 2) {
+    const _r = await c.reposition(52.0, 181.0, 10.0)
+  } else if (which == 3) {
+    const _r = await c.reposition(nan, 21.0, 10.0)
+  } else if (which == 4) {
+    const _r = await c.reposition(52.0, nan, 10.0)
+  } else if (which == 5) {
+    const _r = await c.reposition(52.0, 21.0, -1.0)
+  } else if (which == 6) {
+    const _r = await c.reposition(52.0, 21.0, nan)
+  } else if (which == 7) {
+    const _r = await c.reposition(52.0, 21.0, MAX_REPOSITION_M + 1.0)
+  } else if (which == 8) {
+    const _r = await c.changeAltitude(52.0, 21.0, -5.0)
+  } else if (which == 9) {
+    const _r = await c.setSpeed(0.0)
+  } else if (which == 10) {
+    const _r = await c.setSpeed(-3.0)
+  } else if (which == 11) {
+    const _r = await c.setSpeed(nan)
+  } else if (which == 12) {
+    const _r = await c.setSpeed(MAX_SPEED_MS + 1.0)
+  } else if (which == 13) {
+    const _r = await c.setHome(95.0, 21.0, 100.0)
+  } else {
+    const _r = await c.setHome(52.0, 21.0, nan)
+  }
+}
+
+async function nothingThatIsNotAPlaceOrASpeedIsSent(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  let refused = 0
+  for (let which = 0; which < 15; which++) {
+    try {
+      await badCall(rig, which)
+    } catch (e: Error) {
+      if (e instanceof MavLinkError && e.code == "INVALID_VALUE") {
+        refused += 1
+      }
+    }
+  }
+  rig.close()
+  expect(refused).toBe(15)
+  expect(rig.ints.length).toBe(0)
+  expect(rig.longs.length).toBe(0)
+}
+
+function aPlaceIsDegreesTimesTenMillion(): void {
+  expect(degreesE7(52.2297, 90.0, "a latitude")).toBe(522297000)
+  expect(degreesE7(-21.0122, 180.0, "a longitude")).toBe(-210122000)
+  expect(degreesE7(52.229712345, 90.0, "a latitude")).toBe(522297123)
+  expect(degreesE7(90.0, 90.0, "a latitude")).toBe(900000000)
+  // a reposition never changes the mode or the speed by itself
+  expect(repositionParams()[0]).toBe(-1.0)
+  expect(repositionParams()[1]).toBe(0.0)
+  expect(speedParams(7.5)[1]).toBe(7.5)
+  expect(homeHereParams()[0]).toBe(1.0)
+}
+
+async function aRepositionIsRefusedOutsideGuidedAndNeverChangesTheMode(): Promise<void> throws Error {
+  const rig = new Rig(true, 5)
+  const got = await rig.control.reposition(52.23, 21.02, 20.0)
+  rig.close()
+  expect(got.accepted).toBe(false)
+  expect(got.name).toBe("DENIED")
+  expect(rig.sim.control.repositions).toBe(0)
+  expect(rig.sim.control.mode()).toBe(5)
+  // the change-mode bit (param2) is never set
+  expect(rig.ints.length).toBe(1)
+  expect(rig.ints[0]).toBe("192 6 -1 0 0 0 522300000 210200000 20")
+}
+
+async function aRepositionInGuidedLoadsTheTarget(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  const got = await rig.control.reposition(52.2301, 21.0131, 25.5)
+  rig.close()
+  expect(got.accepted).toBe(true)
+  expect(rig.sim.control.repositions).toBe(1)
+  expect(rig.sim.control.targetLat).toBe(522301000)
+  expect(rig.sim.control.targetLon).toBe(210131000)
+  expect(rig.sim.control.targetHeight).toBe(25.5)
+  expect(rig.sim.control.mode()).toBe(4)
+  expect(rig.sim.control.modeChanges).toBe(0)
+  // a COMMAND_INT, in the frame relative to home
+  expect(rig.ints.length).toBe(1)
+  expect(rig.ints[0]).toBe("192 6 -1 0 0 0 522301000 210131000 25.5")
+  expect(rig.longs.length).toBe(0)
+}
+
+async function aChangeOfAltitudeIsARepositionToTheSamePlace(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  const got = await rig.control.changeAltitude(HOME_LAT, HOME_LON, 40.0)
+  rig.close()
+  expect(got.accepted).toBe(true)
+  expect(rig.ints[0]).toBe("192 6 -1 0 0 0 522297000 210122000 40")
+  expect(rig.sim.control.targetHeight).toBe(40.0)
+}
+
+async function theSpeedIsSetOnceAndTheSimulatorKeepsIt(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  const got = await rig.control.setSpeed(8.0)
+  rig.close()
+  expect(got.accepted).toBe(true)
+  expect(rig.sim.control.groundSpeed).toBe(8.0)
+  // DO_CHANGE_SPEED: ground speed (1), the speed, throttle unchanged (-1)
+  expect(rig.longs.join("|")).toBe("178 1 8 -1 0 0 0 0")
+}
+
+async function homeIsSetToWhereTheVehicleIsOrToAPlace(): Promise<void> throws Error {
+  const rig = new Rig(false, 0)
+  const here = await rig.control.setHomeHere()
+  expect(here.accepted).toBe(true)
+  const there = await rig.control.setHome(52.2, 21.1, 120.0)
+  rig.close()
+  expect(there.accepted).toBe(true)
+  expect(rig.sim.control.homeSets).toBe(2)
+  expect(rig.sim.control.homeLat).toBe(522000000)
+  expect(rig.sim.control.homeLon).toBe(211000000)
+  expect(rig.longs.join("|")).toBe("179 1 0 0 0 0 0 0")
+  // the place goes as a COMMAND_INT in the global frame (0), param1 0
+  expect(rig.ints.join("|")).toBe("179 0 0 0 0 0 522000000 211000000 120")
+}
+
+async function homeIsRefusedByAVehicleWithoutAnOrigin(): Promise<void> throws Error {
+  const rig = new Rig(false, 0)
+  rig.sim.control.noEkfOrigin = true
+  const got = await rig.control.setHomeHere()
+  rig.close()
+  expect(got.accepted).toBe(false)
+  expect(got.name).toBe("FAILED")
+  expect(rig.sim.control.homeSets).toBe(0)
+}
+
+async function nothingAcknowledgedIsNeverSentAgain(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  rig.sim.control.swallowAcks = 1
+  const got = await rig.control.reposition(52.23, 21.02, 20.0)
+  rig.close()
+  expect(got.acknowledged).toBe(false)
+  expect(got.name).toBe("UNACKNOWLEDGED")
+  // carried out, and sent exactly once
+  expect(rig.sim.control.repositions).toBe(1)
+  expect(rig.ints.length).toBe(1)
+}
+
+async function theVehicleClimbsAndFliesToTheTarget(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  const up = await rig.control.takeoff(10.0)
+  expect(up.accepted).toBe(true)
+  const control = rig.sim.control
+  // 2.5 m/s: 4 s up
+  control.advance(2.0)
+  expect(control.height).toBe(5.0)
+  control.advance(2.0)
+  expect(control.height).toBe(10.0)
+  // a target about 55 m north of home, 20 m up; ground speed 5 m/s by default
+  const to = await rig.control.reposition(HOME_LAT + 0.0005, HOME_LON, 20.0)
+  rig.close()
+  expect(to.accepted).toBe(true)
+  control.advance(4.0)
+  expect(control.lat > 522297000).toBe(true)
+  expect(control.lat < 522302000).toBe(true)
+  expect(control.height).toBe(20.0)
+  control.advance(60.0)
+  expect(control.lat).toBe(522302000)
+  expect(control.lon).toBe(210122000)
+  // a vehicle that is not flying stays where it is
+  const grounded = new Rig(true, 4)
+  const _r = await grounded.control.reposition(HOME_LAT + 0.01, HOME_LON, 20.0)
+  grounded.sim.control.advance(100.0)
+  grounded.close()
+  expect(grounded.sim.control.lat).toBe(522297000)
+  expect(grounded.sim.control.height).toBe(0.0)
+}
+
+describe("guided control", () => {
+  it("sends nothing for a place, an altitude, a speed or a home that is not one", nothingThatIsNotAPlaceOrASpeedIsSent)
+  it("writes a place as degrees times 1e7, and builds parameters that change nothing else", aPlaceIsDegreesTimesTenMillion)
+  it("is refused outside GUIDED, and never changes the mode", aRepositionIsRefusedOutsideGuidedAndNeverChangesTheMode)
+  it("loads the target of a reposition in GUIDED, as a COMMAND_INT relative to home", aRepositionInGuidedLoadsTheTarget)
+  it("changes the altitude as a reposition to the same place", aChangeOfAltitudeIsARepositionToTheSamePlace)
+  it("sets the ground speed with DO_CHANGE_SPEED", theSpeedIsSetOnceAndTheSimulatorKeepsIt)
+  it("sets home to where the vehicle is, or to a place", homeIsSetToWhereTheVehicleIsOrToAPlace)
+  it("is refused a home by a vehicle that has no EKF origin", homeIsRefusedByAVehicleWithoutAnOrigin)
+  it("never sends a reposition again that nothing acknowledged", nothingAcknowledgedIsNeverSentAgain)
+  it("flies to the target at its speed, climbing as it goes, and not before it has taken off", theVehicleClimbsAndFliesToTheTarget)
+})

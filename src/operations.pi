@@ -4,9 +4,10 @@
 import { delay } from "std/timers"
 import { MavLinkConnection, Received } from "./connection"
 import { MavLinkError } from "./protocol"
+import { MavLinkData } from "./data"
 import { ParamEncoding, TypedParamValue, decodeParam, encodeParam, sameParam } from "./params"
 import { Heartbeat, MavAutopilot, MavState, MavType } from "./dialects/minimal"
-import { CommandAck, CommandLong, MavCmd, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
+import { CommandAck, CommandInt, CommandLong, MavCmd, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue } from "./dialects/common"
 import { AutopilotVersion } from "./dialects/standard"
 
 /// Which system and component an operation talks to (component 0: any component of the system).
@@ -466,13 +467,7 @@ export class CommandCall {
   /// MAV_RESULT of `command` with up to seven parameters; a `TIMEOUT` MavLinkError when nothing
   /// acks it.
   public async run(command: int, params: f64[] = []): Promise<int> throws Error {
-    const name = MavCmd.nameOf(command) ?? `${command}`
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      checkAborted(signal, name)
-      // With no retries (a command that must never be sent twice) ONE wait takes only a FINAL ack (an IN_PROGRESS is let go by,
-      // inside the same timeout and with no gap in which an ack could be missed); with retries an IN_PROGRESS is the signal to ask again.
-      const finalOnly = retries == 0
-      const reply = conn.waitFor((r: Received) => isAckOf(r, target, command) && !(finalOnly && inProgress(r)), timeoutMs, signal)
+    return await exchange(command, (attempt: int) => {
       const c = new CommandLong()
       c.targetSystem = target.system as u8
       c.targetComponent = target.component as u8
@@ -486,7 +481,45 @@ export class CommandCall {
       c._param5 = p(4)
       c._param6 = p(5)
       c._param7 = p(6)
-      await conn.send(c)
+      return c
+    })
+  }
+
+  /// MAV_RESULT of `command` sent as a COMMAND_INT: `params` are its first four parameters (floats), `x` and `y` the latitude and
+  /// longitude in degrees times 1e7 (or any integer the command takes), `z` the altitude (or any float), all in `frame` (a MAV_FRAME).
+  /// A position does not lose precision as it does in a COMMAND_LONG's floats. Like `run`: a `TIMEOUT` MavLinkError when nothing acks it,
+  /// and with `retries` 0 the command is sent once.
+  public async runInt(command: int, frame: int, params: f64[], x: int, y: int, z: f64): Promise<int> throws Error {
+    return await exchange(command, (_attempt: int) => {
+      const c = new CommandInt()
+      c.targetSystem = target.system as u8
+      c.targetComponent = target.component as u8
+      c.command = command as u16
+      c.frame = frame as u8
+      c.current = 0
+      c.autocontinue = 0
+      const p = (i: int) => (if (i < params.length) params[i] else 0.0) as f32
+      c._param1 = p(0)
+      c._param2 = p(1)
+      c._param3 = p(2)
+      c._param4 = p(3)
+      c._param5 = x as i32
+      c._param6 = y as i32
+      c._param7 = z as f32
+      return c
+    })
+  }
+
+  /// Sends what `make` builds (it is told which attempt it is) and waits for the ack of `command`, as `run` does.
+  async exchange(command: int, make: (attempt: int) => MavLinkData): Promise<int> throws Error {
+    const name = MavCmd.nameOf(command) ?? `${command}`
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      checkAborted(signal, name)
+      // With no retries (a command that must never be sent twice) ONE wait takes only a FINAL ack (an IN_PROGRESS is let go by,
+      // inside the same timeout and with no gap in which an ack could be missed); with retries an IN_PROGRESS is the signal to ask again.
+      const finalOnly = retries == 0
+      const reply = conn.waitFor((r: Received) => isAckOf(r, target, command) && !(finalOnly && inProgress(r)), timeoutMs, signal)
+      await conn.send(make(attempt))
       const r = await reply
       if (r != null) {
         const m = r!.message
