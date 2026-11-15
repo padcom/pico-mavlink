@@ -4,7 +4,7 @@ import { MavLinkConnection, Received } from "./connection"
 import { MemoryStream } from "./stream"
 import { MavLinkError } from "./protocol"
 import { SimulatedAutopilot } from "./simulator"
-import { MAGIC_FORCE_DISARM, MAGIC_SKIP_CHECKS, VehicleControl, armParams, controlResult, emergencyStopParams, modeParams, pauseParams, prearmParams, resultName } from "./arming"
+import { MAGIC_FORCE_DISARM, MAGIC_SKIP_CHECKS, MAX_TAKEOFF_M, VehicleControl, armParams, controlResult, emergencyStopParams, modeParams, pauseParams, prearmParams, resultName, takeoffParams } from "./arming"
 import { CommandCall } from "./operations"
 import { CommandLong, MavCmd, MavResult, StatusText } from "./dialects/common"
 
@@ -342,6 +342,114 @@ async function theVehicleArmsItselfAtItsThirdTickWhenNothingIsSet(): Promise<voi
   gcs.close()
 }
 
+function aTakeoffIsOnlyItsAltitude(): void {
+  const p = takeoffParams(12.5)
+  expect(p.length).toBe(7)
+  expect(p[6]).toBe(12.5)
+  for (let i = 0; i < 6; i++) {
+    expect(p[i]).toBe(0.0)
+  }
+  // no magic number in any takeoff
+  for (const altitude of [0.5, 2.0, 50.0, MAX_TAKEOFF_M]) {
+    for (const v of takeoffParams(altitude)) {
+      expect(v == MAGIC_SKIP_CHECKS || v == MAGIC_FORCE_DISARM).toBe(false)
+    }
+  }
+}
+
+async function noAltitudeThatIsNotOneIsSent(): Promise<void> throws Error {
+  const rig = new Rig()
+  const nan = 0.0 / 0.0
+  let refused = 0
+  for (const altitude of [0.0, -1.0, nan, MAX_TAKEOFF_M + 1.0]) {
+    try {
+      const _t = await rig.control.takeoff(altitude)
+    } catch (e: Error) {
+      if (e instanceof MavLinkError && e.code == "INVALID_VALUE") {
+        refused += 1
+      }
+    }
+  }
+  rig.close()
+  expect(refused).toBe(4)
+  expect(rig.sent.length).toBe(0)
+}
+
+async function aTakeoffNeedsAnArmedVehicleOnTheGround(): Promise<void> throws Error {
+  const rig = new Rig()
+  // disarmed
+  const disarmed = await rig.control.takeoff(10.0)
+  expect(disarmed.accepted).toBe(false)
+  expect(disarmed.name).toBe("FAILED")
+  const _a = await rig.control.arm()
+  const _m = await rig.control.setMode(4)
+  const taken = await rig.control.takeoff(10.0)
+  expect(taken.accepted).toBe(true)
+  expect(rig.sim.control.takeoffs).toBe(1)
+  expect(rig.sim.control.takeoffAltitude).toBe(10.0)
+  expect(rig.sim.control.flying).toBe(true)
+  // flying: another takeoff is refused, and so is a normal disarm
+  const again = await rig.control.takeoff(20.0)
+  const disarm = await rig.control.disarm()
+  rig.close()
+  expect(again.accepted).toBe(false)
+  expect(disarm.accepted).toBe(false)
+  expect(rig.sim.control.takeoffs).toBe(1)
+  // the altitude is param7 of NAV_TAKEOFF
+  const takeoffs: string[] = []
+  for (const line of rig.sent) {
+    if (line.startsWith("22 ")) {
+      takeoffs.push(line)
+    }
+  }
+  expect(takeoffs.join("|")).toBe("22 0 0 0 0 0 0 10|22 0 0 0 0 0 0 10|22 0 0 0 0 0 0 20")
+  expect(rig.magic).toBe(0)
+}
+
+/// Which Copter modes take off on a NAV_TAKEOFF that needs a position (param3 0), as ArduCopter's `has_user_takeoff(true)` has it:
+/// GUIDED (and AVOID_ADSB, GUIDED_NOGPS and FOLLOW, which inherit it), LOITER, POSHOLD and ZIGZAG do; STABILIZE, ALT_HOLD, AUTO, RTL, LAND,
+/// SPORT and the like do not. (The Drone Configurator's own
+/// rule is stricter: its Take off puts the vehicle in GUIDED first.)
+async function aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther(): Promise<void> throws Error {
+  let accepted = ""
+  let refused = ""
+  for (const mode of [0, 2, 3, 4, 5, 6, 9, 13, 16, 19, 20, 23, 24]) {
+    const rig = new Rig()
+    const _a = await rig.control.arm()
+    const _m = await rig.control.setMode(mode)
+    const got = await rig.control.takeoff(10.0)
+    rig.close()
+    if (got.accepted) {
+      accepted += `${mode} `
+    } else {
+      refused += `${mode} `
+    }
+  }
+  expect(accepted).toBe("4 5 16 19 20 23 24 ")
+  expect(refused).toBe("0 2 3 6 9 13 ")
+}
+
+async function aTakeoffNothingAcknowledgedIsNeverSentAgain(): Promise<void> throws Error {
+  const rig = new Rig(80)
+  const _a = await rig.control.arm()
+  const _m = await rig.control.setMode(4)
+  rig.sim.control.swallowAcks = 1
+  const lost = await rig.control.takeoff(10.0)
+  await delay(200)
+  rig.close()
+  expect(lost.acknowledged).toBe(false)
+  expect(lost.name).toBe("UNACKNOWLEDGED")
+  // it was carried out once, and never sent again
+  expect(rig.sim.control.takeoffs).toBe(1)
+  let takeoffs = 0
+  for (const line of rig.sent) {
+    if (line.startsWith("22 ")) {
+      takeoffs += 1
+    }
+  }
+  expect(takeoffs).toBe(1)
+}
+
 describe("arming, modes and pause", () => {
   it("builds param2 as 0 everywhere but in the emergency stop (21196), and never 2989", buildersSendMagicOnlyForTheEmergencyStop)
   it("sends one command per call and a magic number only for the emergency stop", everyMethodSendsOneCommandAndOnlyTheStopHasAMagicNumber)
@@ -361,6 +469,11 @@ describe("arming, modes and pause", () => {
   it("gives up on an emergency stop nothing answers after 3 sends", theEmergencyStopGivesUpAfterThreeSends)
   it("is ignored by a vehicle it is not addressed to", aCommandAnotherSystemIsNotMineIsIgnored)
   it("keeps the simulator's old behaviour: armed at the third tick, disarmed again after a reboot", theVehicleArmsItselfAtItsThirdTickWhenNothingIsSet)
+  it("builds a takeoff of its altitude only, and never with a magic number", aTakeoffIsOnlyItsAltitude)
+  it("sends no takeoff altitude that is not above 0 and at most 1000 m", noAltitudeThatIsNotOneIsSent)
+  it("takes off only when armed and on the ground, and then a disarm in flight is refused", aTakeoffNeedsAnArmedVehicleOnTheGround)
+  it("takes off in GUIDED (and the guided modes), LOITER, POSHOLD and ZIGZAG and in no other mode", aTakeoffIsAcceptedInTheModesThatCanNavigateAndNoOther)
+  it("never sends a takeoff again that nothing acknowledged", aTakeoffNothingAcknowledgedIsNeverSentAgain)
   it("names a result", () => {
     expect(resultName(MavResult.ACCEPTED)).toBe("ACCEPTED")
     expect(resultName(MavResult.FAILED)).toBe("FAILED")

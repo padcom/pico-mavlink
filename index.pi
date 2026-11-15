@@ -145,6 +145,7 @@ export {
   MAGIC_FORCE_DISARM,
   MAGIC_SKIP_CHECKS,
   MAX_MODE,
+  MAX_TAKEOFF_M,
   STOP_GAP_MS,
   STOP_RESENDS,
   VehicleControl,
@@ -155,6 +156,7 @@ export {
   pauseParams,
   prearmParams,
   resultName,
+  takeoffParams,
   unacknowledged,
 } from "./src/arming"
 export { UP_AFTER_MS, waitUntilUp } from "./src/ready"
