@@ -34,5 +34,5 @@ export class Crc32 {
 export function crc32Of(b: Uint8Array): int {
   const c = new Crc32()
   c.update(b)
-  c.crc
+  return c.crc
 }

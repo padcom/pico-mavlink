@@ -10,11 +10,11 @@ export function x25crc(b: Uint8Array, from: int, to: int, magic: int? = null): i
   if (magic != null) {
     crc = step(crc, magic!)
   }
-  crc
+  return crc
 }
 
 function step(crc: int, byte: int): int {
   let tmp = (byte & 0xFF) ^ (crc & 0xFF)
   tmp = (tmp ^ (tmp << 4)) & 0xFF
-  ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+  return ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
 }

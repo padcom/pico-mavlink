@@ -87,7 +87,7 @@ function streamOf(messageId: int): int {
       return pair[1]
     }
   }
-  -1
+  return -1
 }
 
 /// How many times in a row the rates are asked for again after a reboot, when the connection fails or the
@@ -184,7 +184,7 @@ export class TelemetryRates {
       drop(lease)
       throw e
     }
-    lease
+    return lease
   }
 
   /// Puts a rate back to `intervalUs` (microseconds between messages, -1 for off), or, with null, gives the message back to the vehicle's
@@ -212,7 +212,7 @@ export class TelemetryRates {
     if (intervalUs < 1) {
       return 1
     }
-    intervalUs
+    return intervalUs
   }
 
   /// What `messageId` is to be at: the base while no lease is out; while some are, the shortest interval of the leases and the
@@ -234,7 +234,7 @@ export class TelemetryRates {
     if (own != null && own! > 0 && own! < fastest) {
       fastest = own!
     }
-    fastest
+    return fastest
   }
 
   /// Removes a lease from those that are out, and what is wanted follows (the request is `hold`'s): when nothing is wanted any more
@@ -292,17 +292,17 @@ export class TelemetryRates {
     for (const [id, interval] of wanted) {
       out.push({ messageId: id, intervalUs: interval, method: methods.get(id) ?? "none" })
     }
-    out
+    return out
   }
 
   /// Whether the manager is asking the vehicle for SYSTEM_TIME to see a restart (it does while something is held).
   public watching(): bool {
-    watcher >= 0
+    return watcher >= 0
   }
 
   /// How many reboots or reconnects were noticed.
   public rebootCount(): int {
-    reboots
+    return reboots
   }
 
   /// Calls `handler` with the results each time the rates were asked for again after a reboot or reconnect.
@@ -334,7 +334,7 @@ export class TelemetryRates {
         results.push(failed)
       }
     }
-    results
+    return results
   }
 
   /// Stops watching the connection, and cancels asking again after a reboot, scheduled or begun (the request
@@ -417,7 +417,7 @@ export class TelemetryRates {
       throw e
     }
     release()
-    out!
+    return out!
   }
 
   /// SET_MESSAGE_INTERVAL; or, if the vehicle does not accept it (or does not answer), REQUEST_DATA_STREAM.
@@ -451,7 +451,7 @@ export class TelemetryRates {
     await requestStream(stream)
     remember(messageId, "stream")
     const sent: RateResult = { messageId: messageId, method: "stream", ok: true, result: result }
-    sent
+    return sent
   }
 
   /// How `messageId` was last asked for, kept only while a rate is held for it.
@@ -483,7 +483,7 @@ export class TelemetryRates {
 
   /// Whether a message is from the vehicle this manager looks after.
   fromTarget(r: Received): bool {
-    r.packet.header.sysid == target.system && (target.component == 0 || r.packet.header.compid == target.component)
+    return r.packet.header.sysid == target.system && (target.component == 0 || r.packet.header.compid == target.component)
   }
 
   /// The vehicle's time since boot in a message that has it, or -1.
@@ -506,7 +506,7 @@ export class TelemetryRates {
     if (at! < 0) {
       return -1
     }
-    readU32(r.packet.payload, at!) as int
+    return readU32(r.packet.payload, at!) as int
   }
 
   seen(r: Received): void {

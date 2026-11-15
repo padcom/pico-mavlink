@@ -20,7 +20,7 @@ async function counts(chunk: int): Promise<string> throws Error {
   for (let i = 0; i < bytes.length; i += chunk) {
     n += s.push(bytes.slice(i, if (i + chunk < bytes.length) i + chunk else bytes.length)).length
   }
-  `${n} ${s.validPackets}/${s.invalidPackets}/${s.unknownPackets}`
+  return `${n} ${s.validPackets}/${s.invalidPackets}/${s.unknownPackets}`
 }
 
 async function splitsTheCapture(): Promise<void> throws Error {
@@ -34,7 +34,7 @@ function heartbeat(): Heartbeat {
   const h = new Heartbeat()
   h.type = MavType.GCS as u8
   h.mavlinkVersion = 3
-  h
+  return h
 }
 
 function roundTripsBothVersions(): void {

@@ -271,7 +271,7 @@ export class LogProtocolClient {
   }
 
   public aborted(): bool {
-    signal != null && signal!.aborted
+    return signal != null && signal!.aborted
   }
 
   /// Sends the ground station's heartbeat when a second has passed since the last (the vehicle sends nothing without one in 3 s).
@@ -322,7 +322,7 @@ export class LogProtocolClient {
         out.push(e!)
       }
     }
-    out
+    return out
   }
 
   /// Asks for the list, and again for what is missing, until every entry from 1 to the last is here, or the tries are used.
@@ -494,12 +494,12 @@ export class LogProtocolClient {
       }
       at += c!.length
     }
-    true
+    return true
   }
 
   /// Whether the log is whole: the end is known and the front is there.
   finished(a: Arrived, front: int): bool {
-    a.end >= 0 && front >= a.end
+    return a.end >= 0 && front >= a.end
   }
 
   /// Erases ALL the logs on the vehicle (the protocol has no way to erase one; the vehicle does not answer, and ignores it while it
@@ -532,7 +532,7 @@ export class LogProtocolClient {
         break
       }
     }
-    remaining
+    return remaining
   }
 }
 
@@ -566,11 +566,11 @@ class Listing {
         return i
       }
     }
-    -1
+    return -1
   }
 
   /// Whether the list is whole: an entry came, and nothing from 1 to the last is missing (a vehicle with no logs says so in one entry).
   public whole(): bool {
-    last >= 0 && firstMissing() < 0
+    return last >= 0 && firstMissing() < 0
   }
 }

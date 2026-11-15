@@ -75,7 +75,7 @@ export class ReadState {
 
   /// Whether the read has run out of time.
   public late(): bool {
-    deadline > 0 && (Date.now() as int) >= deadline
+    return deadline > 0 && (Date.now() as int) >= deadline
   }
 
   /// `start` is where the read begins (a multiple of `size`): a file that is read from the middle, to go on with a download. What is
@@ -90,7 +90,7 @@ export class ReadState {
   }
 
   public complete(): bool {
-    end >= 0 && front >= end
+    return end >= 0 && front >= end
   }
 
   public fail(code: string, message: string): void {
@@ -163,7 +163,7 @@ export class ReadState {
       }
       at += size
     }
-    found
+    return found
   }
 
   /// A packet of a burst (a reply to BurstReadFile on this session, from the vehicle).
@@ -211,7 +211,7 @@ export class ReadState {
       }
       at += size
     }
-    out
+    return out
   }
 }
 

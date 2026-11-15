@@ -68,7 +68,7 @@ function sizeOf(type: int): int {
   if (type == MavParamType.INT32 || type == MavParamType.REAL32) {
     return 4
   }
-  0
+  return 0
 }
 
 /// The file's type nibble for a MAV_PARAM_TYPE (0 when the file cannot carry it).
@@ -85,7 +85,7 @@ function nibbleOf(type: int): int {
   if (type == MavParamType.REAL32) {
     return 4
   }
-  0
+  return 0
 }
 
 /// The MAV_PARAM_TYPE for a file's type nibble (0 when it is not one).
@@ -102,11 +102,11 @@ function typeOfNibble(nibble: int): int {
   if (nibble == 4) {
     return MavParamType.REAL32
   }
-  0
+  return 0
 }
 
 function u16At(b: Uint8Array, at: int): int {
-  byteAt(b, at) | (byteAt(b, at + 1) << 8)
+  return byteAt(b, at) | (byteAt(b, at + 1) << 8)
 }
 
 /// The value of `type` at `at`.
@@ -132,7 +132,7 @@ function nameOf(shared: Uint8Array, common: int, b: Uint8Array, at: int, n: int)
   for (let i = 0; i < n; i++) {
     name.set(common + i, b[at + i])
   }
-  name
+  return name
 }
 
 /// A name as text. A parameter's name is printable ASCII (0x21 to 0x7E, no space): anything else makes the entry bad, which
@@ -223,7 +223,7 @@ export function decodeParamPack(b: Uint8Array): ParamPack throws ParamPackError 
     throw new ParamPackError("TOO_MANY_ENTRIES", `the file has more than the ${count} parameters its header says`)
   }
   const pack: ParamPack = { total, withDefaults: magic == PARAM_PACK_MAGIC_WITH_DEFAULTS, params }
-  pack
+  return pack
 }
 
 /// How many bytes of the name `a` and `b` have in common at the start, at most 15 (what a nibble holds) and at most `limit`.
@@ -232,7 +232,7 @@ function sharedBytes(a: Uint8Array, b: Uint8Array, limit: int): int {
   while (n < a.length && n < b.length && n < 15 && n < limit && a[n] == b[n]) {
     n += 1
   }
-  n
+  return n
 }
 
 /// Appends the value (`size` bytes) to `out`.
@@ -329,7 +329,7 @@ export function encodeParamPack(
   for (let i = 0; i < out.length; i++) {
     bytes.set(i, out[i])
   }
-  bytes
+  return bytes
 }
 
 function writeHeader(out: int[], magic: int, count: int, total: int): void {
@@ -354,5 +354,5 @@ function crosses(start: int, valueFrom: int, size: int, values: int, readSize: i
       return true
     }
   }
-  false
+  return false
 }

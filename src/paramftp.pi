@@ -64,14 +64,14 @@ const ENOENT: int = 2
 /// Whether a failure of FTP says the vehicle does not have the parameter file: "no such file", ENOENT, a protected file. Only
 /// that is "unsupported", which the application may remember for the whole connection.
 function missingFile(e: FtpError): bool {
-  e.code == "FTP_NOT_FOUND" || e.code == "FTP_PROTECTED" || (e.code == "FTP_ERRNO" && e.errno == ENOENT)
+  return e.code == "FTP_NOT_FOUND" || e.code == "FTP_PROTECTED" || (e.code == "FTP_ERRNO" && e.errno == ENOENT)
 }
 
 /// Whether AUTOPILOT_VERSION's capabilities (a u64, any bits) have the FTP bit. Only the low 32 bits are converted to an int: the
 /// whole u64 does not fit one, and a vehicle that sets its top bit must not panic the download.
 export function hasFtpBit(capabilities: u64): bool {
   const low = (capabilities & (0xFFFFFFFF as u64)) as int
-  (low & MavProtocolCapability.FTP) != 0
+  return (low & MavProtocolCapability.FTP) != 0
 }
 
 /// The words for why a failure of FTP means the list is used: `unsupported` (the vehicle has no such file), `timeout` (no answer,
@@ -100,7 +100,7 @@ function paramsOf(pack: ParamPack): Param[] throws FtpError {
     const q: Param = { id: p.name, index: i, value: p.value }
     out.push(q)
   }
-  out
+  return out
 }
 
 function defaultsOf(pack: ParamPack): Param[] {
@@ -112,7 +112,7 @@ function defaultsOf(pack: ParamPack): Param[] {
       out.push(q)
     }
   }
-  out
+  return out
 }
 
 /// Downloads the parameters by FTP, or fails: whatever is short of every parameter (the file's header says how many there are,
@@ -171,7 +171,7 @@ export class ParamFtp {
       elapsedMs: (Date.now() as int) - started,
       defaults: defaultsOf(pack),
     }
-    result
+    return result
   }
 }
 
@@ -186,7 +186,7 @@ function listResult(r: ParamListResult, fallback: string?, elapsedMs: int): Para
     elapsedMs,
     defaults: [],
   }
-  out
+  return out
 }
 
 /// The one way an application downloads the parameters: FTP where the vehicle has it and it works, else the list.
@@ -210,7 +210,7 @@ export class ParamDownload {
       return (given! & MavProtocolCapability.FTP) != 0
     }
     const v = await new AutopilotVersionRead(conn, target, { timeoutMs: options.timeoutMs, retries: options.retries, signal: options.signal }).run()
-    v != null && hasFtpBit(v!.capabilities)
+    return v != null && hasFtpBit(v!.capabilities)
   }
 
   async list(fallback: string?, started: int, progress: (received: int, total: int, unit: string) => void throws Error): Promise<ParamDownloadResult> throws Error {

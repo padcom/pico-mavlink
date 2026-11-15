@@ -20,7 +20,7 @@ export function x25crc(b: Uint8Array, from: int, to: int, magic: int? = null): i
   if (magic != null) {
     step(magic!)
   }
-  crc
+  return crc
 }
 
 export class Splitter {
@@ -36,7 +36,7 @@ export class Splitter {
         return i
       }
     }
-    -1
+    return -1
   }
 
   /// The packets completed by `chunk`, as their bytes.
@@ -82,6 +82,6 @@ export class Splitter {
         buffer = buffer.slice(1)
       }
     }
-    out
+    return out
   }
 }

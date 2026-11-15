@@ -23,11 +23,11 @@ function bytesOf(list: int[]): Uint8Array {
   for (let i = 0; i < list.length; i++) {
     out.set(i, list[i])
   }
-  out
+  return out
 }
 
 function near(a: f64, b: f64): bool {
-  (if (a > b) a - b else b - a) < 0.0000001
+  return (if (a > b) a - b else b - a) < 0.0000001
 }
 
 /// The messages of a whole log, pushed in chunks of `chunk` bytes.
@@ -48,7 +48,7 @@ function readAll(log: Uint8Array, chunk: int): DfMessage[] {
     }
   }
   d.finish()
-  out
+  return out
 }
 
 /// Two types that between them have every field character (a format is at most 16 of them).
@@ -56,7 +56,7 @@ function allFieldsEncoder(): DfEncoder {
   const e = new DfEncoder()
   expect(e.define(129, "TST", ALL, LABELS)).toBe(true)
   expect(e.define(130, "TS2", MORE, MORE_LABELS)).toBe(true)
-  e
+  return e
 }
 
 /// A message of each of the two types: 2 messages.
@@ -346,7 +346,7 @@ function oddNumbers(): f64[] {
   const nan = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF8, 0x7F]), 0)
   const inf = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF0, 0x7F]), 0)
   const negInf = readF64(bytesOf([0, 0, 0, 0, 0, 0, 0xF0, 0xFF]), 0)
-  [nan, inf, negInf, 1.0e300, -1.0e300, 9.3e18, 1000.0]
+  return [nan, inf, negInf, 1.0e300, -1.0e300, 9.3e18, 1000.0]
 }
 
 function doesNotStopOnATimeThatIsNotAnInt(): void {
@@ -469,7 +469,7 @@ function fmtBytes(defines: int, length: int, name: string, format: string, label
       out.set(starts[k] + i, bytes[i])
     }
   }
-  out
+  return out
 }
 
 function countsATruncatedEnd(): void {
@@ -498,7 +498,7 @@ function noise(n: int, seed: int): Uint8Array {
     x = (x * 1103515245 + 12345) & 0x7FFFFFFF
     out.set(i, (x >> 16) & 0xFF)
   }
-  out
+  return out
 }
 
 function survivesHostileInput(): void {

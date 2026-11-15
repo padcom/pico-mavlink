@@ -1177,7 +1177,7 @@ export class Heartbeat extends MavLinkData {
     m.baseMode = readU8(payload, 6)
     m.systemStatus = readU8(payload, 7)
     m.mavlinkVersion = readU8(payload, 8)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -1190,7 +1190,7 @@ export class Heartbeat extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Heartbeat.INFO
+    return Heartbeat.INFO
   }
 }
 

@@ -129,12 +129,12 @@ export class SimControl {
       }
       answer(command, result)
     }
-    true
+    return true
   }
 
   /// Whether the command is one of those this handles.
   isMine(command: int): bool {
-    command == MavCmd.COMPONENT_ARM_DISARM || command == MavCmd.DO_SET_MODE || command == MavCmd.DO_PAUSE_CONTINUE
+    return command == MavCmd.COMPONENT_ARM_DISARM || command == MavCmd.DO_SET_MODE || command == MavCmd.DO_PAUSE_CONTINUE
       || command == MavCmd.RUN_PREARM_CHECKS || command == MavCmd.NAV_TAKEOFF
   }
 
@@ -200,7 +200,7 @@ export class SimControl {
     armedSet = 0
     flying = false
     disarms += 1
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   setMode(baseMode: int, custom: int): int {
@@ -213,7 +213,7 @@ export class SimControl {
     }
     modeSet = custom
     modeChanges += 1
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   pauseOrContinue(flag: int): int {
@@ -226,7 +226,7 @@ export class SimControl {
       return MavResult.FAILED
     }
     paused = flag == 0
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   /// ArduPilot (takeoff.cpp `do_user_takeoff_U_m`, mode.h `has_user_takeoff`): FAILED unless the vehicle is armed, on the ground and in
@@ -239,7 +239,7 @@ export class SimControl {
     flying = true
     takeoffs += 1
     takeoffAltitude = altitude
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   /// ArduPilot (GCS_Common.cpp `handle_command_run_prearm_checks`): TEMPORARILY_REJECTED while armed, else it runs the checks, which
@@ -251,6 +251,6 @@ export class SimControl {
     if (prearm != "") {
       say(`PreArm: ${prearm}`)
     }
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 }

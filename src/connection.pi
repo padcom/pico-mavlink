@@ -70,14 +70,14 @@ export class MavLinkConnection {
   nextSeq(): int {
     const s = seq
     seq = (seq + 1) & 0xFF
-    s
+    return s
   }
 
   /// Sends `message`; the count of bytes sent.
   public async send(message: MavLinkData): Promise<int> throws Error {
     const frame = protocol.serialize(message, nextSeq())
     await stream.write(frame)
-    frame.length
+    return frame.length
   }
 
   /// Sends `message` signed with `key` (MAVLink 2 only) for `linkId`, at `timestamp` (ms since
@@ -86,7 +86,7 @@ export class MavLinkConnection {
     const signer = new MavLinkProtocolV2(protocol.sysid, protocol.compid, MavLinkProtocolV2.IFLAG_SIGNED)
     const frame = signer.sign(signer.serialize(message, nextSeq()), linkId, key, timestamp ?? (Date.now() as int))
     await stream.write(frame)
-    frame.length
+    return frame.length
   }
 
   /// Every packet received, decoded when the registry knows its message, until the stream ends.
@@ -112,7 +112,7 @@ export class MavLinkConnection {
     const id = nextListener
     nextListener += 1
     listeners.set(id, handler)
-    id
+    return id
   }
 
   /// Stops calling the handler `on` returned `id` for.

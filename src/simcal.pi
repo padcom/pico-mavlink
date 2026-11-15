@@ -86,7 +86,7 @@ export class SimCalibration {
       }
       return true
     }
-    false
+    return false
   }
 
   ack(command: int, result: int): void {

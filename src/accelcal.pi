@@ -52,12 +52,12 @@ export class AccelPosition {
 
   /// Whether `value` asks for the vehicle to be placed (and not an end).
   public static isPlacement(value: int): bool {
-    value >= LEVEL && value <= BACK
+    return value >= LEVEL && value <= BACK
   }
 
   /// Whether `value` is the end of the calibration.
   public static isEnd(value: int): bool {
-    value == SUCCESS || value == FAILED
+    return value == SUCCESS || value == FAILED
   }
 
   /// "level", "left", "right", "nose down", "nose up", "back" for a position; "success" or "failed" for an end; null for a number that is none.
@@ -86,7 +86,7 @@ export function wholeNumber(value: f64): int {
   if (n as f64 != value) {
     return -1
   }
-  n
+  return n
 }
 
 /// What a full accelerometer calibration came to.
@@ -196,7 +196,7 @@ export class Calibration {
       }
     }
     rcFlagStuck = true
-    why
+    return why
   }
 
   /// The next position the vehicle asks for (`AccelPosition`), or null when it asked for none in `timeoutMs`. A request that holds
@@ -214,7 +214,7 @@ export class Calibration {
     if (m instanceof CommandLong) {
       return wholeNumber(m._param1 as f64)
     }
-    null
+    return null
   }
 
   /// Tells the vehicle it is in `position`, once; MAV_RESULT (FAILED when the vehicle was not asking for it).
@@ -282,7 +282,7 @@ export class Calibration {
 /// Whether a vehicle's answer to a command that sets or clears the RC flag is one that took it: ACCEPTED, or UNSUPPORTED (what ArduPilot
 /// answers a command with only the flag).
 function flagTaken(result: int): bool {
-  result == MavResult.ACCEPTED || result == MavResult.UNSUPPORTED
+  return result == MavResult.ACCEPTED || result == MavResult.UNSUPPORTED
 }
 
 /// A COMMAND_LONG for MAV_CMD_ACCELCAL_VEHICLE_POS from the vehicle that holds a whole number.
@@ -292,5 +292,5 @@ function isPrompt(r: Received, target: Target): bool {
     return m.command as int == ApmCmd.ACCELCAL_VEHICLE_POS && r.packet.header.sysid == target.system
       && (target.component == 0 || r.packet.header.compid == target.component) && wholeNumber(m._param1 as f64) >= 0
   }
-  false
+  return false
 }

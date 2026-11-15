@@ -42,7 +42,7 @@ function sameBytes(a: Uint8Array, b: Uint8Array): bool {
       return false
     }
   }
-  true
+  return true
 }
 
 /// What is remembered of a message that is over, to drop its late and repeated chunks.
@@ -85,7 +85,7 @@ class Pending {
         return false
       }
     }
-    true
+    return true
   }
 
   /// The message from the chunks in a row from 0 (up to the last, when that is known).
@@ -109,7 +109,7 @@ class Pending {
     }
     // UTF-8 may be cut between two chunks, so it is decoded only now.
     const m: StatusMessage = { system: system, component: component, severity: severity, text: readChars(joined, 0, size), truncated: truncated, chunks: chunks.length }
-    m
+    return m
   }
 }
 
@@ -188,7 +188,7 @@ export class StatusTextAssembler {
       remember(key, p, now)
       pending.delete(key)
     }
-    out
+    return out
   }
 
   /// The messages that have waited `timeoutMs` for a chunk, as truncated.
@@ -214,12 +214,12 @@ export class StatusTextAssembler {
 
   /// How many messages are waiting for chunks.
   public waiting(): int {
-    pending.size
+    return pending.size
   }
 
   /// How many finished messages are remembered, to drop their late chunks.
   public remembered(): int {
-    finished.size
+    return finished.size
   }
 
   /// Gives up on the messages under `keys`, delivering them as truncated (`now` -1: don't remember them).
@@ -233,7 +233,7 @@ export class StatusTextAssembler {
       }
       pending.delete(key)
     }
-    out
+    return out
   }
 
   evictOldest(now: int): StatusMessage {
@@ -249,7 +249,7 @@ export class StatusTextAssembler {
     const m = p.message(true)
     remember(oldest, p, now)
     pending.delete(oldest)
-    m
+    return m
   }
 
   /// Notes that the message under `key` is over, for `timeoutMs`. At most 256 are kept.
@@ -350,7 +350,7 @@ export function statusTextFields(text: string): Uint8Array[] {
     out.push(field)
     at += 50
   }
-  out
+  return out
 }
 
 /// A status text as the STATUSTEXT messages a vehicle sends: up to 50 bytes of text each, numbered from 0.
@@ -374,5 +374,5 @@ export function splitStatusText(severity: int, text: string, id: int): StatusTex
     }
     out.push(chunk)
   }
-  out
+  return out
 }

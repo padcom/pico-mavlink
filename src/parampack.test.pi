@@ -12,7 +12,7 @@ import { TypedParamValue, showParam } from "./params"
 
 function param(name: string, value: TypedParamValue): PackedParam {
   const p: PackedParam = { name, value }
-  p
+  return p
 }
 
 function int8(name: string, v: int): PackedParam {
@@ -33,7 +33,7 @@ function float(name: string, v: f64): PackedParam {
 
 /// What a parameter shows as: name, type and value.
 function shown(p: PackedParam): string {
-  `${p.name}:${showParam(p.value)}:${typeOf(p.value)}`
+  return `${p.name}:${showParam(p.value)}:${typeOf(p.value)}`
 }
 
 function typeOf(v: TypedParamValue): int {
@@ -52,7 +52,7 @@ function sameAll(a: PackedParam[], b: PackedParam[]): bool {
       return false
     }
   }
-  true
+  return true
 }
 
 /// The code of the error decoding `b` gives, or "ok".
@@ -80,7 +80,7 @@ function bytesOf(list: int[]): Uint8Array {
   for (let i = 0; i < list.length; i++) {
     b.set(i, list[i])
   }
-  b
+  return b
 }
 
 /// A small pseudo-random sequence, the same on every run.
@@ -89,7 +89,7 @@ class Lcg {
 
   public next(n: int): int {
     state = (state * 1103515245 + 12345) & 0x7FFFFFFF
-    (state >> 8) % n
+    return (state >> 8) % n
   }
 }
 
@@ -115,7 +115,7 @@ function names(count: int): string[] {
       }
     }
   }
-  out
+  return out
 }
 
 function generated(count: int): PackedParam[] {
@@ -133,7 +133,7 @@ function generated(count: int): PackedParam[] {
       list.push(float(name, (rng.next(2000000) - 1000000) as f64 / 64.0))
     }
   }
-  list
+  return list
 }
 
 function roundTripsThousands(): void throws ParamPackError {
@@ -252,7 +252,7 @@ function valuesCross(b: Uint8Array, readSize: int): bool {
     at = from + size
     seen += 1
   }
-  false
+  return false
 }
 
 function withDefaults(): void throws ParamPackError {

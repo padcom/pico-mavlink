@@ -39,7 +39,7 @@ function many(count: int): SimParam[] {
     const p: SimParam = { id: `P${i % 90}_V${i}`, value: TypedParamValue.Int(i - 500, MavParamType.INT32) }
     list.push(p)
   }
-  list
+  return list
 }
 
 /// `n` bytes that look like nothing in particular but are the same every time.
@@ -50,7 +50,7 @@ function bytesOf(n: int): Uint8Array {
     x = (x * 1103515245 + 12345) & 0x7FFFFFFF
     out.set(i, (x >> 16) & 0xFF)
   }
-  out
+  return out
 }
 
 function same(a: Uint8Array, b: Uint8Array): bool {
@@ -62,7 +62,7 @@ function same(a: Uint8Array, b: Uint8Array): bool {
       return false
     }
   }
-  true
+  return true
 }
 
 function clientOf(r: Rig, signal: AbortSignal? = null): FtpClient {
@@ -396,7 +396,7 @@ function chunkOf(size: int, fill: int): Uint8Array {
   for (let i = 0; i < size; i++) {
     c.set(i, fill)
   }
-  c
+  return c
 }
 
 function stateOf(): ReadState {

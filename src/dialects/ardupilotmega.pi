@@ -1965,7 +1965,7 @@ export class SensorOffsets extends MavLinkData {
     m.magOfsX = readI16(payload, 36)
     m.magOfsY = readI16(payload, 38)
     m.magOfsZ = readI16(payload, 40)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -1984,7 +1984,7 @@ export class SensorOffsets extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    SensorOffsets.INFO
+    return SensorOffsets.INFO
   }
 }
 
@@ -2027,7 +2027,7 @@ export class SetMagOffsets extends MavLinkData {
     m.magOfsZ = readI16(payload, 4)
     m.targetSystem = readU8(payload, 6)
     m.targetComponent = readU8(payload, 7)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2039,7 +2039,7 @@ export class SetMagOffsets extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    SetMagOffsets.INFO
+    return SetMagOffsets.INFO
   }
 }
 
@@ -2072,7 +2072,7 @@ export class MemInfo extends MavLinkData {
     m.brkval = readU16(payload, 0)
     m.freemem = readU16(payload, 2)
     m.freemem32 = readU32(payload, 4)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2082,7 +2082,7 @@ export class MemInfo extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    MemInfo.INFO
+    return MemInfo.INFO
   }
 }
 
@@ -2128,7 +2128,7 @@ export class ApAdc extends MavLinkData {
     m.adc4 = readU16(payload, 6)
     m.adc5 = readU16(payload, 8)
     m.adc6 = readU16(payload, 10)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2141,7 +2141,7 @@ export class ApAdc extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    ApAdc.INFO
+    return ApAdc.INFO
   }
 }
 
@@ -2214,7 +2214,7 @@ export class DigicamConfigure extends MavLinkData {
     m.commandId = readU8(payload, 12)
     m.engineCutOff = readU8(payload, 13)
     m.extraParam = readU8(payload, 14)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2232,7 +2232,7 @@ export class DigicamConfigure extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    DigicamConfigure.INFO
+    return DigicamConfigure.INFO
   }
 }
 
@@ -2299,7 +2299,7 @@ export class DigicamControl extends MavLinkData {
     m.shot = readU8(payload, 10)
     m.commandId = readU8(payload, 11)
     m.extraParam = readU8(payload, 12)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2316,7 +2316,7 @@ export class DigicamControl extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    DigicamControl.INFO
+    return DigicamControl.INFO
   }
 }
 
@@ -2363,7 +2363,7 @@ export class MountConfigure extends MavLinkData {
     m.stabRoll = readU8(payload, 3)
     m.stabPitch = readU8(payload, 4)
     m.stabYaw = readU8(payload, 5)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2376,7 +2376,7 @@ export class MountConfigure extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    MountConfigure.INFO
+    return MountConfigure.INFO
   }
 }
 
@@ -2422,7 +2422,7 @@ export class MountControl extends MavLinkData {
     m.targetSystem = readU8(payload, 12)
     m.targetComponent = readU8(payload, 13)
     m.savePosition = readU8(payload, 14)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2435,7 +2435,7 @@ export class MountControl extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    MountControl.INFO
+    return MountControl.INFO
   }
 }
 
@@ -2485,7 +2485,7 @@ export class MountStatus extends MavLinkData {
     m.targetSystem = readU8(payload, 12)
     m.targetComponent = readU8(payload, 13)
     m.mountMode = readU8(payload, 14)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2498,7 +2498,7 @@ export class MountStatus extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    MountStatus.INFO
+    return MountStatus.INFO
   }
 }
 
@@ -2547,7 +2547,7 @@ export class FencePoint extends MavLinkData {
     m.targetComponent = readU8(payload, 9)
     m.idx = readU8(payload, 10)
     m.count = readU8(payload, 11)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2560,7 +2560,7 @@ export class FencePoint extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    FencePoint.INFO
+    return FencePoint.INFO
   }
 }
 
@@ -2591,7 +2591,7 @@ export class FenceFetchPoint extends MavLinkData {
     m.targetSystem = readU8(payload, 0)
     m.targetComponent = readU8(payload, 1)
     m.idx = readU8(payload, 2)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2601,7 +2601,7 @@ export class FenceFetchPoint extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    FenceFetchPoint.INFO
+    return FenceFetchPoint.INFO
   }
 }
 
@@ -2655,7 +2655,7 @@ export class Ahrs extends MavLinkData {
     m.renormVal = readF32(payload, 16)
     m.errorRp = readF32(payload, 20)
     m.errorYaw = readF32(payload, 24)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2669,7 +2669,7 @@ export class Ahrs extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Ahrs.INFO
+    return Ahrs.INFO
   }
 }
 
@@ -2751,7 +2751,7 @@ export class SimState extends MavLinkData {
     m.zgyro = readF32(payload, 32)
     m.lat = readI32(payload, 36)
     m.lng = readI32(payload, 40)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2769,7 +2769,7 @@ export class SimState extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    SimState.INFO
+    return SimState.INFO
   }
 }
 
@@ -2796,7 +2796,7 @@ export class HwStatus extends MavLinkData {
     const m = new HwStatus()
     m.Vcc = readU16(payload, 0)
     m.I2Cerr = readU8(payload, 2)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2805,7 +2805,7 @@ export class HwStatus extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    HwStatus.INFO
+    return HwStatus.INFO
   }
 }
 
@@ -2857,7 +2857,7 @@ export class Radio extends MavLinkData {
     m.txbuf = readU8(payload, 6)
     m.noise = readU8(payload, 7)
     m.remnoise = readU8(payload, 8)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2871,7 +2871,7 @@ export class Radio extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Radio.INFO
+    return Radio.INFO
   }
 }
 
@@ -2940,7 +2940,7 @@ export class LimitsStatus extends MavLinkData {
     m.modsEnabled = readU8(payload, 19)
     m.modsRequired = readU8(payload, 20)
     m.modsTriggered = readU8(payload, 21)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -2956,7 +2956,7 @@ export class LimitsStatus extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    LimitsStatus.INFO
+    return LimitsStatus.INFO
   }
 }
 
@@ -2990,7 +2990,7 @@ export class Wind extends MavLinkData {
     m.direction = readF32(payload, 0)
     m.speed = readF32(payload, 4)
     m.speedZ = readF32(payload, 8)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3000,7 +3000,7 @@ export class Wind extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Wind.INFO
+    return Wind.INFO
   }
 }
 
@@ -3034,7 +3034,7 @@ export class Data16 extends MavLinkData {
     for (let i = 0; i < 16; i++) {
       m.data.push(readU8(payload, 2 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3046,7 +3046,7 @@ export class Data16 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Data16.INFO
+    return Data16.INFO
   }
 }
 
@@ -3080,7 +3080,7 @@ export class Data32 extends MavLinkData {
     for (let i = 0; i < 32; i++) {
       m.data.push(readU8(payload, 2 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3092,7 +3092,7 @@ export class Data32 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Data32.INFO
+    return Data32.INFO
   }
 }
 
@@ -3126,7 +3126,7 @@ export class Data64 extends MavLinkData {
     for (let i = 0; i < 64; i++) {
       m.data.push(readU8(payload, 2 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3138,7 +3138,7 @@ export class Data64 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Data64.INFO
+    return Data64.INFO
   }
 }
 
@@ -3172,7 +3172,7 @@ export class Data96 extends MavLinkData {
     for (let i = 0; i < 96; i++) {
       m.data.push(readU8(payload, 2 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3184,7 +3184,7 @@ export class Data96 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Data96.INFO
+    return Data96.INFO
   }
 }
 
@@ -3212,7 +3212,7 @@ export class RangeFinder extends MavLinkData {
     const m = new RangeFinder()
     m.distance = readF32(payload, 0)
     m.voltage = readF32(payload, 4)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3221,7 +3221,7 @@ export class RangeFinder extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    RangeFinder.INFO
+    return RangeFinder.INFO
   }
 }
 
@@ -3301,7 +3301,7 @@ export class AirspeedAutocal extends MavLinkData {
     m.Pax = readF32(payload, 36)
     m.Pby = readF32(payload, 40)
     m.Pcz = readF32(payload, 44)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3320,7 +3320,7 @@ export class AirspeedAutocal extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    AirspeedAutocal.INFO
+    return AirspeedAutocal.INFO
   }
 }
 
@@ -3393,7 +3393,7 @@ export class RallyPoint extends MavLinkData {
     m.idx = readU8(payload, 16)
     m.count = readU8(payload, 17)
     m.flags = readU8(payload, 18)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3410,7 +3410,7 @@ export class RallyPoint extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    RallyPoint.INFO
+    return RallyPoint.INFO
   }
 }
 
@@ -3442,7 +3442,7 @@ export class RallyFetchPoint extends MavLinkData {
     m.targetSystem = readU8(payload, 0)
     m.targetComponent = readU8(payload, 1)
     m.idx = readU8(payload, 2)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3452,7 +3452,7 @@ export class RallyFetchPoint extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    RallyFetchPoint.INFO
+    return RallyFetchPoint.INFO
   }
 }
 
@@ -3501,7 +3501,7 @@ export class CompassMotStatus extends MavLinkData {
     m.CompensationZ = readF32(payload, 12)
     m.throttle = readU16(payload, 16)
     m.interference = readU16(payload, 18)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3514,7 +3514,7 @@ export class CompassMotStatus extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    CompassMotStatus.INFO
+    return CompassMotStatus.INFO
   }
 }
 
@@ -3566,7 +3566,7 @@ export class Ahrs2 extends MavLinkData {
     m.altitude = readF32(payload, 12)
     m.lat = readI32(payload, 16)
     m.lng = readI32(payload, 20)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3579,7 +3579,7 @@ export class Ahrs2 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Ahrs2.INFO
+    return Ahrs2.INFO
   }
 }
 
@@ -3642,7 +3642,7 @@ export class CameraStatus extends MavLinkData {
     m.targetSystem = readU8(payload, 26)
     m.camIdx = readU8(payload, 27)
     m.eventId = readU8(payload, 28)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3658,7 +3658,7 @@ export class CameraStatus extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    CameraStatus.INFO
+    return CameraStatus.INFO
   }
 }
 
@@ -3754,7 +3754,7 @@ export class CameraFeedback extends MavLinkData {
     m.camIdx = readU8(payload, 43)
     m.flags = readU8(payload, 44)
     m.completedCaptures = readU16(payload, 45)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3775,7 +3775,7 @@ export class CameraFeedback extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    CameraFeedback.INFO
+    return CameraFeedback.INFO
   }
 }
 
@@ -3805,7 +3805,7 @@ export class Battery2 extends MavLinkData {
     const m = new Battery2()
     m.voltage = readU16(payload, 0)
     m.currentBattery = readI16(payload, 2)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3814,7 +3814,7 @@ export class Battery2 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Battery2.INFO
+    return Battery2.INFO
   }
 }
 
@@ -3886,7 +3886,7 @@ export class Ahrs3 extends MavLinkData {
     m.v2 = readF32(payload, 28)
     m.v3 = readF32(payload, 32)
     m.v4 = readF32(payload, 36)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3903,7 +3903,7 @@ export class Ahrs3 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Ahrs3.INFO
+    return Ahrs3.INFO
   }
 }
 
@@ -3929,7 +3929,7 @@ export class AutopilotVersionRequest extends MavLinkData {
     const m = new AutopilotVersionRequest()
     m.targetSystem = readU8(payload, 0)
     m.targetComponent = readU8(payload, 1)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3938,7 +3938,7 @@ export class AutopilotVersionRequest extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    AutopilotVersionRequest.INFO
+    return AutopilotVersionRequest.INFO
   }
 }
 
@@ -3977,7 +3977,7 @@ export class RemoteLogDataBlock extends MavLinkData {
     for (let i = 0; i < 200; i++) {
       m.data.push(readU8(payload, 6 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -3990,7 +3990,7 @@ export class RemoteLogDataBlock extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    RemoteLogDataBlock.INFO
+    return RemoteLogDataBlock.INFO
   }
 }
 
@@ -4027,7 +4027,7 @@ export class RemoteLogBlockStatus extends MavLinkData {
     m.targetSystem = readU8(payload, 4)
     m.targetComponent = readU8(payload, 5)
     m.status = readU8(payload, 6)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4038,7 +4038,7 @@ export class RemoteLogBlockStatus extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    RemoteLogBlockStatus.INFO
+    return RemoteLogBlockStatus.INFO
   }
 }
 
@@ -4086,7 +4086,7 @@ export class LedControl extends MavLinkData {
     for (let i = 0; i < 24; i++) {
       m.customBytes.push(readU8(payload, 5 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4101,7 +4101,7 @@ export class LedControl extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    LedControl.INFO
+    return LedControl.INFO
   }
 }
 
@@ -4166,7 +4166,7 @@ export class MagCalProgress extends MavLinkData {
     for (let i = 0; i < 10; i++) {
       m.completionMask.push(readU8(payload, 17 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4184,7 +4184,7 @@ export class MagCalProgress extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    MagCalProgress.INFO
+    return MagCalProgress.INFO
   }
 }
 
@@ -4236,7 +4236,7 @@ export class EkfStatusReport extends MavLinkData {
     m.terrainAltVariance = readF32(payload, 16)
     m.flags = readU16(payload, 20)
     m.airspeedVariance = readF32(payload, 22)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4250,7 +4250,7 @@ export class EkfStatusReport extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EkfStatusReport.INFO
+    return EkfStatusReport.INFO
   }
 }
 
@@ -4312,7 +4312,7 @@ export class PidTuning extends MavLinkData {
     m.axis = readU8(payload, 24)
     m.SRate = readF32(payload, 25)
     m.PDmod = readF32(payload, 29)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4328,7 +4328,7 @@ export class PidTuning extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    PidTuning.INFO
+    return PidTuning.INFO
   }
 }
 
@@ -4404,7 +4404,7 @@ export class Deepstall extends MavLinkData {
     m.expectedTravelDistance = readF32(payload, 28)
     m.crossTrackError = readF32(payload, 32)
     m.stage = readU8(payload, 36)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4421,7 +4421,7 @@ export class Deepstall extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Deepstall.INFO
+    return Deepstall.INFO
   }
 }
 
@@ -4507,7 +4507,7 @@ export class GimbalReport extends MavLinkData {
     m.jointAz = readF32(payload, 36)
     m.targetSystem = readU8(payload, 40)
     m.targetComponent = readU8(payload, 41)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4526,7 +4526,7 @@ export class GimbalReport extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GimbalReport.INFO
+    return GimbalReport.INFO
   }
 }
 
@@ -4570,7 +4570,7 @@ export class GimbalControl extends MavLinkData {
     m.demandedRateZ = readF32(payload, 8)
     m.targetSystem = readU8(payload, 12)
     m.targetComponent = readU8(payload, 13)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4582,7 +4582,7 @@ export class GimbalControl extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GimbalControl.INFO
+    return GimbalControl.INFO
   }
 }
 
@@ -4623,7 +4623,7 @@ export class GimbalTorqueCmdReport extends MavLinkData {
     m.azTorqueCmd = readI16(payload, 4)
     m.targetSystem = readU8(payload, 6)
     m.targetComponent = readU8(payload, 7)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4635,7 +4635,7 @@ export class GimbalTorqueCmdReport extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GimbalTorqueCmdReport.INFO
+    return GimbalTorqueCmdReport.INFO
   }
 }
 
@@ -4669,7 +4669,7 @@ export class GoproHeartbeat extends MavLinkData {
     m.status = readU8(payload, 0)
     m.captureMode = readU8(payload, 1)
     m.flags = readU8(payload, 2)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4679,7 +4679,7 @@ export class GoproHeartbeat extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GoproHeartbeat.INFO
+    return GoproHeartbeat.INFO
   }
 }
 
@@ -4711,7 +4711,7 @@ export class GoproGetRequest extends MavLinkData {
     m.targetSystem = readU8(payload, 0)
     m.targetComponent = readU8(payload, 1)
     m.cmdId = readU8(payload, 2)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4721,7 +4721,7 @@ export class GoproGetRequest extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GoproGetRequest.INFO
+    return GoproGetRequest.INFO
   }
 }
 
@@ -4756,7 +4756,7 @@ export class GoproGetResponse extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.value.push(readU8(payload, 2 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4768,7 +4768,7 @@ export class GoproGetResponse extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GoproGetResponse.INFO
+    return GoproGetResponse.INFO
   }
 }
 
@@ -4807,7 +4807,7 @@ export class GoproSetRequest extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.value.push(readU8(payload, 3 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4820,7 +4820,7 @@ export class GoproSetRequest extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GoproSetRequest.INFO
+    return GoproSetRequest.INFO
   }
 }
 
@@ -4848,7 +4848,7 @@ export class GoproSetResponse extends MavLinkData {
     const m = new GoproSetResponse()
     m.cmdId = readU8(payload, 0)
     m.status = readU8(payload, 1)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4857,7 +4857,7 @@ export class GoproSetResponse extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GoproSetResponse.INFO
+    return GoproSetResponse.INFO
   }
 }
 
@@ -4883,7 +4883,7 @@ export class Rpm extends MavLinkData {
     const m = new Rpm()
     m.rpm1 = readF32(payload, 0)
     m.rpm2 = readF32(payload, 4)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4892,7 +4892,7 @@ export class Rpm extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    Rpm.INFO
+    return Rpm.INFO
   }
 }
 
@@ -4959,7 +4959,7 @@ export class DeviceOpRead extends MavLinkData {
     m.regstart = readU8(payload, 49)
     m.count = readU8(payload, 50)
     m.bank = readU8(payload, 51)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -4976,7 +4976,7 @@ export class DeviceOpRead extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    DeviceOpRead.INFO
+    return DeviceOpRead.INFO
   }
 }
 
@@ -5024,7 +5024,7 @@ export class DeviceOpReadReply extends MavLinkData {
       m.data.push(readU8(payload, 7 + i * 1))
     }
     m.bank = readU8(payload, 135)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5039,7 +5039,7 @@ export class DeviceOpReadReply extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    DeviceOpReadReply.INFO
+    return DeviceOpReadReply.INFO
   }
 }
 
@@ -5113,7 +5113,7 @@ export class DeviceOpWrite extends MavLinkData {
       m.data.push(readU8(payload, 51 + i * 1))
     }
     m.bank = readU8(payload, 179)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5133,7 +5133,7 @@ export class DeviceOpWrite extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    DeviceOpWrite.INFO
+    return DeviceOpWrite.INFO
   }
 }
 
@@ -5159,7 +5159,7 @@ export class DeviceOpWriteReply extends MavLinkData {
     const m = new DeviceOpWriteReply()
     m.requestId = readU32(payload, 0)
     m.result = readU8(payload, 4)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5168,7 +5168,7 @@ export class DeviceOpWriteReply extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    DeviceOpWriteReply.INFO
+    return DeviceOpWriteReply.INFO
   }
 }
 
@@ -5227,7 +5227,7 @@ export class SecureCommand extends MavLinkData {
     for (let i = 0; i < 220; i++) {
       m.data.push(readU8(payload, 12 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5243,7 +5243,7 @@ export class SecureCommand extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    SecureCommand.INFO
+    return SecureCommand.INFO
   }
 }
 
@@ -5288,7 +5288,7 @@ export class SecureCommandReply extends MavLinkData {
     for (let i = 0; i < 220; i++) {
       m.data.push(readU8(payload, 10 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5302,7 +5302,7 @@ export class SecureCommandReply extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    SecureCommandReply.INFO
+    return SecureCommandReply.INFO
   }
 }
 
@@ -5386,7 +5386,7 @@ export class AdapTuning extends MavLinkData {
     m.fDot = readF32(payload, 40)
     m.u = readF32(payload, 44)
     m.axis = readU8(payload, 48)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5406,7 +5406,7 @@ export class AdapTuning extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    AdapTuning.INFO
+    return AdapTuning.INFO
   }
 }
 
@@ -5458,7 +5458,7 @@ export class VisionPositionDelta extends MavLinkData {
       m.positionDelta.push(readF32(payload, 28 + i * 4))
     }
     m.confidence = readF32(payload, 40)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5474,7 +5474,7 @@ export class VisionPositionDelta extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    VisionPositionDelta.INFO
+    return VisionPositionDelta.INFO
   }
 }
 
@@ -5508,7 +5508,7 @@ export class AoaSsa extends MavLinkData {
     m.timeUsec = readU64(payload, 0)
     m.AOA = readF32(payload, 8)
     m.SSA = readF32(payload, 12)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5518,7 +5518,7 @@ export class AoaSsa extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    AoaSsa.INFO
+    return AoaSsa.INFO
   }
 }
 
@@ -5581,7 +5581,7 @@ export class EscTelemetry1To4 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5606,7 +5606,7 @@ export class EscTelemetry1To4 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry1To4.INFO
+    return EscTelemetry1To4.INFO
   }
 }
 
@@ -5669,7 +5669,7 @@ export class EscTelemetry5To8 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5694,7 +5694,7 @@ export class EscTelemetry5To8 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry5To8.INFO
+    return EscTelemetry5To8.INFO
   }
 }
 
@@ -5757,7 +5757,7 @@ export class EscTelemetry9To12 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5782,7 +5782,7 @@ export class EscTelemetry9To12 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry9To12.INFO
+    return EscTelemetry9To12.INFO
   }
 }
 
@@ -5851,7 +5851,7 @@ export class OsdParamConfig extends MavLinkData {
     m.osdIndex = readU8(payload, 19)
     m.paramId = readChars(payload, 20, 16)
     m.configType = readU8(payload, 36)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5868,7 +5868,7 @@ export class OsdParamConfig extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    OsdParamConfig.INFO
+    return OsdParamConfig.INFO
   }
 }
 
@@ -5895,7 +5895,7 @@ export class OsdParamConfigReply extends MavLinkData {
     const m = new OsdParamConfigReply()
     m.requestId = readU32(payload, 0)
     m.result = readU8(payload, 4)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5904,7 +5904,7 @@ export class OsdParamConfigReply extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    OsdParamConfigReply.INFO
+    return OsdParamConfigReply.INFO
   }
 }
 
@@ -5945,7 +5945,7 @@ export class OsdParamShowConfig extends MavLinkData {
     m.targetComponent = readU8(payload, 5)
     m.osdScreen = readU8(payload, 6)
     m.osdIndex = readU8(payload, 7)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -5957,7 +5957,7 @@ export class OsdParamShowConfig extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    OsdParamShowConfig.INFO
+    return OsdParamShowConfig.INFO
   }
 }
 
@@ -6012,7 +6012,7 @@ export class OsdParamShowConfigReply extends MavLinkData {
     m.result = readU8(payload, 16)
     m.paramId = readChars(payload, 17, 16)
     m.configType = readU8(payload, 33)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6026,7 +6026,7 @@ export class OsdParamShowConfigReply extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    OsdParamShowConfigReply.INFO
+    return OsdParamShowConfigReply.INFO
   }
 }
 
@@ -6096,7 +6096,7 @@ export class ObstacleDistance3d extends MavLinkData {
     m.obstacleId = readU16(payload, 24)
     m.sensorType = readU8(payload, 26)
     m.frame = readU8(payload, 27)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6112,7 +6112,7 @@ export class ObstacleDistance3d extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    ObstacleDistance3d.INFO
+    return ObstacleDistance3d.INFO
   }
 }
 
@@ -6192,7 +6192,7 @@ export class WaterDepth extends MavLinkData {
     m.temperature = readF32(payload, 32)
     m.id = readU8(payload, 36)
     m.healthy = readU8(payload, 37)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6210,7 +6210,7 @@ export class WaterDepth extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    WaterDepth.INFO
+    return WaterDepth.INFO
   }
 }
 
@@ -6256,7 +6256,7 @@ export class McuStatus extends MavLinkData {
     m.MCUVoltageMin = readU16(payload, 4)
     m.MCUVoltageMax = readU16(payload, 6)
     m.id = readU8(payload, 8)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6268,7 +6268,7 @@ export class McuStatus extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    McuStatus.INFO
+    return McuStatus.INFO
   }
 }
 
@@ -6331,7 +6331,7 @@ export class EscTelemetry13To16 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6356,7 +6356,7 @@ export class EscTelemetry13To16 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry13To16.INFO
+    return EscTelemetry13To16.INFO
   }
 }
 
@@ -6419,7 +6419,7 @@ export class EscTelemetry17To20 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6444,7 +6444,7 @@ export class EscTelemetry17To20 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry17To20.INFO
+    return EscTelemetry17To20.INFO
   }
 }
 
@@ -6507,7 +6507,7 @@ export class EscTelemetry21To24 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6532,7 +6532,7 @@ export class EscTelemetry21To24 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry21To24.INFO
+    return EscTelemetry21To24.INFO
   }
 }
 
@@ -6595,7 +6595,7 @@ export class EscTelemetry25To28 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6620,7 +6620,7 @@ export class EscTelemetry25To28 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry25To28.INFO
+    return EscTelemetry25To28.INFO
   }
 }
 
@@ -6683,7 +6683,7 @@ export class EscTelemetry29To32 extends MavLinkData {
     for (let i = 0; i < 4; i++) {
       m.temperature.push(readU8(payload, 40 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6708,7 +6708,7 @@ export class EscTelemetry29To32 extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    EscTelemetry29To32.INFO
+    return EscTelemetry29To32.INFO
   }
 }
 
@@ -6741,7 +6741,7 @@ export class NamedValueString extends MavLinkData {
     m.timeBootMs = readU32(payload, 0)
     m.name = readChars(payload, 4, 10)
     m.value = readChars(payload, 14, 64)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -6751,7 +6751,7 @@ export class NamedValueString extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    NamedValueString.INFO
+    return NamedValueString.INFO
   }
 }
 
