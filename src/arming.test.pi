@@ -5,6 +5,7 @@ import { MemoryStream } from "./stream"
 import { MavLinkError } from "./protocol"
 import { SimulatedAutopilot } from "./simulator"
 import { MAGIC_FORCE_DISARM, MAGIC_SKIP_CHECKS, VehicleControl, armParams, controlResult, emergencyStopParams, modeParams, pauseParams, prearmParams, resultName } from "./arming"
+import { CommandCall } from "./operations"
 import { CommandLong, MavCmd, MavResult, StatusText } from "./dialects/common"
 
 /// A ground station and a vehicle that is disarmed (it would arm itself at its third tick: not here).
@@ -237,6 +238,38 @@ async function aCommandThatIsNotAcknowledgedIsNeverSentAgain(): Promise<void> th
   expect(rig.sim.control.commands).toBe(1)
 }
 
+async function anArmWith21196SkipsThePreArmChecksToo(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.control.prearm = "Compasses inconsistent"
+  // (what no VehicleControl method sends: the vehicle's side, as a ground station that is not this library could ask)
+  const raw = new CommandCall(rig.gcs, { system: 1, component: 1 }, { timeoutMs: 150, retries: 0 })
+  const result = await raw.run(MavCmd.COMPONENT_ARM_DISARM, [1.0, 21196.0])
+  rig.close()
+  expect(result).toBe(MavResult.ACCEPTED)
+  expect(rig.sim.control.forcedArms).toBe(1)
+  expect(rig.sim.control.isArmed()).toBe(true)
+}
+
+async function anArmParamThatIsNeitherZeroNorOneIsUnsupported(): Promise<void> throws Error {
+  const rig = new Rig()
+  const raw = new CommandCall(rig.gcs, { system: 1, component: 1 }, { timeoutMs: 150, retries: 0 })
+  const result = await raw.run(MavCmd.COMPONENT_ARM_DISARM, [2.0])
+  rig.close()
+  expect(result).toBe(MavResult.UNSUPPORTED)
+}
+
+async function anInProgressAckIsWaitedPastWithoutSendingAgain(): Promise<void> throws Error {
+  const rig = new Rig(300)
+  rig.sim.control.inProgressFirst = true
+  const result = await rig.control.arm()
+  await delay(100)
+  rig.close()
+  expect(result.acknowledged).toBe(true)
+  expect(result.accepted).toBe(true)
+  expect(rig.sent.length).toBe(1)
+  expect(rig.sim.control.commands).toBe(1)
+}
+
 async function aCommandAnotherSystemIsNotMineIsIgnored(): Promise<void> throws Error {
   const rig = new Rig(100)
   const other = new VehicleControl(rig.gcs, { system: 7, component: 1 }, { timeoutMs: 100 })
@@ -272,6 +305,9 @@ describe("arming, modes and pause", () => {
   it("sends no mode outside 0 to 255", modeOutsideTheLimitsIsNotSent)
   it("pauses and continues in AUTO or GUIDED only", pauseAndResumeNeedAutoOrGuided)
   it("never resends a command nothing acknowledged: UNACKNOWLEDGED", aCommandThatIsNotAcknowledgedIsNeverSentAgain)
+  it("skips the pre-arm checks of an arm for 21196 as it does for 2989 (the simulator counts both)", anArmWith21196SkipsThePreArmChecksToo)
+  it("answers an arm parameter that is not 0 or 1 UNSUPPORTED", anArmParamThatIsNeitherZeroNorOneIsUnsupported)
+  it("waits past IN_PROGRESS for the final ack, in the same timeout and without sending again", anInProgressAckIsWaitedPastWithoutSendingAgain)
   it("is ignored by a vehicle it is not addressed to", aCommandAnotherSystemIsNotMineIsIgnored)
   it("keeps the simulator's old behaviour: armed at the third tick, disarmed again after a reboot", theVehicleArmsItselfAtItsThirdTickWhenNothingIsSet)
   it("names a result", () => {

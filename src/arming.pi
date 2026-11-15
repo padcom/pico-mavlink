@@ -1,7 +1,8 @@
 // Arming, flight modes and pause/continue, as a ground station asks for them (ArduPilot: GCS_MAVLink_Copter.cpp `handle_command_component_arm_disarm`,
 // `handle_command_do_set_mode`, `handle_command_pause_continue`, `handle_command_run_prearm_check`):
 //  - MAV_CMD_COMPONENT_ARM_DISARM: param1 1 arms, 0 disarms. param2 is a MAGIC NUMBER: 2989 arms WITHOUT the pre-arm checks, 21196 disarms
-//    a vehicle that is FLYING (its motors stop where it is). Both are the most dangerous things this file can send, so:
+//    a vehicle that is FLYING (its motors stop where it is). ArduPilot (GCS_Common.cpp, 4.7.2) skips the pre-arm checks of an ARM for
+//    EITHER number, so 21196 on an arm is a forced arm too. Both are the most dangerous things this file can send, so:
 //      * `arm()` and `disarm()` always send param2 0: the vehicle runs its pre-arm checks and refuses to disarm in the air;
 //      * 21196 is sent by `emergencyStop()` ONLY (and nothing sends it without the caller having asked for exactly that);
 //      * 2989 is sent by NOTHING: there is no forced arm here. (`MAGIC_SKIP_CHECKS` is kept for the simulator.)
@@ -12,7 +13,9 @@
 //  - MAV_CMD_RUN_PREARM_CHECKS: runs the pre-arm checks (the vehicle says what fails in STATUSTEXT "PreArm: ...").
 //  - RETRIES ARE 0, ON PURPOSE. A command that was not acknowledged may well have been carried out (an arm whose ack was lost has
 //    ARMED the vehicle): sending it again, later, could arm a vehicle somebody has since disarmed. So every command is sent ONCE and a
-//    missing ack is returned as `acknowledged: false`; what the vehicle is doing is read from its HEARTBEAT, not guessed.
+//    missing ack is returned as `acknowledged: false`; what the vehicle is doing is read from its HEARTBEAT, not guessed. An IN_PROGRESS
+//    ack is waited past, for the final one, inside the same timeout (nothing is sent again).
+//  - AFTER AN ABORT (the signal) the command MAY ALREADY HAVE BEEN SENT: an `ABORTED` error does not say the vehicle did nothing.
 import { MavLinkConnection } from "./connection"
 import { MavLinkError } from "./protocol"
 import { MavCmd, MavResult } from "./dialects/common"
@@ -135,7 +138,7 @@ export class VehicleControl {
   }
 
   /// Sends the command once. A `TIMEOUT` (no ack) is the result `UNACKNOWLEDGED`, never an error and never sent again; any other
-  /// error (the signal aborted it) is thrown.
+  /// error (the signal aborted it) is thrown, and the command MAY ALREADY HAVE BEEN SENT (and carried out) by then.
   async send(command: int, params: f64[]): Promise<ControlResult> throws Error {
     try {
       return controlResult(await call.run(command, params))

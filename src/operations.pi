@@ -469,7 +469,8 @@ export class CommandCall {
     const name = MavCmd.nameOf(command) ?? `${command}`
     for (let attempt = 0; attempt <= retries; attempt++) {
       checkAborted(signal, name)
-      const reply = conn.waitFor((r: Received) => isAckOf(r, target, command), timeoutMs, signal)
+      const startedAt = Date.now() as int
+      let reply = conn.waitFor((r: Received) => isAckOf(r, target, command), timeoutMs, signal)
       const c = new CommandLong()
       c.targetSystem = target.system as u8
       c.targetComponent = target.component as u8
@@ -484,7 +485,13 @@ export class CommandCall {
       c._param6 = p(5)
       c._param7 = p(6)
       await conn.send(c)
-      const r = await reply
+      let r = await reply
+      // With no retries (a command that must never be sent twice) an IN_PROGRESS is waited past, for the final ack, inside the same
+      // timeout and WITHOUT sending again; with retries it is the signal to ask again.
+      while (retries == 0 && inProgress(r) && (Date.now() as int) - startedAt < timeoutMs) {
+        reply = conn.waitFor((q: Received) => isAckOf(q, target, command), timeoutMs - ((Date.now() as int) - startedAt), signal)
+        r = await reply
+      }
       if (r != null) {
         const m = r!.message
         if (m instanceof CommandAck) {
@@ -503,6 +510,14 @@ export class CommandCall {
   public async setMessageInterval(messageId: int, intervalUs: int): Promise<int> throws Error {
     await run(MavCmd.SET_MESSAGE_INTERVAL, [messageId as f64, intervalUs as f64])
   }
+}
+
+function inProgress(r: Received?): bool {
+  if (r == null) {
+    return false
+  }
+  const m = r!.message
+  m instanceof CommandAck && m.result as int == MavResult.IN_PROGRESS
 }
 
 function isAckOf(r: Received, target: Target, command: int): bool {

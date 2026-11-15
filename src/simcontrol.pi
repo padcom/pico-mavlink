@@ -1,7 +1,7 @@
 // Arming, flight modes and pause/continue of the simulated autopilot, as ArduPilot Copter answers them (see arming.pi for the protocol):
-//  - MAV_CMD_COMPONENT_ARM_DISARM: param1 1 arms, 0 disarms, anything else is DENIED. An arm while a PreArm check fails (`prearm`, the
-//    text of the check) is answered FAILED with "PreArm: <text>" in STATUSTEXT, unless param2 is 2989 (skip the checks: the simulator
-//    counts it in `forcedArms`). A disarm while flying (`flying`) is answered FAILED, unless param2 is 21196 (`forcedDisarms`).
+//  - MAV_CMD_COMPONENT_ARM_DISARM: param1 1 arms, 0 disarms, anything else is UNSUPPORTED. An arm while a PreArm check fails (`prearm`,
+//    the text of the check) is answered FAILED with "PreArm: <text>" in STATUSTEXT, unless param2 is 2989 OR 21196 (ArduPilot skips the
+//    checks for either on an ARM: the simulator counts both in `forcedArms`). A disarm while flying (`flying`) is answered FAILED, unless param2 is 21196 (`forcedDisarms`).
 //    Arming a vehicle that is armed, and disarming one that is not, is ACCEPTED (it changes nothing).
 //  - MAV_CMD_DO_SET_MODE: param1 must have the custom-mode bit (else UNSUPPORTED), param2 is the Copter mode: an unknown one, or one in
 //    `refusedModes`, is FAILED, with "Mode change failed" in STATUSTEXT.
@@ -40,6 +40,8 @@ export class SimControl {
   public paused: bool = false
   /// How many of the next commands are carried out and not acknowledged.
   public swallowAcks: int = 0
+  /// Whether each answer is preceded by an IN_PROGRESS ack, the final one coming 40 ms later.
+  public inProgressFirst: bool = false
   /// How many of each came (the ones that were carried out).
   public commands: int = 0
   public arms: int = 0
@@ -125,6 +127,15 @@ export class SimControl {
       swallowAcks -= 1
       return
     }
+    if (inProgressFirst) {
+      ack(command, MavResult.IN_PROGRESS)
+      const _timer = setTimeout(() => this.ack(command, result), 40)
+      return
+    }
+    ack(command, result)
+  }
+
+  ack(command: int, result: int): void {
     const a = new CommandAck()
     a.command = command as u16
     a.result = result as u8
@@ -137,11 +148,13 @@ export class SimControl {
       if (isArmed()) {
         return MavResult.ACCEPTED
       }
-      if (prearm != "" && magic != SKIP_CHECKS) {
+      // ArduPilot (GCS_Common.cpp, 4.7.2) skips the pre-arm checks of an ARM when param2 is 2989 OR 21196.
+      const skips = magic == SKIP_CHECKS || magic == FORCE_DISARM
+      if (prearm != "" && !skips) {
         say(`PreArm: ${prearm}`)
         return MavResult.FAILED
       }
-      if (magic == SKIP_CHECKS) {
+      if (skips) {
         forcedArms += 1
       }
       armedSet = 1
@@ -149,7 +162,7 @@ export class SimControl {
       return MavResult.ACCEPTED
     }
     if (arm != 0) {
-      return MavResult.DENIED
+      return MavResult.UNSUPPORTED
     }
     if (!isArmed()) {
       return MavResult.ACCEPTED
