@@ -13,7 +13,8 @@
 //  - MAV_CMD_RUN_PREARM_CHECKS: runs the pre-arm checks (the vehicle says what fails in STATUSTEXT "PreArm: ...").
 //  - RETRIES ARE 0, ON PURPOSE. A command that was not acknowledged may well have been carried out (an arm whose ack was lost has
 //    ARMED the vehicle): sending it again, later, could arm a vehicle somebody has since disarmed. So every command is sent ONCE and a
-//    missing ack is returned as `acknowledged: false`; what the vehicle is doing is read from its HEARTBEAT, not guessed. An IN_PROGRESS
+//    missing ack is returned as `acknowledged: false` (the one exception is the emergency stop: `emergencyStopRetrying` sends it up to 3
+//    times, because it is idempotent); what the vehicle is doing is read from its HEARTBEAT, not guessed. An IN_PROGRESS
 //    ack is waited past, for the final one, inside the same timeout (nothing is sent again).
 //  - AFTER AN ABORT (the signal) the command MAY ALREADY HAVE BEEN SENT: an `ABORTED` error does not say the vehicle did nothing.
 import { MavLinkConnection } from "./connection"
@@ -26,6 +27,10 @@ export const MAGIC_FORCE_DISARM: f64 = 21196.0
 
 /// The magic number of param2 that arms without the pre-arm checks. NOTHING sends it (it is for the simulator and for tests).
 export const MAGIC_SKIP_CHECKS: f64 = 2989.0
+
+/// How long `emergencyStopRetrying` waits for an ack before it sends the stop again (ms), and how many more times it does.
+export const STOP_GAP_MS: int = 500
+export const STOP_RESENDS: int = 2
 
 /// The greatest custom mode a helper sends (a Copter has fewer than 30).
 export const MAX_MODE: int = 255
@@ -95,10 +100,12 @@ export class VehicleControl {
   readonly conn: MavLinkConnection
   readonly target: Target
   readonly call: CommandCall
+  readonly signal: AbortSignal?
 
   constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
     this.conn = conn
     this.target = target
+    this.signal = options.signal
     this.call = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0, signal: options.signal })
   }
 
@@ -115,6 +122,23 @@ export class VehicleControl {
   /// The emergency stop: disarms WHATEVER the vehicle is doing (it falls). The only command here that can.
   public async emergencyStop(): Promise<ControlResult> throws Error {
     await send(MavCmd.COMPONENT_ARM_DISARM, emergencyStopParams())
+  }
+
+  /// The emergency stop, SENT AGAIN until the vehicle answers: at most 3 sends, `gapMs` (default 500) apart. It is the one command that
+  /// may be repeated: a forced disarm of a vehicle that is already disarmed is accepted and changes nothing, and a stop that is lost
+  /// on a poor link is the worst loss of all. The same command, the same force value, nothing else. The answer is the first ack's (it
+  /// can be the ack of an earlier send, or of a normal disarm in flight: an ack is matched by its command number and sender only, so
+  /// that the vehicle has STOPPED is read from its heartbeat, not from the ack).
+  public async emergencyStopRetrying(gapMs: int = STOP_GAP_MS): Promise<ControlResult> throws Error {
+    const again = new CommandCall(conn, target, { timeoutMs: gapMs, retries: STOP_RESENDS, signal: signal })
+    try {
+      return controlResult(await again.run(MavCmd.COMPONENT_ARM_DISARM, emergencyStopParams()))
+    } catch (e: Error) {
+      if (e instanceof MavLinkError && e.code == "TIMEOUT") {
+        return unacknowledged()
+      }
+      throw e
+    }
   }
 
   /// Changes the flight mode to the Copter mode `mode` (0 to 255; anything else is an `INVALID_VALUE` MavLinkError and nothing is sent).

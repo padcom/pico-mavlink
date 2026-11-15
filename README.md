@@ -63,7 +63,11 @@ Status: **in development (MV1).**
   arm or a disarm is always 0; 21196 (disarm in flight) is sent by `emergencyStop` only, and 2989 (arm without the pre-arm checks) by nothing.** The parameter
   lists are pure functions (`armParams`, `emergencyStopParams`, `modeParams` ...) and a test checks every one. `SimulatedAutopilot.control` does the vehicle's side
   (arms by itself at the third tick unless told otherwise; a `prearm` text makes an arm FAILED with `PreArm: <text>` in STATUSTEXT; a disarm in flight is refused
-  unless forced; modes; pause only in AUTO and GUIDED; lost acks).
+  unless forced; modes; pause only in AUTO and GUIDED; lost acks). **`emergencyStopRetrying`** is the one command sent again: up to 3 sends 500 ms
+  apart until the first ack (a forced disarm of a disarmed vehicle changes nothing). An ack is matched by command number and sender only, so a stop
+  and a normal disarm in flight answer each other: that the vehicle has stopped is read from its heartbeat. A call with no retries waits for its
+  FINAL ack in ONE wait (an IN_PROGRESS is let go by: no gap in which an ack could be missed). The simulator answers RUN_PREARM_CHECKS as ArduPilot
+  does: ACCEPTED (TEMPORARILY_REJECTED while armed) and says the "PreArm:" texts.
 - **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte
   big-endian microsecond timestamp and one MAVLink 1 or 2 frame per record). Bounded memory (a chunk and a record), CRC-checked
   against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,

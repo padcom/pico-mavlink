@@ -145,6 +145,8 @@ export {
   MAGIC_FORCE_DISARM,
   MAGIC_SKIP_CHECKS,
   MAX_MODE,
+  STOP_GAP_MS,
+  STOP_RESENDS,
   VehicleControl,
   armParams,
   controlResult,
