@@ -6,6 +6,10 @@
 //  - MAV_CMD_DO_SET_MODE: param1 must have the custom-mode bit (else UNSUPPORTED), param2 is the Copter mode: an unknown one, or one in
 //    `refusedModes`, is FAILED, with "Mode change failed" in STATUSTEXT.
 //  - MAV_CMD_DO_PAUSE_CONTINUE: param1 0 pauses, 1 continues (anything else is DENIED); FAILED outside AUTO and GUIDED, as Copter does.
+//  - MAV_CMD_NAV_TAKEOFF: FAILED unless the vehicle is armed, on the ground (not `flying`) and in GUIDED (4), and when param7 (the altitude
+//    above home) is not above 0, as Copter's `do_user_takeoff_U_m` does (it says nothing in STATUSTEXT either); else ACCEPTED, and the vehicle
+//    is `flying` from then on (a normal disarm is refused: `takeoffs` counts them, `takeoffAltitude` is the last param7). The simulator
+//    does not model the climb or send a position.
 //  - MAV_CMD_RUN_PREARM_CHECKS: TEMPORARILY_REJECTED while armed; else ACCEPTED, and when a check fails (`prearm`) its "PreArm: ..." text
 //    is said (as ArduPilot does: the answer does not say whether the checks passed).
 // What a test reads: `arms`, `disarms`, `forcedArms`, `forcedDisarms`, `modeChanges`, `paused`, `commands`, `lastParam2` (of the last
@@ -47,6 +51,9 @@ export class SimControl {
   public commands: int = 0
   public arms: int = 0
   public disarms: int = 0
+  /// Takeoffs that were accepted, and the altitude (m above home) of the last (0: none).
+  public takeoffs: int = 0
+  public takeoffAltitude: f64 = 0.0
   public forcedArms: int = 0
   public forcedDisarms: int = 0
   public modeChanges: int = 0
@@ -96,7 +103,7 @@ export class SimControl {
       return false
     }
     const command = m.command as int
-    if (command != MavCmd.COMPONENT_ARM_DISARM && command != MavCmd.DO_SET_MODE && command != MavCmd.DO_PAUSE_CONTINUE && command != MavCmd.RUN_PREARM_CHECKS) {
+    if (!isMine(command)) {
       return false
     }
     if (mine(m.targetSystem as int, m.targetComponent as int)) {
@@ -108,12 +115,20 @@ export class SimControl {
         result = setMode(m._param1 as int, m._param2 as int)
       } else if (command == MavCmd.DO_PAUSE_CONTINUE) {
         result = pauseOrContinue(m._param1 as int)
+      } else if (command == MavCmd.NAV_TAKEOFF) {
+        result = takeOff(m._param7 as f64)
       } else {
         result = runPrearm()
       }
       answer(command, result)
     }
     true
+  }
+
+  /// Whether the command is one of those this handles.
+  isMine(command: int): bool {
+    command == MavCmd.COMPONENT_ARM_DISARM || command == MavCmd.DO_SET_MODE || command == MavCmd.DO_PAUSE_CONTINUE
+      || command == MavCmd.RUN_PREARM_CHECKS || command == MavCmd.NAV_TAKEOFF
   }
 
   say(text: string): void {
@@ -204,6 +219,18 @@ export class SimControl {
       return MavResult.FAILED
     }
     paused = flag == 0
+    MavResult.ACCEPTED
+  }
+
+  /// ArduPilot (takeoff.cpp `do_user_takeoff_U_m`, mode_guided.cpp): FAILED unless the vehicle is armed, on the ground and in GUIDED, and
+  /// the altitude is above 0; ACCEPTED then, and the vehicle is flying.
+  takeOff(altitude: f64): int {
+    if (!isArmed() || flying || mode() != 4 || !(altitude > 0.0)) {
+      return MavResult.FAILED
+    }
+    flying = true
+    takeoffs += 1
+    takeoffAltitude = altitude
     MavResult.ACCEPTED
   }
 

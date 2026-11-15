@@ -11,6 +11,11 @@
 //    5 LOITER, 6 RTL, 9 LAND ...).
 //  - MAV_CMD_DO_PAUSE_CONTINUE: param1 0 pauses the mission (or a guided move), 1 continues it.
 //  - MAV_CMD_RUN_PREARM_CHECKS: runs the pre-arm checks (the vehicle says what fails in STATUSTEXT "PreArm: ...").
+//  - MAV_CMD_NAV_TAKEOFF (ArduCopter GCS_MAVLink_Copter.cpp `handle_MAV_CMD_NAV_TAKEOFF`, takeoff.cpp `do_user_takeoff_U_m`): param7 is the
+//    altitude in metres ABOVE HOME (a COMMAND_LONG is taken as the relative frame), param3 0 means horizontal navigation is required
+//    (the vehicle needs a position), params 4 to 6 are not used. The vehicle answers FAILED unless it is ARMED, still on the ground and in
+//    a mode that can take off (GUIDED), and when the altitude is not above where it is; ACCEPTED starts the climb. It is the motion that
+//    begins a flight, so it is sent ONCE like the rest (a takeoff whose ack was lost may be under way).
 //  - RETRIES ARE 0, ON PURPOSE. A command that was not acknowledged may well have been carried out (an arm whose ack was lost has
 //    ARMED the vehicle): sending it again, later, could arm a vehicle somebody has since disarmed. So every command is sent ONCE and a
 //    missing ack is returned as `acknowledged: false` (the one exception is the emergency stop: `emergencyStopRetrying` sends it up to 3
@@ -34,6 +39,10 @@ export const STOP_RESENDS: int = 2
 
 /// The greatest custom mode a helper sends (a Copter has fewer than 30).
 export const MAX_MODE: int = 255
+
+/// The highest takeoff altitude this library puts in a command (m): a number that is not a flight a person means (the caller's own limit,
+/// which is far lower, comes first; this only keeps a typo or a unit mistake from going out).
+export const MAX_TAKEOFF_M: f64 = 1000.0
 
 /// The parameters of an arm (`arm` true) or a disarm: param2 is 0 (the pre-arm checks run, a flying vehicle refuses to disarm).
 export function armParams(arm: bool): f64[] {
@@ -61,6 +70,15 @@ export function pauseParams(resume: bool): f64[] {
 /// The parameters of RUN_PREARM_CHECKS: none.
 export function prearmParams(): f64[] {
   [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// The parameters of NAV_TAKEOFF to `altitude` metres above home: param3 0 (horizontal navigation required), param7 the altitude, no
+/// position (params 4 to 6 are not used by a Copter). The altitude must be above 0 and at most `MAX_TAKEOFF_M`, and a number.
+export function takeoffParams(altitude: f64): f64[] throws MavLinkError {
+  if (!(altitude > 0.0) || altitude > MAX_TAKEOFF_M) {
+    throw new MavLinkError("INVALID_VALUE", `a takeoff altitude is above 0 and at most ${MAX_TAKEOFF_M} m, not ${altitude}`)
+  }
+  [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, altitude]
 }
 
 /// What the vehicle said to a command.
@@ -144,6 +162,12 @@ export class VehicleControl {
   /// Changes the flight mode to the Copter mode `mode` (0 to 255; anything else is an `INVALID_VALUE` MavLinkError and nothing is sent).
   public async setMode(mode: int): Promise<ControlResult> throws Error {
     await send(MavCmd.DO_SET_MODE, modeParams(mode))
+  }
+
+  /// Takes off to `altitude` metres above home (above 0, at most `MAX_TAKEOFF_M`; anything else is an `INVALID_VALUE` MavLinkError and
+  /// nothing is sent). The vehicle must be armed, on the ground and in GUIDED, else it answers FAILED. Sent once.
+  public async takeoff(altitude: f64): Promise<ControlResult> throws Error {
+    await send(MavCmd.NAV_TAKEOFF, takeoffParams(altitude))
   }
 
   /// Pauses the mission (or the guided move).
