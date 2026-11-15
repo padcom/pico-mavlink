@@ -21,7 +21,8 @@
 //  - MAV_CMD_DO_CHANGE_SPEED: DENIED unless param2 (the speed) is above 0 and param1 is a speed type 0 to 3; ground and air speed set `groundSpeed`.
 //  - MAV_CMD_DO_SET_HOME (GCS_Common.cpp:5491): param1 1, or latitude and longitude both 0, sets HOME to where the vehicle is; param1 0 with a place
 //    sets that place (a COMMAND_INT carries degrees times 1e7, a COMMAND_LONG degrees); any other param1 is FAILED, a place off the globe DENIED, and
-//    FAILED while `noEkfOrigin` is on (ArduCopter commands.cpp:58).
+//    FAILED while `noEkfOrigin` is on (ArduCopter commands.cpp:58). Home's altitude (`homeAmsl`, above sea level) moves with it: the vehicle's height
+//    above home (`height`) and its target's change by the difference, as the vehicle's own do.
 // The vehicle's position (`lat`, `lon` in degrees times 1e7, `height` in metres above home) starts at home, climbs to a takeoff's altitude and
 // goes to a reposition's target when `advance` is called (the simulator calls it at each tick).
 // What a test reads: `arms`, `disarms`, `forcedArms`, `forcedDisarms`, `modeChanges`, `paused`, `commands`, `lastParam2` (of the last
@@ -42,8 +43,12 @@ const COPTER_MODES: int[] = [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 14, 15, 16, 17, 
 /// ZIGZAG (24), and the modes that are guided ones and inherit its takeoff: AVOID_ADSB (19), GUIDED_NOGPS (20), FOLLOW (23).
 const TAKEOFF_MODES: int[] = [4, 5, 16, 24, 19, 20, 23]
 
-/// The frames of MAV_FRAME a reposition may name (global, relative to home, the integer ones, and terrain): all taken as metres above home.
+/// The frames of MAV_FRAME a reposition may name. 0 (GLOBAL) and 5 (GLOBAL_INT) give the altitude above SEA LEVEL; 3 (GLOBAL_RELATIVE_ALT) and 6
+/// (GLOBAL_RELATIVE_ALT_INT) above HOME; 10 and 11 (terrain) are taken as above home (the simulator has no terrain).
 const KNOWN_FRAMES: int[] = [0, 3, 5, 6, 10, 11]
+
+/// The frames in which an altitude of 0 means "the current altitude": the ones above home (Location.cpp:548: `alt == 0 && relative_alt`).
+const RELATIVE_FRAMES: int[] = [3, 6]
 
 /// Metres of a degree of latitude, and the climb rate of the simulated vehicle (m/s).
 const METRES_PER_DEGREE: f64 = 111320.0
@@ -86,9 +91,10 @@ export class SimControl {
   public lat: int = 522297000
   public lon: int = 210122000
   public height: f64 = 0.0
-  /// Where HOME is (degrees times 1e7).
+  /// Where HOME is (degrees times 1e7), and how high above sea level (m): every height above home is from it.
   public homeLat: int = 522297000
   public homeLon: int = 210122000
+  public homeAmsl: f64 = 100.0
   /// The place the vehicle flies to (a reposition, a takeoff's altitude): none until one is accepted.
   public hasTarget: bool = false
   public targetLat: int = 0
@@ -170,7 +176,7 @@ export class SimControl {
       } else if (command == MavCmd.DO_CHANGE_SPEED) {
         result = changeSpeed(m._param1 as int, m._param2 as f64)
       } else if (command == MavCmd.DO_SET_HOME) {
-        result = setHome(m._param1 as f64, Math.round((m._param5 as f64) * 10000000.0) as int, Math.round((m._param6 as f64) * 10000000.0) as int)
+        result = setHome(m._param1 as f64, Math.round((m._param5 as f64) * 10000000.0) as int, Math.round((m._param6 as f64) * 10000000.0) as int, m._param7 as f64)
       } else {
         result = runPrearm()
       }
@@ -191,7 +197,7 @@ export class SimControl {
       if (command == MavCmd.DO_REPOSITION) {
         result = reposition(m._param2 as int, m.frame as int, m._param5 as int, m._param6 as int, m._param7 as f64)
       } else {
-        result = setHome(m._param1 as f64, m._param5 as int, m._param6 as int)
+        result = setHome(m._param1 as f64, m._param5 as int, m._param6 as int, m._param7 as f64)
       }
       answer(command, result)
     }
@@ -314,7 +320,8 @@ export class SimControl {
   }
 
   /// ArduPilot (GCS_MAVLink_Copter.cpp:431): DENIED outside GUIDED unless param2 has the change-mode bit, for a place off the globe, a NaN
-  /// altitude and an unknown frame; else the destination is loaded (ACCEPTED), and the mode is GUIDED.
+  /// altitude and an unknown frame, and (`Location::sanitize`, Location.cpp:541 and :548, from GCS_MAVLink_Copter.cpp:444) for a latitude and
+  /// longitude of 0 and 0 and for an altitude of 0 in a frame above home; else the destination is loaded (ACCEPTED), and the mode is GUIDED.
   reposition(flags: int, frame: int, latitude: int, longitude: int, altitude: f64): int {
     if (mode() != 4 && (flags & 1) == 0) {
       return MavResult.DENIED
@@ -325,6 +332,9 @@ export class SimControl {
     if (!(altitude == altitude) || !KNOWN_FRAMES.includes(frame)) {
       return MavResult.DENIED
     }
+    if ((latitude == 0 && longitude == 0) || (altitude == 0.0 && RELATIVE_FRAMES.includes(frame))) {
+      return MavResult.DENIED
+    }
     if (mode() != 4) {
       modeSet = 4
       modeChanges += 1
@@ -332,7 +342,7 @@ export class SimControl {
     hasTarget = true
     targetLat = latitude
     targetLon = longitude
-    targetHeight = altitude
+    targetHeight = if (frame == 0 || frame == 5) altitude - homeAmsl else altitude
     repositions += 1
     return MavResult.ACCEPTED
   }
@@ -350,9 +360,9 @@ export class SimControl {
   }
 
   /// ArduPilot (GCS_Common.cpp:5491): param1 1, or both coordinates 0, is where the vehicle is; param1 0 is the place given; else FAILED.
-  setHome(param1: f64, latitude: int, longitude: int): int {
+  setHome(param1: f64, latitude: int, longitude: int, altitudeAmsl: f64): int {
     if (param1 == 1.0 || (latitude == 0 && longitude == 0)) {
-      return changeHome(lat, lon)
+      return changeHome(lat, lon, homeAmsl + height)
     }
     if (param1 != 0.0) {
       return MavResult.FAILED
@@ -360,16 +370,22 @@ export class SimControl {
     if (latitude < -900000000 || latitude > 900000000 || longitude < -1800000000 || longitude > 1800000000) {
       return MavResult.DENIED
     }
-    return changeHome(latitude, longitude)
+    return changeHome(latitude, longitude, altitudeAmsl)
   }
 
-  changeHome(latitude: int, longitude: int): int {
+  /// Moves HOME to a place and a height above sea level. What is above home is from the new home: the vehicle (and its target) are where
+  /// they were above sea level, so their heights above home change by the difference.
+  changeHome(latitude: int, longitude: int, amsl: f64): int {
     if (noEkfOrigin) {
       say("Home: no EKF origin")
       return MavResult.FAILED
     }
+    const shift = amsl - homeAmsl
     homeLat = latitude
     homeLon = longitude
+    homeAmsl = amsl
+    height -= shift
+    targetHeight -= shift
     homeSets += 1
     return MavResult.ACCEPTED
   }

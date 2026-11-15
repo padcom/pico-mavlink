@@ -6,7 +6,8 @@ import { MemoryStream } from "./stream"
 import { MavLinkError } from "./protocol"
 import { SimulatedAutopilot } from "./simulator"
 import { MAX_REPOSITION_M, MAX_SPEED_MS, VehicleControl, degreesE7, homeHereParams, repositionParams, speedParams } from "./arming"
-import { CommandInt, CommandLong } from "./dialects/common"
+import { CommandInt, CommandLong, MavCmd, MavResult } from "./dialects/common"
+import { CommandCall } from "./operations"
 
 /// The home of the simulated vehicle, as `SimControl` starts it, in degrees.
 const HOME_LAT: f64 = 52.2297
@@ -50,6 +51,7 @@ class Rig {
 /// One of the calls that must be refused before anything is sent: the number says which.
 async function badCall(rig: Rig, which: int): Promise<void> throws Error {
   const nan = 0.0 / 0.0
+  const inf = 1.0 / 0.0
   const c = rig.control
   if (which == 0) {
     const _r = await c.reposition(91.0, 21.0, 10.0)
@@ -79,15 +81,36 @@ async function badCall(rig: Rig, which: int): Promise<void> throws Error {
     const _r = await c.setSpeed(MAX_SPEED_MS + 1.0)
   } else if (which == 13) {
     const _r = await c.setHome(95.0, 21.0, 100.0)
-  } else {
+  } else if (which == 14) {
     const _r = await c.setHome(52.0, 21.0, nan)
+  } else if (which == 15) {
+    // 0, 0 and an altitude of 0 are "here" and "the current altitude" to a vehicle, which DENIES them
+    const _r = await c.reposition(0.0, 0.0, 10.0)
+  } else if (which == 16) {
+    const _r = await c.reposition(52.0, 21.0, 0.0)
+  } else if (which == 17) {
+    const _r = await c.reposition(inf, 21.0, 10.0)
+  } else if (which == 18) {
+    const _r = await c.reposition(52.0, 21.0, inf)
+  } else if (which == 19) {
+    const _r = await c.setHome(0.0, 0.0, 100.0)
+  } else if (which == 20) {
+    const _r = await c.setHome(52.0, 21.0, inf)
+  } else if (which == 21) {
+    const _r = await c.setHome(52.0, 21.0, -inf)
+  } else if (which == 22) {
+    const _r = await c.setHome(52.0, 21.0, -20000.0)
+  } else if (which == 23) {
+    const _r = await c.setHome(52.0, 21.0, 100001.0)
+  } else {
+    const _r = await c.changeAltitude(0.0, 0.0, 10.0)
   }
 }
 
 async function nothingThatIsNotAPlaceOrASpeedIsSent(): Promise<void> throws Error {
   const rig = new Rig(true, 4)
   let refused = 0
-  for (let which = 0; which < 15; which++) {
+  for (let which = 0; which < 25; which++) {
     try {
       await badCall(rig, which)
     } catch (e: Error) {
@@ -97,7 +120,7 @@ async function nothingThatIsNotAPlaceOrASpeedIsSent(): Promise<void> throws Erro
     }
   }
   rig.close()
-  expect(refused).toBe(15)
+  expect(refused).toBe(25)
   expect(rig.ints.length).toBe(0)
   expect(rig.longs.length).toBe(0)
 }
@@ -188,6 +211,45 @@ async function homeIsRefusedByAVehicleWithoutAnOrigin(): Promise<void> throws Er
   expect(rig.sim.control.homeSets).toBe(0)
 }
 
+/// What a vehicle answers to a reposition that the library would not send: the library is skipped, to see the simulator say what ArduPilot says.
+async function aVehicleDeniesWhatItTakesForHereAndNow(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  const raw = new CommandCall(rig.gcs, { system: 1, component: 1 }, { timeoutMs: 150, retries: 0 })
+  // latitude and longitude 0, 0 (Location::sanitize, Location.cpp:541)
+  const here = await raw.runInt(MavCmd.DO_REPOSITION, 6, [-1.0, 0.0, 0.0, 0.0], 0, 0, 20.0)
+  // an altitude of 0 above home (Location.cpp:548)
+  const now = await raw.runInt(MavCmd.DO_REPOSITION, 6, [-1.0, 0.0, 0.0, 0.0], 522300000, 210200000, 0.0)
+  expect(here).toBe(MavResult.DENIED)
+  expect(now).toBe(MavResult.DENIED)
+  expect(rig.sim.control.repositions).toBe(0)
+  // an altitude in frame 0 is above SEA LEVEL (0 there is an altitude, not "now"): accepted
+  const amsl = await raw.runInt(MavCmd.DO_REPOSITION, 0, [-1.0, 0.0, 0.0, 0.0], 522300000, 210200000, 130.0)
+  rig.close()
+  expect(amsl).toBe(MavResult.ACCEPTED)
+  // sea level 130 m, home at 100 m: 30 m above home
+  expect(rig.sim.control.targetHeight).toBe(30.0)
+}
+
+async function homeMovesTheReferenceOfEveryHeight(): Promise<void> throws Error {
+  const rig = new Rig(true, 4)
+  const control = rig.sim.control
+  const _up = await rig.control.takeoff(10.0)
+  control.advance(4.0)
+  expect(control.height).toBe(10.0)
+  expect(control.homeAmsl).toBe(100.0)
+  // home here, 10 m up: the vehicle is 0 m above the new home, which is 10 m higher above sea level
+  const here = await rig.control.setHomeHere()
+  expect(here.accepted).toBe(true)
+  expect(control.homeAmsl).toBe(110.0)
+  expect(control.height).toBe(0.0)
+  // home at a place 20 m below that (90 m above sea level): the same vehicle is 20 m above it
+  const there = await rig.control.setHome(52.2, 21.1, 90.0)
+  rig.close()
+  expect(there.accepted).toBe(true)
+  expect(control.homeAmsl).toBe(90.0)
+  expect(control.height).toBe(20.0)
+}
+
 async function nothingAcknowledgedIsNeverSentAgain(): Promise<void> throws Error {
   const rig = new Rig(true, 4)
   rig.sim.control.swallowAcks = 1
@@ -239,6 +301,8 @@ describe("guided control", () => {
   it("sets the ground speed with DO_CHANGE_SPEED", theSpeedIsSetOnceAndTheSimulatorKeepsIt)
   it("sets home to where the vehicle is, or to a place", homeIsSetToWhereTheVehicleIsOrToAPlace)
   it("is refused a home by a vehicle that has no EKF origin", homeIsRefusedByAVehicleWithoutAnOrigin)
+  it("is denied by a vehicle for 0, 0 and for an altitude of 0 above home, and takes an altitude above sea level from the home's", aVehicleDeniesWhatItTakesForHereAndNow)
+  it("moves the home's altitude, and every height above home with it", homeMovesTheReferenceOfEveryHeight)
   it("never sends a reposition again that nothing acknowledged", nothingAcknowledgedIsNeverSentAgain)
   it("flies to the target at its speed, climbing as it goes, and not before it has taken off", theVehicleClimbsAndFliesToTheTarget)
 })

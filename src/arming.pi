@@ -28,12 +28,19 @@
 //    cannot take the destination. param1 (speed) is NOT used by a Copter: the speed is `setSpeed` (DO_CHANGE_SPEED), a separate command, so that
 //    a reposition never changes a speed by itself. The frame is GLOBAL_RELATIVE_ALT_INT: the altitude is metres above HOME. ACCEPTED means the
 //    destination was loaded, not that the vehicle has arrived (it flies there, and stays: its position says what it does).
+//    The vehicle DENIES a place whose latitude and longitude are both 0 ("use the current point") and an altitude of 0 in a frame that is relative
+//    to home ("use the current altitude"): ArduCopter GCS_MAVLink_Copter.cpp:444 `request_location.sanitize(copter.current_loc)` returns true when it
+//    had to change the place, and the handler answers DENIED (libraries/AP_Common/Location.cpp:541 and :548). So `reposition` REFUSES both before
+//    anything is sent (an altitude must be above 0), and the simulator DENIES them as the vehicle does.
 //  - MAV_CMD_DO_CHANGE_SPEED (GCS_MAVLink_Copter.cpp:633): param1 the speed type (1 ground speed), param2 the speed (m/s, DENIED unless above 0),
 //    param3 throttle (-1: no change).
 //  - MAV_CMD_DO_SET_HOME (GCS_Common.cpp:5491 `handle_command_do_set_home`): param1 1 uses the vehicle's CURRENT location; 0 with a latitude and
-//    longitude (a COMMAND_INT, frame global, altitude above sea level) sets that place; any other param1 is FAILED. DENIED for a place that is not
-//    on the globe; FAILED when the vehicle has no EKF origin yet (ArduCopter commands.cpp:58 `Copter::set_home`). It CHANGES WHERE RTL GOES, so it
-//    is the caller's to ask the user first; it is sent once like the rest.
+//    longitude (a COMMAND_INT, frame global, altitude above sea level) sets that place; any other param1 is FAILED. A latitude and a longitude that are
+//    BOTH 0 mean "the current location" too (line 5493): `setHome` REFUSES 0, 0 before sending, because a place that falls back to where the vehicle
+//    is, in the air as well, is not the place that was asked for. DENIED for a place that is not on the globe; FAILED when the vehicle has no EKF origin
+//    yet (ArduCopter commands.cpp:58 `Copter::set_home`). It CHANGES WHERE RTL GOES, so it is the caller's to ask the user first; it is sent once like
+//    the rest. It moves the home ALTITUDE as well: home's height above sea level is the reference of every altitude above home (a reposition's, a
+//    takeoff's) and the height RTL lands from, so after it the same target altitude is another height; the simulator models this (`homeAmsl`).
 //  - A Copter has no DO_CHANGE_ALTITUDE (nothing handles it): a change of altitude is a reposition to where the vehicle is, with another altitude
 //    (`changeAltitude`).
 //  - RETRIES ARE 0, ON PURPOSE. A command that was not acknowledged may well have been carried out (an arm whose ack was lost has
@@ -109,6 +116,11 @@ export const MAX_SPEED_MS: f64 = 30.0
 
 /// DO_CHANGE_SPEED's speed type for the ground speed.
 const SPEED_TYPE_GROUND: f64 = 1.0
+
+/// Whether a latitude and a longitude (degrees times 1e7) are both 0: ArduPilot's "the current point" (Location.cpp:541), not the place at 0, 0.
+export function isTheCurrentPoint(x: int, y: int): bool {
+  return x == 0 && y == 0
+}
 
 /// A latitude or a longitude in degrees as the whole number of degrees times 1e7 a COMMAND_INT carries; an `INVALID_VALUE` MavLinkError for
 /// one that is not a number or beyond `limit` (90 for a latitude, 180 for a longitude).
@@ -229,19 +241,25 @@ export class VehicleControl {
   }
 
   /// Flies to a place, in GUIDED (the vehicle must already be in it, else it answers DENIED: this never changes the mode): `latitude` and
-  /// `longitude` in degrees, `altitude` metres above home (a number, at most `MAX_REPOSITION_M`, and not below 0). Anything else is an
-  /// `INVALID_VALUE` MavLinkError and nothing is sent. Sent once. ACCEPTED means the destination was loaded.
+  /// `longitude` in degrees, `altitude` metres above home (a number, above 0 and at most `MAX_REPOSITION_M`). Anything else is an
+  /// `INVALID_VALUE` MavLinkError and nothing is sent: a latitude and longitude both 0 and an altitude of 0 also, because the vehicle takes them
+  /// to mean "here" and DENIES the command (Location.cpp:541, :548). Sent once. ACCEPTED means the destination was loaded.
   public async reposition(latitude: f64, longitude: f64, altitude: f64): Promise<ControlResult> throws Error {
-    if (!(altitude >= 0.0) || altitude > MAX_REPOSITION_M) {
-      throw new MavLinkError("INVALID_VALUE", `a reposition altitude is 0 to ${MAX_REPOSITION_M} m above home, not ${altitude}`)
+    if (!(altitude > 0.0) || altitude > MAX_REPOSITION_M) {
+      throw new MavLinkError("INVALID_VALUE", `a reposition altitude is above 0 and at most ${MAX_REPOSITION_M} m above home, not ${altitude}`)
     }
     const x = degreesE7(latitude, 90.0, "a latitude")
     const y = degreesE7(longitude, 180.0, "a longitude")
+    if (isTheCurrentPoint(x, y)) {
+      throw new MavLinkError("INVALID_VALUE", "a latitude and a longitude of 0 and 0 mean 'where the vehicle is' to a vehicle, not a place")
+    }
     return await sendInt(MavCmd.DO_REPOSITION, MavFrame.GLOBAL_RELATIVE_ALT_INT, repositionParams(), x, y, altitude)
   }
 
   /// Goes to another altitude where the vehicle is: a reposition to `latitude` and `longitude` (the vehicle's own position, as the caller
-  /// knows it) at `altitude` metres above home. A Copter has no DO_CHANGE_ALTITUDE.
+  /// knows it) at `altitude` metres above home. A Copter has no DO_CHANGE_ALTITUDE. THE POSITION MUST BE FRESH: the vehicle flies to the place it
+  /// is given, so a position from a while ago sends it back to where it was (and drops what it was flying to). The caller checks the age of the
+  /// position it passes; this library cannot.
   public async changeAltitude(latitude: f64, longitude: f64, altitude: f64): Promise<ControlResult> throws Error {
     return await reposition(latitude, longitude, altitude)
   }
@@ -251,15 +269,21 @@ export class VehicleControl {
     return await send(MavCmd.DO_CHANGE_SPEED, speedParams(speed))
   }
 
-  /// Sets HOME to where the vehicle is: RTL will return here from now on. Sent once; FAILED when the vehicle has no EKF origin yet.
+  /// Sets HOME to where the vehicle is, height included: RTL will return here from now on, and what the vehicle's height above home is changes with it
+  /// (in the air it becomes 0). Sent once; FAILED when the vehicle has no EKF origin yet.
   public async setHomeHere(): Promise<ControlResult> throws Error {
     return await send(MavCmd.DO_SET_HOME, homeHereParams())
   }
 
-  /// Sets HOME to a place (a COMMAND_INT, frame global: the altitude is above sea level): RTL will return there from now on. Sent once.
+  /// Sets HOME to a place (a COMMAND_INT, frame global: the altitude is metres above SEA LEVEL, from -10000 to 100000): RTL will return there from
+  /// now on, and the home altitude moves with it (every altitude above home changes its reference). A latitude and longitude of 0 and 0 are
+  /// refused (a vehicle takes them for "here": use `setHomeHere`). Sent once.
   public async setHome(latitude: f64, longitude: f64, altitude: f64): Promise<ControlResult> throws Error {
     const x = degreesE7(latitude, 90.0, "a latitude")
     const y = degreesE7(longitude, 180.0, "a longitude")
+    if (isTheCurrentPoint(x, y)) {
+      throw new MavLinkError("INVALID_VALUE", "a latitude and a longitude of 0 and 0 mean 'where the vehicle is' to a vehicle: use setHomeHere")
+    }
     if (!(altitude > -10000.0) || altitude > 100000.0) {
       throw new MavLinkError("INVALID_VALUE", `a home altitude is above sea level and not ${altitude}`)
     }
