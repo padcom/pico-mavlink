@@ -151,7 +151,8 @@ async function aFailingPreArmCheckRefusesTheArmWithItsText(): Promise<void> thro
   expect(result.acknowledged).toBe(true)
   expect(result.result).toBe(MavResult.FAILED)
   expect(result.name).toBe("FAILED")
-  expect(checks.name).toBe("FAILED")
+  // ArduPilot answers a run of the checks ACCEPTED whatever they found: the texts say what failed
+  expect(checks.name).toBe("ACCEPTED")
   expect(rig.sim.control.isArmed()).toBe(false)
   expect(rig.sim.control.arms).toBe(0)
   expect(rig.texts.join(";")).toBe("PreArm: Compasses inconsistent;PreArm: Compasses inconsistent")
@@ -270,6 +271,52 @@ async function anInProgressAckIsWaitedPastWithoutSendingAgain(): Promise<void> t
   expect(rig.sim.control.commands).toBe(1)
 }
 
+async function theRunOfTheChecksIsRejectedWhileArmed(): Promise<void> throws Error {
+  const rig = new Rig()
+  const _a = await rig.control.arm()
+  const result = await rig.control.runPrearmChecks()
+  rig.close()
+  expect(result.name).toBe("TEMPORARILY_REJECTED")
+}
+
+async function theEmergencyStopIsSentAgainUntilTheFirstAck(): Promise<void> throws Error {
+  const rig = new Rig(100)
+  const _a = await rig.control.arm()
+  rig.sim.control.swallowAcks = 2
+  const before = rig.sent.length
+  const result = await rig.control.emergencyStopRetrying(100)
+  await delay(250)
+  rig.close()
+  expect(result.accepted).toBe(true)
+  // sent three times (two lost acks), and then no more; every one the stop: 21196 and nothing else
+  expect(rig.sent.length - before).toBe(3)
+  expect(rig.param2.slice(1).join(",")).toBe("21196,21196,21196")
+  expect(rig.sim.control.isArmed()).toBe(false)
+}
+
+async function theEmergencyStopIsSentOnceWhenItIsAnswered(): Promise<void> throws Error {
+  const rig = new Rig(100)
+  const _a = await rig.control.arm()
+  const before = rig.sent.length
+  const result = await rig.control.emergencyStopRetrying(100)
+  await delay(250)
+  rig.close()
+  expect(result.accepted).toBe(true)
+  expect(rig.sent.length - before).toBe(1)
+}
+
+async function theEmergencyStopGivesUpAfterThreeSends(): Promise<void> throws Error {
+  const rig = new Rig(100)
+  const _a = await rig.control.arm()
+  rig.sim.control.swallowAcks = 5
+  const before = rig.sent.length
+  const result = await rig.control.emergencyStopRetrying(100)
+  await delay(250)
+  rig.close()
+  expect(result.acknowledged).toBe(false)
+  expect(rig.sent.length - before).toBe(3)
+}
+
 async function aCommandAnotherSystemIsNotMineIsIgnored(): Promise<void> throws Error {
   const rig = new Rig(100)
   const other = new VehicleControl(rig.gcs, { system: 7, component: 1 }, { timeoutMs: 100 })
@@ -308,6 +355,10 @@ describe("arming, modes and pause", () => {
   it("skips the pre-arm checks of an arm for 21196 as it does for 2989 (the simulator counts both)", anArmWith21196SkipsThePreArmChecksToo)
   it("answers an arm parameter that is not 0 or 1 UNSUPPORTED", anArmParamThatIsNeitherZeroNorOneIsUnsupported)
   it("waits past IN_PROGRESS for the final ack, in the same timeout and without sending again", anInProgressAckIsWaitedPastWithoutSendingAgain)
+  it("is told by the vehicle that the checks cannot run while armed", theRunOfTheChecksIsRejectedWhileArmed)
+  it("sends the emergency stop again until the first ack, at most 3 times, and only the stop", theEmergencyStopIsSentAgainUntilTheFirstAck)
+  it("sends the emergency stop once when it is answered", theEmergencyStopIsSentOnceWhenItIsAnswered)
+  it("gives up on an emergency stop nothing answers after 3 sends", theEmergencyStopGivesUpAfterThreeSends)
   it("is ignored by a vehicle it is not addressed to", aCommandAnotherSystemIsNotMineIsIgnored)
   it("keeps the simulator's old behaviour: armed at the third tick, disarmed again after a reboot", theVehicleArmsItselfAtItsThirdTickWhenNothingIsSet)
   it("names a result", () => {

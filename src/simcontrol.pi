@@ -6,7 +6,8 @@
 //  - MAV_CMD_DO_SET_MODE: param1 must have the custom-mode bit (else UNSUPPORTED), param2 is the Copter mode: an unknown one, or one in
 //    `refusedModes`, is FAILED, with "Mode change failed" in STATUSTEXT.
 //  - MAV_CMD_DO_PAUSE_CONTINUE: param1 0 pauses, 1 continues (anything else is DENIED); FAILED outside AUTO and GUIDED, as Copter does.
-//  - MAV_CMD_RUN_PREARM_CHECKS: ACCEPTED when no check fails (`prearm` is ""), else FAILED with the "PreArm: ..." text.
+//  - MAV_CMD_RUN_PREARM_CHECKS: TEMPORARILY_REJECTED while armed; else ACCEPTED, and when a check fails (`prearm`) its "PreArm: ..." text
+//    is said (as ArduPilot does: the answer does not say whether the checks passed).
 // What a test reads: `arms`, `disarms`, `forcedArms`, `forcedDisarms`, `modeChanges`, `paused`, `commands`, `lastParam2` (of the last
 // COMPONENT_ARM_DISARM). Faults for tests: `swallowAcks` (the next commands are carried out and not acknowledged: an ack lost on the link).
 // With nothing set the vehicle arms by itself at its third tick (what the simulator always did) and flies STABILIZE (disarmed) / LOITER (armed).
@@ -206,10 +207,14 @@ export class SimControl {
     MavResult.ACCEPTED
   }
 
+  /// ArduPilot (GCS_Common.cpp `handle_command_run_prearm_checks`): TEMPORARILY_REJECTED while armed, else it runs the checks, which
+  /// print their "PreArm: ..." texts, and answers ACCEPTED whatever they found.
   runPrearm(): int {
+    if (isArmed()) {
+      return MavResult.TEMPORARILY_REJECTED
+    }
     if (prearm != "") {
       say(`PreArm: ${prearm}`)
-      return MavResult.FAILED
     }
     MavResult.ACCEPTED
   }

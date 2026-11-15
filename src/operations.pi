@@ -469,8 +469,10 @@ export class CommandCall {
     const name = MavCmd.nameOf(command) ?? `${command}`
     for (let attempt = 0; attempt <= retries; attempt++) {
       checkAborted(signal, name)
-      const startedAt = Date.now() as int
-      let reply = conn.waitFor((r: Received) => isAckOf(r, target, command), timeoutMs, signal)
+      // With no retries (a command that must never be sent twice) ONE wait takes only a FINAL ack (an IN_PROGRESS is let go by,
+      // inside the same timeout and with no gap in which an ack could be missed); with retries an IN_PROGRESS is the signal to ask again.
+      const finalOnly = retries == 0
+      const reply = conn.waitFor((r: Received) => isAckOf(r, target, command) && !(finalOnly && inProgress(r)), timeoutMs, signal)
       const c = new CommandLong()
       c.targetSystem = target.system as u8
       c.targetComponent = target.component as u8
@@ -485,13 +487,7 @@ export class CommandCall {
       c._param6 = p(5)
       c._param7 = p(6)
       await conn.send(c)
-      let r = await reply
-      // With no retries (a command that must never be sent twice) an IN_PROGRESS is waited past, for the final ack, inside the same
-      // timeout and WITHOUT sending again; with retries it is the signal to ask again.
-      while (retries == 0 && inProgress(r) && (Date.now() as int) - startedAt < timeoutMs) {
-        reply = conn.waitFor((q: Received) => isAckOf(q, target, command), timeoutMs - ((Date.now() as int) - startedAt), signal)
-        r = await reply
-      }
+      const r = await reply
       if (r != null) {
         const m = r!.message
         if (m instanceof CommandAck) {
@@ -512,11 +508,8 @@ export class CommandCall {
   }
 }
 
-function inProgress(r: Received?): bool {
-  if (r == null) {
-    return false
-  }
-  const m = r!.message
+function inProgress(r: Received): bool {
+  const m = r.message
   m instanceof CommandAck && m.result as int == MavResult.IN_PROGRESS
 }
 
