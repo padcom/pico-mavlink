@@ -20,6 +20,7 @@ import { SimLogs } from "./simlogs"
 import { SimCalibration } from "./simcal"
 import { SimCompass } from "./simcompass"
 import { SimMotors } from "./simmotor"
+import { SimControl } from "./simcontrol"
 import { actualRate, desiredRate } from "./simrate"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
 import { Attitude, AttitudeTarget, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime } from "./dialects/common"
@@ -212,6 +213,9 @@ export class SimulatedAutopilot {
   public readonly motors: SimMotors
   /// SERVO_OUTPUT_RAW (the outputs of the motors, `motors.outputs()`) at each tick when on (off: nothing).
   public servoStream: bool = false
+  /// Arming, flight modes, pause and the pre-arm checks (COMPONENT_ARM_DISARM, DO_SET_MODE, DO_PAUSE_CONTINUE, RUN_PREARM_CHECKS): see
+  /// simcontrol.pi. By itself the vehicle arms at its third tick; a `prearm` text makes an arm FAILED with "PreArm: <text>".
+  public readonly control: SimControl
 
   constructor(stream: ByteStream, params: SimParam[] = defaultSimParams(), sysid: int = 1, compid: int = 1) {
     this.sysid = sysid
@@ -219,10 +223,11 @@ export class SimulatedAutopilot {
     this.bootedAt = Date.now() as int
     this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(sysid, compid) })
     this.params = params
-    this.logs = new SimLogs(conn, fsFiles, fsTimes, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
-    this.calibration = new SimCalibration(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
-    this.compass = new SimCompass(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
-    this.motors = new SimMotors(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
+    this.control = new SimControl(conn, () => this.ticks >= 3, (system: int, component: int) => this.forMe(system, component))
+    this.logs = new SimLogs(conn, fsFiles, fsTimes, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
+    this.calibration = new SimCalibration(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
+    this.compass = new SimCompass(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
+    this.motors = new SimMotors(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
     conn.on((r: Received) => this.handle(r))
   }
 
@@ -277,6 +282,7 @@ export class SimulatedAutopilot {
     streams.delete(MavDataStream.EXTENDED_STATUS)
     streams.delete(MavDataStream.EXTRA1)
     ticks = 0
+    control.reset()
     bootedAt = Date.now() as int
     reboots += 1
     clearTimeout(downTimer)
@@ -363,12 +369,12 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    const armed = ticks >= 3
+    const armed = control.isArmed()
     const h = new Heartbeat()
     h.type = MavType.QUADROTOR as u8
     h.autopilot = MavAutopilot.ARDUPILOTMEGA as u8
     h.baseMode = (MavModeFlag.CUSTOM_MODE_ENABLED | (if (armed) MavModeFlag.SAFETY_ARMED else 0)) as u8
-    h.customMode = if (armed) 5 else 0   // ArduCopter: LOITER, STABILIZE
+    h.customMode = control.mode() as u32   // ArduCopter: LOITER (armed) or STABILIZE by default
     h.systemStatus = (if (armed) MavState.ACTIVE else MavState.STANDBY) as u8
     h.mavlinkVersion = 3
     conn.send(h)
@@ -445,7 +451,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r)) {
+    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || control.handle(r)) {
       return
     }
     const m = r.message

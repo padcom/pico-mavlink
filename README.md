@@ -57,6 +57,13 @@ Status: **in development (MV1).**
   outputs per port, 0 for an unused one). `SimulatedAutopilot.motors` does the vehicle's side (a motor that stops by itself when the timeout runs out, outputs
   in `sendServo`, faults: not landed, a refusal, lost acks). SITL (`SITL_FLIGHT=1`): a motor spins at the throttle asked and shows in `SERVO_OUTPUT_RAW`, a
   stop ends it at once, a held test goes on past one test's length and stops on release.
+- **Done:** arming, flight modes and pause (src/arming.pi). `VehicleControl` sends `COMPONENT_ARM_DISARM` (`arm`, `disarm`, `emergencyStop`), `DO_SET_MODE`
+  (`setMode`, 0 to 255), `DO_PAUSE_CONTINUE` (`pause`, `resume`) and `RUN_PREARM_CHECKS` (`runPrearmChecks`), each **once** (retries 0: an arm whose ack was
+  lost may have armed the vehicle, so it is never sent again): a missing ack is the result `UNACKNOWLEDGED` (`acknowledged: false`), not an error. **param2 of an
+  arm or a disarm is always 0; 21196 (disarm in flight) is sent by `emergencyStop` only, and 2989 (arm without the pre-arm checks) by nothing.** The parameter
+  lists are pure functions (`armParams`, `emergencyStopParams`, `modeParams` ...) and a test checks every one. `SimulatedAutopilot.control` does the vehicle's side
+  (arms by itself at the third tick unless told otherwise; a `prearm` text makes an arm FAILED with `PreArm: <text>` in STATUSTEXT; a disarm in flight is refused
+  unless forced; modes; pause only in AUTO and GUIDED; lost acks).
 - **Done:** `TlogReader` and `TlogWriter` (src/tlog.pi): a streaming reader for a ground station's `.tlog` (an 8-byte
   big-endian microsecond timestamp and one MAVLink 1 or 2 frame per record). Bounded memory (a chunk and a record), CRC-checked
   against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,

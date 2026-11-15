@@ -1,0 +1,216 @@
+// Arming, flight modes and pause/continue of the simulated autopilot, as ArduPilot Copter answers them (see arming.pi for the protocol):
+//  - MAV_CMD_COMPONENT_ARM_DISARM: param1 1 arms, 0 disarms, anything else is UNSUPPORTED. An arm while a PreArm check fails (`prearm`,
+//    the text of the check) is answered FAILED with "PreArm: <text>" in STATUSTEXT, unless param2 is 2989 OR 21196 (ArduPilot skips the
+//    checks for either on an ARM: the simulator counts both in `forcedArms`). A disarm while flying (`flying`) is answered FAILED, unless param2 is 21196 (`forcedDisarms`).
+//    Arming a vehicle that is armed, and disarming one that is not, is ACCEPTED (it changes nothing).
+//  - MAV_CMD_DO_SET_MODE: param1 must have the custom-mode bit (else UNSUPPORTED), param2 is the Copter mode: an unknown one, or one in
+//    `refusedModes`, is FAILED, with "Mode change failed" in STATUSTEXT.
+//  - MAV_CMD_DO_PAUSE_CONTINUE: param1 0 pauses, 1 continues (anything else is DENIED); FAILED outside AUTO and GUIDED, as Copter does.
+//  - MAV_CMD_RUN_PREARM_CHECKS: ACCEPTED when no check fails (`prearm` is ""), else FAILED with the "PreArm: ..." text.
+// What a test reads: `arms`, `disarms`, `forcedArms`, `forcedDisarms`, `modeChanges`, `paused`, `commands`, `lastParam2` (of the last
+// COMPONENT_ARM_DISARM). Faults for tests: `swallowAcks` (the next commands are carried out and not acknowledged: an ack lost on the link).
+// With nothing set the vehicle arms by itself at its third tick (what the simulator always did) and flies STABILIZE (disarmed) / LOITER (armed).
+import { MavLinkConnection, Received } from "./connection"
+import { CommandAck, CommandLong, MavCmd, MavResult, MavSeverity, StatusText } from "./dialects/common"
+import { MAGIC_FORCE_DISARM, MAGIC_SKIP_CHECKS } from "./arming"
+
+/// ArduPilot's magic numbers of COMPONENT_ARM_DISARM param2 (arming.pi), as the whole numbers a COMMAND_LONG carries.
+const SKIP_CHECKS: int = MAGIC_SKIP_CHECKS as int
+const FORCE_DISARM: int = MAGIC_FORCE_DISARM as int
+
+/// The Copter modes (ArduCopter `Mode::Number`) the simulated vehicle knows.
+const COPTER_MODES: int[] = [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+
+/// The simulated autopilot's arming, mode and pause.
+export class SimControl {
+  readonly conn: MavLinkConnection
+  readonly auto: () => bool
+  readonly forMe: (system: int, component: int) => bool
+  /// -1: the vehicle arms by itself (`auto`); 0: disarmed; 1: armed.
+  public armedSet: int = -1
+  /// -1: LOITER when armed and STABILIZE when not; else the Copter mode.
+  public modeSet: int = -1
+  /// Whether the vehicle is flying (a disarm is refused then, unless it is forced).
+  public flying: bool = false
+  /// The text of a pre-arm check that fails ("" when none does): an arm is refused with "PreArm: <text>".
+  public prearm: string = ""
+  /// Modes the vehicle refuses to change to (FAILED).
+  public refusedModes: int[] = []
+  /// Whether the vehicle is paused (DO_PAUSE_CONTINUE).
+  public paused: bool = false
+  /// How many of the next commands are carried out and not acknowledged.
+  public swallowAcks: int = 0
+  /// Whether each answer is preceded by an IN_PROGRESS ack, the final one coming 40 ms later.
+  public inProgressFirst: bool = false
+  /// How many of each came (the ones that were carried out).
+  public commands: int = 0
+  public arms: int = 0
+  public disarms: int = 0
+  public forcedArms: int = 0
+  public forcedDisarms: int = 0
+  public modeChanges: int = 0
+  /// The param2 of the last COMPONENT_ARM_DISARM (-1: none came).
+  public lastParam2: int = -1
+
+  constructor(conn: MavLinkConnection, auto: () => bool, forMe: (system: int, component: int) => bool) {
+    this.conn = conn
+    this.auto = auto
+    this.forMe = forMe
+  }
+
+  /// Back to what a vehicle that has just booted is (it is disarmed, in its first mode).
+  public reset(): void {
+    armedSet = -1
+    modeSet = -1
+    flying = false
+    paused = false
+  }
+
+  /// Whether the vehicle is armed now.
+  public isArmed(): bool {
+    if (armedSet >= 0) {
+      return armedSet == 1
+    }
+    const f = auto
+    f()
+  }
+
+  /// The Copter mode (the heartbeat's custom mode).
+  public mode(): int {
+    if (modeSet >= 0) {
+      return modeSet
+    }
+    if (isArmed()) 5 else 0
+  }
+
+  mine(system: int, component: int): bool {
+    const f = forMe
+    f(system, component)
+  }
+
+  /// Handles one message; whether it was one of the four commands.
+  public handle(r: Received): bool {
+    const m = r.message
+    if (!(m instanceof CommandLong)) {
+      return false
+    }
+    const command = m.command as int
+    if (command != MavCmd.COMPONENT_ARM_DISARM && command != MavCmd.DO_SET_MODE && command != MavCmd.DO_PAUSE_CONTINUE && command != MavCmd.RUN_PREARM_CHECKS) {
+      return false
+    }
+    if (mine(m.targetSystem as int, m.targetComponent as int)) {
+      commands += 1
+      let result = MavResult.UNSUPPORTED
+      if (command == MavCmd.COMPONENT_ARM_DISARM) {
+        result = armOrDisarm(m._param1 as int, m._param2 as int)
+      } else if (command == MavCmd.DO_SET_MODE) {
+        result = setMode(m._param1 as int, m._param2 as int)
+      } else if (command == MavCmd.DO_PAUSE_CONTINUE) {
+        result = pauseOrContinue(m._param1 as int)
+      } else {
+        result = runPrearm()
+      }
+      answer(command, result)
+    }
+    true
+  }
+
+  say(text: string): void {
+    const s = new StatusText()
+    s.severity = MavSeverity.CRITICAL as u8
+    s.text = text
+    conn.send(s)
+  }
+
+  answer(command: int, result: int): void {
+    if (swallowAcks > 0) {
+      swallowAcks -= 1
+      return
+    }
+    if (inProgressFirst) {
+      ack(command, MavResult.IN_PROGRESS)
+      const _timer = setTimeout(() => this.ack(command, result), 40)
+      return
+    }
+    ack(command, result)
+  }
+
+  ack(command: int, result: int): void {
+    const a = new CommandAck()
+    a.command = command as u16
+    a.result = result as u8
+    conn.send(a)
+  }
+
+  armOrDisarm(arm: int, magic: int): int {
+    lastParam2 = magic
+    if (arm == 1) {
+      if (isArmed()) {
+        return MavResult.ACCEPTED
+      }
+      // ArduPilot (GCS_Common.cpp, 4.7.2) skips the pre-arm checks of an ARM when param2 is 2989 OR 21196.
+      const skips = magic == SKIP_CHECKS || magic == FORCE_DISARM
+      if (prearm != "" && !skips) {
+        say(`PreArm: ${prearm}`)
+        return MavResult.FAILED
+      }
+      if (skips) {
+        forcedArms += 1
+      }
+      armedSet = 1
+      arms += 1
+      return MavResult.ACCEPTED
+    }
+    if (arm != 0) {
+      return MavResult.UNSUPPORTED
+    }
+    if (!isArmed()) {
+      return MavResult.ACCEPTED
+    }
+    if (flying && magic != FORCE_DISARM) {
+      say("Disarm: vehicle is flying")
+      return MavResult.FAILED
+    }
+    if (magic == FORCE_DISARM) {
+      forcedDisarms += 1
+    }
+    armedSet = 0
+    flying = false
+    disarms += 1
+    MavResult.ACCEPTED
+  }
+
+  setMode(baseMode: int, custom: int): int {
+    if ((baseMode & 1) == 0) {
+      return MavResult.UNSUPPORTED
+    }
+    if (!COPTER_MODES.includes(custom) || refusedModes.includes(custom)) {
+      say("Mode change failed")
+      return MavResult.FAILED
+    }
+    modeSet = custom
+    modeChanges += 1
+    MavResult.ACCEPTED
+  }
+
+  pauseOrContinue(flag: int): int {
+    if (flag != 0 && flag != 1) {
+      return MavResult.DENIED
+    }
+    const m = mode()
+    if (m != 3 && m != 4) {
+      say("Pause/continue: not in AUTO or GUIDED")
+      return MavResult.FAILED
+    }
+    paused = flag == 0
+    MavResult.ACCEPTED
+  }
+
+  runPrearm(): int {
+    if (prearm != "") {
+      say(`PreArm: ${prearm}`)
+      return MavResult.FAILED
+    }
+    MavResult.ACCEPTED
+  }
+}

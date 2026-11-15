@@ -1,0 +1,320 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError } from "./protocol"
+import { SimulatedAutopilot } from "./simulator"
+import { MAGIC_FORCE_DISARM, MAGIC_SKIP_CHECKS, VehicleControl, armParams, controlResult, emergencyStopParams, modeParams, pauseParams, prearmParams, resultName } from "./arming"
+import { CommandCall } from "./operations"
+import { CommandLong, MavCmd, MavResult, StatusText } from "./dialects/common"
+
+/// A ground station and a vehicle that is disarmed (it would arm itself at its third tick: not here).
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly control: VehicleControl
+  /// The commands the vehicle was sent, as "command p1 p2 p3 p4 p5 p6 p7".
+  public readonly sent: string[] = []
+  /// The param2 of every COMPONENT_ARM_DISARM it was sent, and every parameter of every command that equals 2989 or 21196.
+  public readonly param2: f64[] = []
+  public magic: int = 0
+  public readonly texts: string[] = []
+
+  constructor(timeoutMs: int = 150) {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.sim.control.armedSet = 0
+    this.gcs = new MavLinkConnection(ends[0])
+    this.control = new VehicleControl(this.gcs, { system: 1, component: 1 }, { timeoutMs: timeoutMs })
+    this.sim.conn.on((r: Received) => {
+      const m = r.message
+      if (m instanceof CommandLong) {
+        this.sent.push(`${m.command} ${m._param1} ${m._param2} ${m._param3} ${m._param4} ${m._param5} ${m._param6} ${m._param7}`)
+        if (m.command as int == MavCmd.COMPONENT_ARM_DISARM) {
+          this.param2.push(m._param2 as f64)
+        }
+        const ps: f64[] = [m._param1 as f64, m._param2 as f64, m._param3 as f64, m._param4 as f64, m._param5 as f64, m._param6 as f64, m._param7 as f64]
+        for (const p of ps) {
+          if (p == MAGIC_SKIP_CHECKS || p == MAGIC_FORCE_DISARM) {
+            this.magic += 1
+          }
+        }
+      }
+    })
+    this.gcs.on((r: Received) => {
+      const m = r.message
+      if (m instanceof StatusText) {
+        this.texts.push(m.text)
+      }
+    })
+    this.gcs.run()
+    this.sim.start(1000)
+  }
+
+  public close(): void {
+    sim.stop()
+    gcs.close()
+  }
+}
+
+function listIsAllZeroButParam1(p: f64[]): bool {
+  let ok = p.length == 7
+  for (let i = 1; i < p.length; i++) {
+    if (p[i] != 0.0) {
+      ok = false
+    }
+  }
+  ok
+}
+
+function buildersSendMagicOnlyForTheEmergencyStop(): void {
+  // every pure builder, every option
+  expect(listIsAllZeroButParam1(armParams(true))).toBe(true)
+  expect(listIsAllZeroButParam1(armParams(false))).toBe(true)
+  expect(armParams(true)[0]).toBe(1.0)
+  expect(armParams(false)[0]).toBe(0.0)
+  expect(listIsAllZeroButParam1(pauseParams(true))).toBe(true)
+  expect(listIsAllZeroButParam1(pauseParams(false))).toBe(true)
+  expect(listIsAllZeroButParam1(modeParams(5))).toBe(false)
+  expect(modeParams(5)[0]).toBe(1.0)
+  expect(modeParams(5)[1]).toBe(5.0)
+  for (const v of prearmParams()) {
+    expect(v).toBe(0.0)
+  }
+  const stop = emergencyStopParams()
+  expect(stop[0]).toBe(0.0)
+  expect(stop[1]).toBe(21196.0)
+  for (let i = 2; i < stop.length; i++) {
+    expect(stop[i]).toBe(0.0)
+  }
+  let others = 0
+  const all: f64[][] = [armParams(true), armParams(false), pauseParams(true), pauseParams(false), prearmParams()]
+  for (let mode = 0; mode <= 255; mode++) {
+    all.push(modeParams(mode))
+  }
+  for (const list of all) {
+    for (const v of list) {
+      if (v == MAGIC_SKIP_CHECKS || v == MAGIC_FORCE_DISARM) {
+        others += 1
+      }
+    }
+  }
+  expect(others).toBe(0)
+}
+
+async function everyMethodSendsOneCommandAndOnlyTheStopHasAMagicNumber(): Promise<void> throws Error {
+  const rig = new Rig()
+  const _a = await rig.control.arm()
+  const _d = await rig.control.disarm()
+  const _m = await rig.control.setMode(4)
+  const _p = await rig.control.pause()
+  const _r = await rig.control.resume()
+  const _c = await rig.control.runPrearmChecks()
+  // (the vehicle is guided, not flying: pause and resume are answered, whatever the answer)
+  expect(rig.sent.length).toBe(6)
+  expect(rig.magic).toBe(0)
+  expect(rig.param2.join(",")).toBe("0,0")
+  const stop = await rig.control.emergencyStop()
+  rig.close()
+  expect(stop.accepted).toBe(true)
+  expect(rig.sent.length).toBe(7)
+  expect(rig.magic).toBe(1)
+  expect(rig.param2[2]).toBe(21196.0)
+  expect(rig.sim.control.forcedArms).toBe(0)
+}
+
+async function armArmsAndDisarmDisarms(): Promise<void> throws Error {
+  const rig = new Rig()
+  expect(rig.sim.control.isArmed()).toBe(false)
+  const armed = await rig.control.arm()
+  expect(armed.accepted).toBe(true)
+  expect(armed.acknowledged).toBe(true)
+  expect(armed.name).toBe("ACCEPTED")
+  expect(rig.sim.control.isArmed()).toBe(true)
+  const disarmed = await rig.control.disarm()
+  rig.close()
+  expect(disarmed.accepted).toBe(true)
+  expect(rig.sim.control.isArmed()).toBe(false)
+  expect(rig.sim.control.arms).toBe(1)
+  expect(rig.sim.control.disarms).toBe(1)
+  expect(rig.sim.control.forcedArms).toBe(0)
+  expect(rig.sim.control.lastParam2).toBe(0)
+}
+
+async function aFailingPreArmCheckRefusesTheArmWithItsText(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.control.prearm = "Compasses inconsistent"
+  const result = await rig.control.arm()
+  const checks = await rig.control.runPrearmChecks()
+  rig.close()
+  expect(result.accepted).toBe(false)
+  expect(result.acknowledged).toBe(true)
+  expect(result.result).toBe(MavResult.FAILED)
+  expect(result.name).toBe("FAILED")
+  expect(checks.name).toBe("FAILED")
+  expect(rig.sim.control.isArmed()).toBe(false)
+  expect(rig.sim.control.arms).toBe(0)
+  expect(rig.texts.join(";")).toBe("PreArm: Compasses inconsistent;PreArm: Compasses inconsistent")
+  // and no forced arm was ever sent to get past it
+  expect(rig.sim.control.forcedArms).toBe(0)
+}
+
+async function aFlyingVehicleRefusesADisarmAndTheEmergencyStopStopsIt(): Promise<void> throws Error {
+  const rig = new Rig()
+  const _a = await rig.control.arm()
+  rig.sim.control.flying = true
+  const refused = await rig.control.disarm()
+  expect(refused.result).toBe(MavResult.FAILED)
+  expect(rig.sim.control.isArmed()).toBe(true)
+  const stop = await rig.control.emergencyStop()
+  rig.close()
+  expect(stop.accepted).toBe(true)
+  expect(rig.sim.control.isArmed()).toBe(false)
+  expect(rig.sim.control.forcedDisarms).toBe(1)
+  expect(rig.sim.control.flying).toBe(false)
+}
+
+async function setModeChangesTheModeTheHeartbeatSays(): Promise<void> throws Error {
+  const rig = new Rig()
+  expect(rig.sim.control.mode()).toBe(0)
+  const ok = await rig.control.setMode(4)
+  const unknown = await rig.control.setMode(99)
+  rig.sim.control.refusedModes.push(6)
+  const refused = await rig.control.setMode(6)
+  rig.close()
+  expect(ok.accepted).toBe(true)
+  expect(rig.sim.control.mode()).toBe(4)
+  expect(unknown.name).toBe("FAILED")
+  expect(refused.name).toBe("FAILED")
+  expect(rig.sim.control.modeChanges).toBe(1)
+  expect(rig.texts.join(";")).toBe("Mode change failed;Mode change failed")
+}
+
+async function modeOutsideTheLimitsIsNotSent(): Promise<void> throws Error {
+  const rig = new Rig()
+  let refused = 0
+  for (const mode of [-1, 256, 100000]) {
+    try {
+      const _r = await rig.control.setMode(mode)
+    } catch (e: MavLinkError) {
+      if (e.code == "INVALID_VALUE") {
+        refused += 1
+      }
+    }
+  }
+  rig.close()
+  expect(refused).toBe(3)
+  expect(rig.sent.length).toBe(0)
+}
+
+async function pauseAndResumeNeedAutoOrGuided(): Promise<void> throws Error {
+  const rig = new Rig()
+  const stabilize = await rig.control.pause()
+  const _g = await rig.control.setMode(4)
+  const paused = await rig.control.pause()
+  expect(rig.sim.control.paused).toBe(true)
+  const resumed = await rig.control.resume()
+  rig.close()
+  expect(stabilize.name).toBe("FAILED")
+  expect(paused.accepted).toBe(true)
+  expect(resumed.accepted).toBe(true)
+  expect(rig.sim.control.paused).toBe(false)
+}
+
+async function aCommandThatIsNotAcknowledgedIsNeverSentAgain(): Promise<void> throws Error {
+  const rig = new Rig(100)
+  rig.sim.control.swallowAcks = 1
+  const result = await rig.control.arm()
+  // well past the time of several tries
+  await delay(450)
+  rig.close()
+  expect(result.acknowledged).toBe(false)
+  expect(result.accepted).toBe(false)
+  expect(result.result).toBe(-1)
+  expect(result.name).toBe("UNACKNOWLEDGED")
+  // the vehicle armed all the same, and was asked once
+  expect(rig.sim.control.isArmed()).toBe(true)
+  expect(rig.sent.length).toBe(1)
+  expect(rig.sim.control.commands).toBe(1)
+}
+
+async function anArmWith21196SkipsThePreArmChecksToo(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.control.prearm = "Compasses inconsistent"
+  // (what no VehicleControl method sends: the vehicle's side, as a ground station that is not this library could ask)
+  const raw = new CommandCall(rig.gcs, { system: 1, component: 1 }, { timeoutMs: 150, retries: 0 })
+  const result = await raw.run(MavCmd.COMPONENT_ARM_DISARM, [1.0, 21196.0])
+  rig.close()
+  expect(result).toBe(MavResult.ACCEPTED)
+  expect(rig.sim.control.forcedArms).toBe(1)
+  expect(rig.sim.control.isArmed()).toBe(true)
+}
+
+async function anArmParamThatIsNeitherZeroNorOneIsUnsupported(): Promise<void> throws Error {
+  const rig = new Rig()
+  const raw = new CommandCall(rig.gcs, { system: 1, component: 1 }, { timeoutMs: 150, retries: 0 })
+  const result = await raw.run(MavCmd.COMPONENT_ARM_DISARM, [2.0])
+  rig.close()
+  expect(result).toBe(MavResult.UNSUPPORTED)
+}
+
+async function anInProgressAckIsWaitedPastWithoutSendingAgain(): Promise<void> throws Error {
+  const rig = new Rig(300)
+  rig.sim.control.inProgressFirst = true
+  const result = await rig.control.arm()
+  await delay(100)
+  rig.close()
+  expect(result.acknowledged).toBe(true)
+  expect(result.accepted).toBe(true)
+  expect(rig.sent.length).toBe(1)
+  expect(rig.sim.control.commands).toBe(1)
+}
+
+async function aCommandAnotherSystemIsNotMineIsIgnored(): Promise<void> throws Error {
+  const rig = new Rig(100)
+  const other = new VehicleControl(rig.gcs, { system: 7, component: 1 }, { timeoutMs: 100 })
+  const result = await other.arm()
+  rig.close()
+  expect(result.acknowledged).toBe(false)
+  expect(rig.sim.control.isArmed()).toBe(false)
+}
+
+async function theVehicleArmsItselfAtItsThirdTickWhenNothingIsSet(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  sim.start(10)
+  expect(sim.control.isArmed()).toBe(false)
+  await delay(120)
+  expect(sim.control.isArmed()).toBe(true)
+  expect(sim.control.mode()).toBe(5)
+  sim.reboot()
+  expect(sim.control.isArmed()).toBe(false)
+  sim.stop()
+  gcs.close()
+}
+
+describe("arming, modes and pause", () => {
+  it("builds param2 as 0 everywhere but in the emergency stop (21196), and never 2989", buildersSendMagicOnlyForTheEmergencyStop)
+  it("sends one command per call and a magic number only for the emergency stop", everyMethodSendsOneCommandAndOnlyTheStopHasAMagicNumber)
+  it("arms and disarms", armArmsAndDisarmDisarms)
+  it("is refused by a failing pre-arm check, with its text, and never forces", aFailingPreArmCheckRefusesTheArmWithItsText)
+  it("refuses a disarm in flight and obeys the emergency stop", aFlyingVehicleRefusesADisarmAndTheEmergencyStopStopsIt)
+  it("changes the mode the heartbeat says, and reports a mode it refuses", setModeChangesTheModeTheHeartbeatSays)
+  it("sends no mode outside 0 to 255", modeOutsideTheLimitsIsNotSent)
+  it("pauses and continues in AUTO or GUIDED only", pauseAndResumeNeedAutoOrGuided)
+  it("never resends a command nothing acknowledged: UNACKNOWLEDGED", aCommandThatIsNotAcknowledgedIsNeverSentAgain)
+  it("skips the pre-arm checks of an arm for 21196 as it does for 2989 (the simulator counts both)", anArmWith21196SkipsThePreArmChecksToo)
+  it("answers an arm parameter that is not 0 or 1 UNSUPPORTED", anArmParamThatIsNeitherZeroNorOneIsUnsupported)
+  it("waits past IN_PROGRESS for the final ack, in the same timeout and without sending again", anInProgressAckIsWaitedPastWithoutSendingAgain)
+  it("is ignored by a vehicle it is not addressed to", aCommandAnotherSystemIsNotMineIsIgnored)
+  it("keeps the simulator's old behaviour: armed at the third tick, disarmed again after a reboot", theVehicleArmsItselfAtItsThirdTickWhenNothingIsSet)
+  it("names a result", () => {
+    expect(resultName(MavResult.ACCEPTED)).toBe("ACCEPTED")
+    expect(resultName(MavResult.FAILED)).toBe("FAILED")
+    expect(resultName(-1)).toBe("UNACKNOWLEDGED")
+    expect(controlResult(MavResult.TEMPORARILY_REJECTED).accepted).toBe(false)
+    expect(controlResult(MavResult.ACCEPTED).accepted).toBe(true)
+  })
+})
