@@ -140,6 +140,21 @@ export {
   MIN_REPEAT_MS,
   MotorTest,
 } from "./src/motortest"
+export {
+  ControlResult,
+  MAGIC_FORCE_DISARM,
+  MAGIC_SKIP_CHECKS,
+  MAX_MODE,
+  VehicleControl,
+  armParams,
+  controlResult,
+  emergencyStopParams,
+  modeParams,
+  pauseParams,
+  prearmParams,
+  resultName,
+  unacknowledged,
+} from "./src/arming"
 export { UP_AFTER_MS, waitUntilUp } from "./src/ready"
 export {
   AutopilotVersionRead,

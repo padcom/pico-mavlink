@@ -1,0 +1,149 @@
+// Arming, flight modes and pause/continue, as a ground station asks for them (ArduPilot: GCS_MAVLink_Copter.cpp `handle_command_component_arm_disarm`,
+// `handle_command_do_set_mode`, `handle_command_pause_continue`, `handle_command_run_prearm_check`):
+//  - MAV_CMD_COMPONENT_ARM_DISARM: param1 1 arms, 0 disarms. param2 is a MAGIC NUMBER: 2989 arms WITHOUT the pre-arm checks, 21196 disarms
+//    a vehicle that is FLYING (its motors stop where it is). Both are the most dangerous things this file can send, so:
+//      * `arm()` and `disarm()` always send param2 0: the vehicle runs its pre-arm checks and refuses to disarm in the air;
+//      * 21196 is sent by `emergencyStop()` ONLY (and nothing sends it without the caller having asked for exactly that);
+//      * 2989 is sent by NOTHING: there is no forced arm here. (`MAGIC_SKIP_CHECKS` is kept for the simulator.)
+//    The paramater lists are built by pure functions (`armParams`, `emergencyStopParams` ...), so that a test can look at every one.
+//  - MAV_CMD_DO_SET_MODE: param1 1 (the custom mode is used), param2 the mode (ArduCopter: 0 STABILIZE, 2 ALT_HOLD, 3 AUTO, 4 GUIDED,
+//    5 LOITER, 6 RTL, 9 LAND ...).
+//  - MAV_CMD_DO_PAUSE_CONTINUE: param1 0 pauses the mission (or a guided move), 1 continues it.
+//  - MAV_CMD_RUN_PREARM_CHECKS: runs the pre-arm checks (the vehicle says what fails in STATUSTEXT "PreArm: ...").
+//  - RETRIES ARE 0, ON PURPOSE. A command that was not acknowledged may well have been carried out (an arm whose ack was lost has
+//    ARMED the vehicle): sending it again, later, could arm a vehicle somebody has since disarmed. So every command is sent ONCE and a
+//    missing ack is returned as `acknowledged: false`; what the vehicle is doing is read from its HEARTBEAT, not guessed.
+import { MavLinkConnection } from "./connection"
+import { MavLinkError } from "./protocol"
+import { MavCmd, MavResult } from "./dialects/common"
+import { CommandCall, ParamOptions, Target } from "./operations"
+
+/// The magic number of param2 that disarms a vehicle in flight. Only `emergencyStopParams` uses it.
+export const MAGIC_FORCE_DISARM: f64 = 21196.0
+
+/// The magic number of param2 that arms without the pre-arm checks. NOTHING sends it (it is for the simulator and for tests).
+export const MAGIC_SKIP_CHECKS: f64 = 2989.0
+
+/// The greatest custom mode a helper sends (a Copter has fewer than 30).
+export const MAX_MODE: int = 255
+
+/// The parameters of an arm (`arm` true) or a disarm: param2 is 0 (the pre-arm checks run, a flying vehicle refuses to disarm).
+export function armParams(arm: bool): f64[] {
+  [if (arm) 1.0 else 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// The parameters of the emergency stop: a disarm with the magic number that works in flight. The only list that has one.
+export function emergencyStopParams(): f64[] {
+  [0.0, MAGIC_FORCE_DISARM, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// The parameters of DO_SET_MODE to the Copter mode `mode`: base mode 1 (custom mode enabled).
+export function modeParams(mode: int): f64[] throws MavLinkError {
+  if (mode < 0 || mode > MAX_MODE) {
+    throw new MavLinkError("INVALID_VALUE", `mode ${mode} is not 0 to ${MAX_MODE}`)
+  }
+  [1.0, mode as f64, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// The parameters of DO_PAUSE_CONTINUE: 0 pauses, 1 continues.
+export function pauseParams(resume: bool): f64[] {
+  [if (resume) 1.0 else 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// The parameters of RUN_PREARM_CHECKS: none.
+export function prearmParams(): f64[] {
+  [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// What the vehicle said to a command.
+export struct ControlResult {
+  /// Whether an ack came at all. When not, `result` is -1 and the command MAY have been carried out.
+  acknowledged: bool
+  /// The MAV_RESULT, or -1 when nothing acknowledged the command.
+  result: int
+  /// Whether the vehicle accepted it (ACCEPTED).
+  accepted: bool
+  /// The name of the result: `ACCEPTED`, `TEMPORARILY_REJECTED`, `DENIED`, `UNSUPPORTED`, `FAILED`, `CANCELLED` ..., or `UNACKNOWLEDGED`.
+  name: string
+}
+
+/// The name of a MAV_RESULT (`UNACKNOWLEDGED` for -1, the number for one this library does not know).
+export function resultName(result: int): string {
+  if (result < 0) {
+    return "UNACKNOWLEDGED"
+  }
+  MavResult.nameOf(result) ?? `${result}`
+}
+
+/// The result of a command the vehicle answered with `result`.
+export function controlResult(result: int): ControlResult {
+  const out: ControlResult = { acknowledged: true, result: result, accepted: result == MavResult.ACCEPTED, name: resultName(result) }
+  out
+}
+
+/// The result of a command nothing acknowledged.
+export function unacknowledged(): ControlResult {
+  const out: ControlResult = { acknowledged: false, result: -1, accepted: false, name: "UNACKNOWLEDGED" }
+  out
+}
+
+/// Arming, modes and pause of a vehicle. `conn.run()` must be running. Every command is sent ONCE.
+export class VehicleControl {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly call: CommandCall
+
+  constructor(conn: MavLinkConnection, target: Target, options: ParamOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.call = new CommandCall(conn, target, { timeoutMs: options.timeoutMs ?? 1000, retries: 0, signal: options.signal })
+  }
+
+  /// Arms: the vehicle runs its pre-arm checks and answers FAILED (and says why in STATUSTEXT "PreArm: ...") when one fails.
+  public async arm(): Promise<ControlResult> throws Error {
+    await send(MavCmd.COMPONENT_ARM_DISARM, armParams(true))
+  }
+
+  /// Disarms: a vehicle that is flying refuses (FAILED).
+  public async disarm(): Promise<ControlResult> throws Error {
+    await send(MavCmd.COMPONENT_ARM_DISARM, armParams(false))
+  }
+
+  /// The emergency stop: disarms WHATEVER the vehicle is doing (it falls). The only command here that can.
+  public async emergencyStop(): Promise<ControlResult> throws Error {
+    await send(MavCmd.COMPONENT_ARM_DISARM, emergencyStopParams())
+  }
+
+  /// Changes the flight mode to the Copter mode `mode` (0 to 255; anything else is an `INVALID_VALUE` MavLinkError and nothing is sent).
+  public async setMode(mode: int): Promise<ControlResult> throws Error {
+    await send(MavCmd.DO_SET_MODE, modeParams(mode))
+  }
+
+  /// Pauses the mission (or the guided move).
+  public async pause(): Promise<ControlResult> throws Error {
+    await send(MavCmd.DO_PAUSE_CONTINUE, pauseParams(false))
+  }
+
+  /// Continues it.
+  public async resume(): Promise<ControlResult> throws Error {
+    await send(MavCmd.DO_PAUSE_CONTINUE, pauseParams(true))
+  }
+
+  /// Asks the vehicle to run its pre-arm checks: FAILED when one fails (the text is in its STATUSTEXT).
+  public async runPrearmChecks(): Promise<ControlResult> throws Error {
+    await send(MavCmd.RUN_PREARM_CHECKS, prearmParams())
+  }
+
+  /// Sends the command once. A `TIMEOUT` (no ack) is the result `UNACKNOWLEDGED`, never an error and never sent again; any other
+  /// error (the signal aborted it) is thrown.
+  async send(command: int, params: f64[]): Promise<ControlResult> throws Error {
+    try {
+      return controlResult(await call.run(command, params))
+    } catch (e: Error) {
+      if (e instanceof MavLinkError && e.code == "TIMEOUT") {
+        return unacknowledged()
+      }
+      throw e
+    }
+  }
+}
