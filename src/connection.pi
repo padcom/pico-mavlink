@@ -1,6 +1,7 @@
 // Packets from a byte stream, and a connection that sends and receives messages over one
 // (node-mavlink's createMavLinkStream, send and sendSigned, with the sequence number kept per
 // connection instead of per module).
+import { delay } from "std/timers"
 import { MavLinkData, Registry } from "./data"
 import { MavLinkPacket, MavLinkPacketParser, MavLinkProtocol, MavLinkProtocolV2 } from "./protocol"
 import { MavLinkPacketSplitter, SplitterOptions } from "./splitter"
@@ -56,6 +57,7 @@ export class MavLinkConnection {
   public readonly signing: SigningPolicy?
   seq: int = 0
   closeHooks: Map<int, () => Promise<void>> = new Map<int, () => Promise<void>>()
+  shutting: Promise<void>? = null
   nextHook: int = 0
   readonly listeners: Map<int, (r: Received) => void> = new Map<int, (r: Received) => void>()
   nextListener: int = 0
@@ -207,20 +209,89 @@ export class MavLinkConnection {
 
   /// Runs the close hooks one after the other, waits for each to finish, then closes the stream (in a `finally`: a hook that fails
   /// does not keep it open, nor stop the hooks after it).
+  /// The hooks together may take `SHUTDOWN_MS` (a write that never completes does not keep the stream open for ever); a second call
+  /// while the first is under way waits for the same shutdown.
   public async shutdown(): Promise<void> {
+    const running = shutting
+    if (running != null) {
+      await running!
+      return
+    }
+    const work = this.runShutdown()
+    shutting = work
+    await work
+  }
+
+  async runShutdown(): Promise<void> {
     const hooks = takeHooks()
+    const deadline = (Date.now() as int) + SHUTDOWN_MS
     try {
       for (const h of hooks) {
-        try {
-          await h()
-        } catch (e: Error) {
-          continue
+        const left = deadline - (Date.now() as int)
+        if (left <= 0) {
+          break
         }
+        await within(h, left)
+      }
+      if (hooks.length > 0) {
+        // what the hooks wrote has to be READ by the other end before the socket goes: a socket that closes with data of the other
+        // end's still unread (or the other end not having read ours yet) resets the link, and the reset takes our last frame with it
+        // (seen against SITL: a release written and awaited, and the vehicle never saw it)
+        await pause(SHUTDOWN_GRACE_MS)
       }
     } finally {
       stream.close()
     }
   }
+}
+
+/// How long `shutdown` waits for the close hooks, all together (ms).
+export const SHUTDOWN_MS: int = 1000
+
+/// How long `shutdown` waits after the hooks, before it closes the stream (ms).
+export const SHUTDOWN_GRACE_MS: int = 150
+
+async function pause(ms: int): Promise<void> {
+  try {
+    await delay(ms)
+  } catch (e: Error) {
+    return
+  }
+}
+
+/// Runs `work` until it ends or `ms` pass, whichever comes first (the work is not stopped: it is just not waited for).
+async function within(hook: () => Promise<void>, ms: int): Promise<void> {
+  try {
+    await new Promise<bool, Error>((resolve: (value: bool) => void, _reject: (error: Error) => void) => {
+      let done = false
+      const timer = setTimeout(() => {
+        if (!done) {
+          done = true
+          resolve(false)
+        }
+      }, ms)
+      finishing(hook, () => {
+        if (!done) {
+          done = true
+          clearTimeout(timer)
+          resolve(true)
+        }
+      })
+    })
+  } catch (e: Error) {
+    return
+  }
+}
+
+/// Runs the hook, then `done` (also when the hook fails).
+async function finishing(hook: () => Promise<void>, done: () => void): Promise<void> {
+  try {
+    await hook()
+  } catch (e: Error) {
+    done()
+    return
+  }
+  done()
 }
 
 /// One `waitFor`: settles once, by a message or by its timer.

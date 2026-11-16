@@ -1785,12 +1785,50 @@ async function theRealVehicleObeysAndLetsGoOfTheOverride(): Promise<void> throws
 
     // (d) the connection is shut down with the override active: the sender releases first (`shutdown` waits for it), and the channel
     // is the radio's within a second. (With a plain `close()`, over TCP, the release frame was lost with the socket: the channel stayed
-    // 1500 for the 3 s of RC_OVERRIDE_TIME. `shutdown` is what a caller that holds an override uses.)
+    // 1500 for the 3 s of RC_OVERRIDE_TIME. `shutdown` is what a caller that holds an override uses.) The last `set` is right before the
+    // shutdown, so the sender's 300 ms of silence cannot be what lets go: it is the release `shutdown` waited for (released + 1, why
+    // "released", and it is back at once, not after 300 ms).
+    over.set(three)
+    const releasedBefore = over.released
     const closedAt = Date.now() as int
     await gcs.shutdown()
+    expect(over.released).toBe(releasedBefore + 1)
+    expect(over.why).toBe("released")
+    expect(over.running).toBe(false)
     expect(await pulseBecomes(monitor, 2, rest, 1500, null, three) >= 0).toBe(true)
-    println(`RC (d) chan3 back to ${pulseAt(monitor, 2)} ${(Date.now() as int) - closedAt} ms after the close; released ${over.released}`)
-    expect((Date.now() as int) - closedAt < 1500).toBe(true)
+    const backAfter = (Date.now() as int) - closedAt
+    println(`RC (d) chan3 back to ${pulseAt(monitor, 2)} ${backAfter} ms after the shutdown; released ${over.released}, why ${over.why}`)
+    expect(backAfter < 500).toBe(true)
+    // and it STAYS the radio's: the caller goes on calling `set` for 1.5 s, as one that has not heard of the shutdown would, and no pulse
+    // frame may follow the release (the vehicle would hold the channel again for its 3 s)
+    let held = 0
+    for (let i = 0; i < 38; i++) {
+      over.set(three)
+      if (pulseAt(monitor, 2) != rest) {
+        held += 1
+      }
+      await delay(40)
+    }
+    println(`RC (d) after the shutdown chan3 was held again ${held} times in 1.5 s; released ${over.released}`)
+    expect(held).toBe(0)
+    expect(over.released).toBe(releasedBefore + 1)
+
+    // (f) NOT ASSERTED, what was seen: the same with a plain `close()` (the hooks are started, the socket closes behind them). The
+    // frame may or may not get out before the socket goes; the outcome of this run is printed.
+    const stream2 = new TcpStream(await connect(s.port + 2))
+    const gcs2 = new MavLinkConnection(stream2, { protocol: new MavLinkProtocolV2(255, 190) })
+    links.push(gcs2)
+    gcs2.run()
+    const plain = new RcOverride(gcs2, s.target)
+    senders.push(plain)
+    plain.start()
+    plain.set(three)
+    expect(await pulseBecomes(monitor, 2, 1500, 1000, plain, three) >= 0).toBe(true)
+    plain.set(three)
+    gcs2.close()
+    const plainAt = Date.now() as int
+    const plainBack = await pulseBecomes(monitor, 2, rest, 1500, null, three)
+    println(`RC (f) plain close(): chan3 ${if (plainBack >= 0) "back to " + rest + " after " + plainBack + " ms" else "STILL " + pulseAt(monitor, 2) + " after 1500 ms"}; released ${plain.released}, why ${plain.why} (${(Date.now() as int) - plainAt} ms)`)
   } finally {
     for (const o of senders) {
       await o.release()

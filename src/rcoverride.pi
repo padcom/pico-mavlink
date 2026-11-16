@@ -115,6 +115,10 @@ export class RcOverride {
   /// Whether `set` was called since `start` (nothing is sent before).
   fresh: bool = false
   releasing: bool = false
+  /// Whether a write is out (writes are one at a time).
+  writing: bool = false
+  /// The release under way (what a second `end` waits for).
+  inFlight: Promise<void>? = null
   lastSetAt: int = 0
   /// Bumped by every start and end: a sending loop of an earlier one stops.
   epoch: int = 0
@@ -248,17 +252,18 @@ export class RcOverride {
       snap.push(values[i])
     }
     const m = frame(snap, false)
-    // a frame that fails to be written may still have reached the vehicle: the release is owed from here
-    owed = true
+    const mine = epoch
     const at = now()
     if (lastFrameAt >= 0 && (closestMs < 0 || at - lastFrameAt < closestMs)) {
       closestMs = at - lastFrameAt
     }
     lastFrameAt = at
-    if (await write(m)) {
+    if (await write(m, mine)) {
       sent += 1
-      for (let i = 0; i < OVERRIDE_CHANNELS; i++) {
-        told[i] = snap[i]
+      if (epoch == mine) {
+        for (let i = 0; i < OVERRIDE_CHANNELS; i++) {
+          told[i] = snap[i]
+        }
       }
     }
   }
@@ -278,18 +283,30 @@ export class RcOverride {
       epoch += 1
     }
     forget()
-    // the connection need not tell this sender that it closes any more (a sender that is started again hooks itself up again)
-    const off = unhook
-    unhook = null
-    if (off != null) {
-      off!()
-    }
     if (owed && !releasing) {
       releasing = true
       const mine = epoch
-      await letGo(mine)
+      const work = letGo(mine)
+      inFlight = work
+      await work
       if (epoch == mine) {
         releasing = false
+      }
+    } else if (releasing) {
+      // a release is under way (a silent end, or `release()` not awaited): this call is done when that one is, so that whoever waits for
+      // this one (the connection's `shutdown`) does not close the stream under the frame
+      const work = inFlight
+      if (work != null) {
+        await work!
+      }
+    }
+    // the connection need not tell this sender that it closes any more, once the release is written or given up (a sender that is
+    // started again hooks itself up again)
+    if (!running) {
+      const off = unhook
+      unhook = null
+      if (off != null) {
+        off!()
       }
     }
   }
@@ -302,7 +319,7 @@ export class RcOverride {
       if (epoch != mine) {
         return
       }
-      if (await write(frame(values, true))) {
+      if (await write(frame(values, true), -1)) {
         released += 1
         // (a new start while the write was out: its pulses are owed a release, this one does not pay it)
         if (epoch == mine) {
@@ -330,14 +347,29 @@ export class RcOverride {
     }
   }
 
-  /// Writes `m`; whether it was written.
-  async write(m: RcChannelsOverride): Promise<bool> {
+  /// Writes `m`, one write at a time (a frame already being written cannot be recalled, so the next waits for it); whether it was
+  /// written. `mine` is the epoch of a frame of pulses, which is not written at all when the run it belongs to has ended by the time
+  /// its turn comes: after an end nothing but a release is ever written. A release is `-1`.
+  async write(m: RcChannelsOverride, mine: int): Promise<bool> {
+    while (writing) {
+      await nap(1)
+    }
+    if (mine >= 0 && epoch != mine) {
+      return false
+    }
+    writing = true
+    if (mine >= 0) {
+      // a frame that fails to be written may still have reached the vehicle: the release is owed from here
+      owed = true
+    }
     try {
       await conn.send(m)
       return true
     } catch (e: Error) {
       failed += 1
       return false
+    } finally {
+      writing = false
     }
   }
 

@@ -12,6 +12,8 @@ class FlakyStream implements ByteStream {
   readonly inner: ByteStream
   public failWrites: int = 0
   public attempts: int = 0
+  /// Every write takes this long (ms) before it is made.
+  public slowMs: int = 0
 
   constructor(inner: ByteStream) {
     this.inner = inner
@@ -23,6 +25,9 @@ class FlakyStream implements ByteStream {
 
   public async write(bytes: Uint8Array): Promise<void> throws Error {
     attempts += 1
+    if (slowMs > 0) {
+      await delay(slowMs)
+    }
     if (failWrites > 0) {
       failWrites -= 1
       throw new Error("the link is down")
@@ -408,6 +413,72 @@ async function closingTheConnectionReleasesFirst(): Promise<void> throws Error {
   expect(pulses).toBe("1500,1500,1000")
 }
 
+async function shutdownWaitsForARelaseThatIsAlreadyOutAndSlow(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  await delay(100)
+  rig.link.slowMs = 250
+  // the release is under way (not awaited), and the shutdown comes behind it: it must not close the stream under the frame
+  rig.over.release()
+  await delay(20)
+  const began = Date.now() as int
+  await rig.gcs.shutdown()
+  const took = (Date.now() as int) - began
+  const released = rig.over.released
+  const pulses = pulsesOf(rig, 3)
+  rig.sim.stop()
+  expect(released).toBe(1)
+  expect(pulses).toBe("1500,1500,1000")
+  // it waited for the slow write (about 230 ms were left of it)
+  expect(took >= 150).toBe(true)
+}
+
+async function noPulseFrameFollowsTheRelease(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  await delay(100)
+  // writes are slow, so a pulse frame is out when the shutdown comes, and the caller goes on calling set
+  rig.link.slowMs = 30
+  await delay(60)
+  await rig.gcs.shutdown()
+  const releasesAtShutdown = rig.sim.rcOverride.releases
+  const pulseFramesAtShutdown = rig.sim.rcOverride.frames - releasesAtShutdown
+  for (let i = 0; i < 25; i++) {
+    rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+    await delay(40)
+  }
+  const releases = rig.sim.rcOverride.releases
+  const pulseFrames = rig.sim.rcOverride.frames - releases
+  const pulses = pulsesOf(rig, 3)
+  const released = rig.over.released
+  rig.sim.stop()
+  // for a second after the shutdown the vehicle gets no pulse frame, and no release but the one
+  expect(pulseFrames).toBe(pulseFramesAtShutdown)
+  expect(releases).toBe(1)
+  expect(released).toBe(1)
+  expect(pulses).toBe("1500,1500,1000")
+}
+
+async function aSilentEndThatIsRetryingIsWaitedForToo(): Promise<void> throws Error {
+  const rig = new Rig(255, 25, 100)
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  await delay(60)
+  // the link is down for the release the silence starts: it is retried, a period apart
+  rig.link.failWrites = 2
+  await delay(150)
+  await rig.gcs.shutdown()
+  const released = rig.over.released
+  const why = rig.over.why
+  const pulses = pulsesOf(rig, 3)
+  rig.sim.stop()
+  expect(why).toBe("silent")
+  expect(released).toBe(1)
+  expect(pulses).toBe("1500,1500,1000")
+}
+
 async function anAbortedSignalMeansNothingIsSent(): Promise<void> throws Error {
   // aborted before the sender is made: the abort event will never come, and the sender must look at the signal itself
   const before = new AbortController()
@@ -495,6 +566,9 @@ async function aNewStartDropsTheReleaseOfTheRunBefore(): Promise<void> throws Er
 }
 
 describe("the RC override sender", () => {
+  it("is waited for by a shutdown when its release is already out and slow", shutdownWaitsForARelaseThatIsAlreadyOutAndSlow)
+  it("sends no pulse frame after the release, whatever is in flight and whatever the caller does", noPulseFrameFollowsTheRelease)
+  it("is waited for by a shutdown when the silence began a release that is retried", aSilentEndThatIsRetryingIsWaitedForToo)
   it("sends nothing when its signal is aborted, before it is made or before it starts", anAbortedSignalMeansNothingIsSent)
   it("releases and stops when its signal aborts while it sends", anAbortWhileItSendsReleasesAndStops)
   it("drops the release of the run before when it is started again", aNewStartDropsTheReleaseOfTheRunBefore)

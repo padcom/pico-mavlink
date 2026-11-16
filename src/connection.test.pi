@@ -158,6 +158,41 @@ async function shutdownWaitsForTheHooksThenCloses(): Promise<void> throws Error 
   expect(stream.closes).toBe(1)
 }
 
+async function shutdownGivesUpOnAHookThatNeverEnds(): Promise<void> throws Error {
+  const stream = new CountingStream(MemoryStream.pair()[0])
+  const conn = new MavLinkConnection(stream)
+  const ran: string[] = []
+  // the first never ends within the second the shutdown allows (it is over after 2.5 s, long after the test), the second is not reached
+  conn.onClose(() => mark(ran, "never", 2500))
+  conn.onClose(() => mark(ran, "after", 0))
+  const began = Date.now() as int
+  await conn.shutdown()
+  const took = (Date.now() as int) - began
+  expect(stream.closes).toBe(1)
+  expect(took >= 900).toBe(true)
+  expect(took < 1500).toBe(true)
+  expect(ran.length).toBe(0)
+}
+
+async function aSecondShutdownWaitsForTheFirstAndDoesNotCloseEarly(): Promise<void> throws Error {
+  const stream = new CountingStream(MemoryStream.pair()[0])
+  const conn = new MavLinkConnection(stream)
+  const ran: string[] = []
+  conn.onClose(() => mark(ran, "slow", 150))
+  const first = conn.shutdown()
+  await delay(20)
+  // the stream is not closed while the hook is out, and the second call is not done before the first
+  expect(stream.closes).toBe(0)
+  const second = conn.shutdown()
+  await delay(20)
+  expect(stream.closes).toBe(0)
+  await second
+  expect(ran.join(",")).toBe("slow")
+  expect(stream.closes).toBe(1)
+  await first
+  expect(stream.closes).toBe(1)
+}
+
 async function aCloseHookCanBeTakenOff(): Promise<void> throws Error {
   const stream = new CountingStream(MemoryStream.pair()[0])
   const conn = new MavLinkConnection(stream)
@@ -174,6 +209,8 @@ async function aCloseHookCanBeTakenOff(): Promise<void> throws Error {
 describe("connections", () => {
   it("run every close hook once, then close the stream", everyCloseHookRunsOnceAndTheStreamCloses)
   it("shut down: wait for every close hook, in order, then close", shutdownWaitsForTheHooksThenCloses)
+  it("shut down: give up on a hook that never ends after a second, and close", shutdownGivesUpOnAHookThatNeverEnds)
+  it("shut down: a second call waits for the first and the stream is not closed early", aSecondShutdownWaitsForTheFirstAndDoesNotCloseEarly)
   it("do not run a close hook that was taken off", aCloseHookCanBeTakenOff)
   it("drop packets with incompatibility flags they don't understand", dropsUnknownIncompatibilityFlags)
   it("send and receive over an in-memory pipe, v1 and v2 mixed", talksOverAPipe)
