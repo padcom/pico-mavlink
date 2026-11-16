@@ -1,3 +1,4 @@
 node_modules/
 .sitl-guided
 .sitl-mission
+.sitl-rc

@@ -130,6 +130,19 @@ export {
 export { MAX_PULSE, MIN_PULSE, RcExtremes, RcMonitor, RcReading, rcReadingOf } from "./src/rcchannels"
 export { SERVO_OUTPUTS, ServoMonitor, ServoReading, servoReadingOf } from "./src/servooutputs"
 export {
+  DEFAULT_RATE_HZ,
+  DEFAULT_SILENCE_MS,
+  MAX_RATE_HZ,
+  MAX_SILENCE_MS,
+  MIN_RATE_HZ,
+  MIN_SILENCE_MS,
+  NO_OVERRIDE,
+  OVERRIDE_CHANNELS,
+  RELEASE_TRIES,
+  RcOptions,
+  RcOverride,
+} from "./src/rcoverride"
+export {
   HOLD_REPEAT_MS,
   HOLD_TEST_SECONDS,
   HoldResult,

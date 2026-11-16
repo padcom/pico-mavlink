@@ -20,6 +20,7 @@ import { SimLogs } from "./simlogs"
 import { SimCalibration } from "./simcal"
 import { SimCompass } from "./simcompass"
 import { SimMotors } from "./simmotor"
+import { SimRc } from "./simrc"
 import { SimMissions } from "./simmission"
 import { SimControl } from "./simcontrol"
 import { actualRate, desiredRate } from "./simrate"
@@ -210,6 +211,9 @@ export class SimulatedAutopilot {
   /// The pulses (µs) of the channels of the radio, one for each: sent as RC_CHANNELS at each tick when `rcStream` is on (off: nothing).
   public rc: int[] = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000]
   public rcStream: bool = false
+  /// RC_CHANNELS_OVERRIDE as ArduPilot takes it (the sender's system id, RC_OVERRIDE_TIME, release): see simrc.pi. With an override
+  /// on, RC_CHANNELS says its pulses in place of those of `rc` while they last.
+  public readonly rcOverride: SimRc
   /// The motor test (MAV_CMD_DO_MOTOR_TEST): see simmotor.pi. Refused when not landed; accepted while armed, as ArduPilot does.
   public readonly motors: SimMotors
   /// Missions, fences and rally points (MISSION_COUNT, MISSION_REQUEST, MISSION_ITEM_INT, MISSION_ACK, MISSION_CLEAR_ALL, DO_SET_MISSION_CURRENT)
@@ -236,6 +240,7 @@ export class SimulatedAutopilot {
     this.calibration = new SimCalibration(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
     this.compass = new SimCompass(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
     this.motors = new SimMotors(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
+    this.rcOverride = new SimRc((system: int, component: int) => this.forMe(system, component), () => this.rc)
     this.missions = new SimMissions(
       conn,
       () => this.control.isArmed(),
@@ -450,7 +455,8 @@ export class SimulatedAutopilot {
     const m = new RcChannels()
     m.timeBootMs = ((Date.now() as int) - bootedAt) as u32
     m.chancount = (if (rc.length > 18) 18 else rc.length) as u8
-    const p = (i: int) => (if (i < rc.length) rc[i] else 65535) as u16
+    const now = rcOverride.pulses()
+    const p = (i: int) => (if (i < now.length) now[i] else 65535) as u16
     m.chan1Raw = p(0)
     m.chan2Raw = p(1)
     m.chan3Raw = p(2)
@@ -484,7 +490,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || missions.handle(r) || control.handle(r)) {
+    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || rcOverride.handle(r) || missions.handle(r) || control.handle(r)) {
       return
     }
     const m = r.message

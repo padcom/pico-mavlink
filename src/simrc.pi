@@ -1,0 +1,137 @@
+// RC_CHANNELS_OVERRIDE as the simulated autopilot takes it (ArduPilot: libraries/GCS_MAVLink/GCS_Common.cpp `handle_rc_channels_override`,
+// libraries/RC_Channel/RC_Channel.cpp `set_override`, checked against Copter SITL):
+//  - the SENDER must be a ground station the vehicle knows: its system id from MAV_GCS_SYSID to MAV_GCS_SYSID_HI (`gcsLow` .. `gcsHigh`;
+//    a high of 0 is the low one alone: 255 to 255 by default). A frame from another sender has no effect (`refused` counts them).
+//  - channels 1 to 8: 65535 leaves the channel as it is, 0 RELEASES it (an override of 0 is no override), any other value is the
+//    pulse (µs) the channel has from now on. Channels 9 to 16: 0 or 65535 leave it, 65534 RELEASES it, any other value is the pulse.
+//    Channels 17 and 18 (the MAVLink 2 extension) are not read.
+//  - an override lasts `overrideTimeMs` (RC_OVERRIDE_TIME, 3 s by default) from the frame that set it, PER CHANNEL: a frame that leaves a
+//    channel as it is does not renew it. 0 turns every override off; a negative time is "never expires" (a vehicle that must never be
+//    left like that: the helper refuses to be used with one, see rcoverride.pi).
+//  - `pulses()` is what RC_CHANNELS says: the override of a channel while it lasts, else the radio's own pulse (`base`).
+// What a test reads: `frames` (frames of a sender the vehicle takes), `refused`, `releases` (frames that released at least one channel
+// and set none), `lastFrameAt`.
+import { Received } from "./connection"
+import { RcChannelsOverride } from "./dialects/common"
+
+/// How many channels the vehicle reads of the message.
+const READ_CHANNELS: int = 16
+
+/// The override of the simulated autopilot's radio channels.
+export class SimRc {
+  readonly forMe: (system: int, component: int) => bool
+  readonly base: () => int[]
+  /// RC_OVERRIDE_TIME in milliseconds: how long an override lasts. 0: overrides are off. Negative: they never expire.
+  public overrideTimeMs: int = 3000
+  /// MAV_GCS_SYSID and MAV_GCS_SYSID_HI: the senders taken are `gcsLow` to the higher of the two (a high of 0 is none).
+  public gcsLow: int = 255
+  public gcsHigh: int = 0
+  /// How many frames of a sender the vehicle takes came, how many of another did, and how many of the first only released channels.
+  public frames: int = 0
+  public refused: int = 0
+  public releases: int = 0
+  /// When the last frame that was taken came (ms since 1970), 0 for none.
+  public lastFrameAt: int = 0
+  readonly values: int[] = []
+  readonly at: int[] = []
+
+  constructor(forMe: (system: int, component: int) => bool, base: () => int[]) {
+    this.forMe = forMe
+    this.base = base
+    for (let i = 0; i < READ_CHANNELS; i++) {
+      this.values.push(0)
+      this.at.push(0)
+    }
+  }
+
+  mine(system: int, component: int): bool {
+    const f = forMe
+    f(system, component)
+  }
+
+  radio(): int[] {
+    const f = base
+    f()
+  }
+
+  /// Whether a sender with this system id is one the vehicle takes overrides from.
+  public takes(sysid: int): bool {
+    const high = if (gcsHigh > gcsLow) gcsHigh else gcsLow
+    return sysid >= gcsLow && sysid <= high
+  }
+
+  /// Handles the message when it is RC_CHANNELS_OVERRIDE; true when it was.
+  public handle(r: Received): bool {
+    const m = r.message
+    if (!(m instanceof RcChannelsOverride)) {
+      return false
+    }
+    if (!mine(m.targetSystem as int, m.targetComponent as int)) {
+      return true
+    }
+    if (!takes(r.packet.header.sysid)) {
+      refused += 1
+      return true
+    }
+    if (overrideTimeMs == 0) {
+      return true
+    }
+    const raw: int[] = [
+      m.chan1Raw as int, m.chan2Raw as int, m.chan3Raw as int, m.chan4Raw as int, m.chan5Raw as int, m.chan6Raw as int,
+      m.chan7Raw as int, m.chan8Raw as int, m.chan9Raw as int, m.chan10Raw as int, m.chan11Raw as int, m.chan12Raw as int,
+      m.chan13Raw as int, m.chan14Raw as int, m.chan15Raw as int, m.chan16Raw as int,
+    ]
+    const now = Date.now() as int
+    let set = 0
+    let released = 0
+    for (let i = 0; i < READ_CHANNELS; i++) {
+      const v = raw[i]
+      if (i < 8) {
+        if (v == 65535) {
+          continue
+        }
+        if (v == 0) {
+          values[i] = 0
+          released += 1
+          continue
+        }
+      } else {
+        if (v == 0 || v == 65535) {
+          continue
+        }
+        if (v == 65534) {
+          values[i] = 0
+          released += 1
+          continue
+        }
+      }
+      values[i] = v
+      at[i] = now
+      set += 1
+    }
+    frames += 1
+    lastFrameAt = now
+    if (set == 0 && released > 0) {
+      releases += 1
+    }
+    return true
+  }
+
+  /// Whether channel `i` (0 based) has an override that has not run out.
+  public overridden(i: int): bool {
+    if (i < 0 || i >= READ_CHANNELS || values[i] == 0) {
+      return false
+    }
+    return overrideTimeMs < 0 || ((Date.now() as int) - at[i]) < overrideTimeMs
+  }
+
+  /// The pulse of each channel of the radio as RC_CHANNELS says it: an override while it lasts, else the radio's own.
+  public pulses(): int[] {
+    const own = radio()
+    const out: int[] = []
+    for (let i = 0; i < own.length; i++) {
+      out.push(if (overridden(i)) values[i] else own[i])
+    }
+    return out
+  }
+}
