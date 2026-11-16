@@ -192,14 +192,19 @@ export class SimMissions {
         request(m.seq as int, m.missionType as int, sender, component)
       }
     } else if (m instanceof MissionClearAll) {
-      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
+        // (counted when it came, deaf or not: a test of "sent once" has a vehicle that does not answer)
         clears += 1
-        clear(m.missionType as int, sender, component)
+        if (!deaf) {
+          clear(m.missionType as int, sender, component)
+        }
       }
     } else if (m instanceof MissionSetCurrent) {
-      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+      if (mine(m.targetSystem as int, m.targetComponent as int)) {
         setCurrentMessages += 1
-        setCurrentMessage(m.seq as int)
+        if (!deaf) {
+          setCurrentMessage(m.seq as int)
+        }
       }
     } else if (m instanceof MissionAck) {
       // (the GCS' end of a download)

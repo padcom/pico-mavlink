@@ -397,6 +397,26 @@ async function aLostAckOfAClearIsNeverAnsweredByASecondClear(): Promise<void> th
   expect(clears).toBe(1)
 }
 
+async function aDeafVehicleStillCountsTheClearAndTheSetCurrentThatCame(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  rig.sim.missions.deaf = true
+  const code = await codeOf(rig.client.clear())
+  const unknown = await codeOf(rig.client.setCurrentMessage(2))
+  await delay(400)
+  const clears = rig.sim.missions.clears
+  const messages = rig.sim.missions.setCurrentMessages
+  // (a deaf vehicle does nothing with them)
+  const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  rig.close()
+  // the vehicle heard nothing it answered: the client never gets an answer, and sent the clear ONCE (a resend would make it 2)
+  expect(code).toBe("TIMEOUT")
+  expect(unknown).not.toBe("")
+  expect(clears).toBe(1)
+  expect(messages).toBe(1)
+  expect(held).toBe(4)
+}
+
 describe("the simulated autopilot's missions", () => {
   it("holds only home when it is fresh", aFreshVehicleHoldsOnlyHome)
   it("asks for an upload with the old request and makes the first item its own home", anUploadIsAskedForWithTheOldRequestAndItsFirstItemBecomesHome)
@@ -414,4 +434,5 @@ describe("the simulated autopilot's missions", () => {
   it("teaches the size and says INVALID_SEQUENCE to a request past the end", aRequestPastTheEndTeachesTheSizeAndIsInvalidSequence)
   it("denies a clear from another sender and does not cancel the upload", aClearFromAnotherSenderIsDeniedAndDoesNotCancelTheUpload)
   it("clears when the ack of the clear is lost, and the client never sends it again", aLostAckOfAClearIsNeverAnsweredByASecondClear)
+  it("counts the clear and the set-current that came to a deaf vehicle, which does nothing with them", aDeafVehicleStillCountsTheClearAndTheSetCurrentThatCame)
 })
