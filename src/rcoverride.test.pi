@@ -1,0 +1,263 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError, MavLinkProtocolV2 } from "./protocol"
+import { SimulatedAutopilot } from "./simulator"
+import { NO_OVERRIDE, RcOverride } from "./rcoverride"
+import { RcChannelsOverride } from "./dialects/common"
+
+/// A ground station (system 255, which the vehicle takes overrides from) and a vehicle whose radio has the first 16 channels at rest.
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly over: RcOverride
+
+  constructor(sysid: int = 255, rateHz: int = 25, silenceMs: int = 300) {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.sim.rc = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]
+    this.gcs = new MavLinkConnection(ends[0], { protocol: new MavLinkProtocolV2(sysid, 190) })
+    this.over = new RcOverride(this.gcs, { system: 1, component: 1 }, { rateHz: rateHz, silenceMs: silenceMs })
+    this.gcs.run()
+    this.sim.start(1000)
+  }
+
+  public close(): void {
+    over.release()
+    sim.stop()
+    gcs.close()
+  }
+}
+
+/// The pulses as `RC_CHANNELS` would say them, the first `n`.
+function pulsesOf(rig: Rig, n: int): string {
+  const all = rig.sim.rcOverride.pulses()
+  const out: int[] = []
+  for (let i = 0; i < n; i++) {
+    out.push(all[i])
+  }
+  return out.join(",")
+}
+
+/// One frame sent by hand (not by the helper): the override of channel 3, as `pulse`.
+async function sendByHand(rig: Rig, pulse: int): Promise<void> throws Error {
+  const m = new RcChannelsOverride()
+  m.targetSystem = 1
+  m.targetComponent = 1
+  m.chan1Raw = 65535
+  m.chan2Raw = 65535
+  m.chan3Raw = pulse as u16
+  m.chan4Raw = 65535
+  m.chan5Raw = 65535
+  m.chan6Raw = 65535
+  m.chan7Raw = 65535
+  m.chan8Raw = 65535
+  m.chan9Raw = 65535
+  m.chan10Raw = 65535
+  m.chan11Raw = 65535
+  m.chan12Raw = 65535
+  m.chan13Raw = 65535
+  m.chan14Raw = 65535
+  m.chan15Raw = 65535
+  m.chan16Raw = 65535
+  m.chan17Raw = 65535
+  m.chan18Raw = 65535
+  await rig.gcs.send(m)
+}
+
+async function sendsWhatItIsGivenAndTheVehicleObeysIt(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  rig.over.start()
+  await delay(300)
+  const frames = rig.sim.rcOverride.frames
+  const pulses = pulsesOf(rig, 4)
+  rig.close()
+  expect(frames > 3).toBe(true)
+  // channel 3 is the override's, the others are the radio's own
+  expect(pulses).toBe("1500,1500,1500,1500")
+}
+
+async function neverSendsFasterThanItsRateAndHoldsTheRateToItsBounds(): Promise<void> throws Error {
+  const fast = new Rig(255, 100000)
+  const slow = new Rig(255, 1)
+  expect(fast.over.rateHz).toBe(50)
+  expect(fast.over.periodMs).toBe(20)
+  expect(slow.over.rateHz).toBe(10)
+  expect(slow.over.periodMs).toBe(100)
+  fast.over.set([1500])
+  fast.over.start()
+  await delay(500)
+  const frames = fast.over.sent
+  fast.close()
+  slow.close()
+  // 50 a second for half a second is 25 at most (a timer is never early)
+  expect(frames <= 26).toBe(true)
+  expect(frames >= 10).toBe(true)
+}
+
+async function holdsTheSilenceToItsBounds(): Promise<void> throws Error {
+  const short = new Rig(255, 25, 1)
+  const long = new Rig(255, 25, 60000)
+  expect(short.over.silenceMs).toBe(100)
+  expect(long.over.silenceMs).toBe(1000)
+  short.close()
+  long.close()
+}
+
+async function refusesWhatIsNotAPulseAndSendsNothingForIt(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.over.set([1500])
+  let refused = 0
+  const bad: int[][] = [[799], [2201], [0], [65535], [1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500]]
+  for (const pulses of bad) {
+    try {
+      rig.over.set(pulses)
+    } catch (e: MavLinkError) {
+      if (e.code == "INVALID_VALUE") {
+        refused += 1
+      }
+    }
+  }
+  rig.over.start()
+  await delay(150)
+  const pulses = pulsesOf(rig, 1)
+  rig.close()
+  expect(refused).toBe(bad.length)
+  // what was given before is what is sent: the refused ones changed nothing
+  expect(pulses).toBe("1500")
+}
+
+async function releasesAndStopsWhenSetIsNotCalledInTime(): Promise<void> throws Error {
+  const rig = new Rig(255, 25, 100)
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  rig.over.start()
+  await delay(60)
+  const during = pulsesOf(rig, 3)
+  // no set from here: the sender lets go after 100 ms
+  await delay(400)
+  const framesThen = rig.sim.rcOverride.frames
+  await delay(300)
+  const framesLater = rig.sim.rcOverride.frames
+  const after = pulsesOf(rig, 3)
+  const running = rig.over.running
+  const why = rig.over.why
+  const released = rig.over.released
+  const vehicleReleases = rig.sim.rcOverride.releases
+  rig.close()
+  expect(during).toBe("1500,1500,1500")
+  expect(running).toBe(false)
+  expect(why).toBe("silent")
+  expect(released).toBe(1)
+  expect(vehicleReleases).toBe(1)
+  // the radio's own channel again, at once (not after the vehicle's 3 s), and no frame after the release
+  expect(after).toBe("1500,1500,1000")
+  expect(framesLater).toBe(framesThen)
+}
+
+async function keepsSendingWhileSetIsCalled(): Promise<void> throws Error {
+  const rig = new Rig(255, 25, 100)
+  rig.over.start()
+  for (let i = 0; i < 10; i++) {
+    rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500 + i])
+    await delay(40)
+  }
+  const running = rig.over.running
+  rig.close()
+  expect(running).toBe(true)
+}
+
+async function releaseSendsOneReleaseFrameAndOnlyWhenThereIsAnOverrideToRelease(): Promise<void> throws Error {
+  const rig = new Rig()
+  // nothing sent yet: nothing to release
+  rig.over.release()
+  expect(rig.over.released).toBe(0)
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  rig.over.start()
+  await delay(150)
+  rig.over.release()
+  rig.over.release()
+  await delay(100)
+  const released = rig.over.released
+  const running = rig.over.running
+  const why = rig.over.why
+  const pulses = pulsesOf(rig, 3)
+  const vehicleReleases = rig.sim.rcOverride.releases
+  rig.close()
+  expect(released).toBe(1)
+  expect(running).toBe(false)
+  expect(why).toBe("released")
+  expect(vehicleReleases).toBe(1)
+  expect(pulses).toBe("1500,1500,1000")
+}
+
+async function overridesChannelsNineToSixteenAndReleasesThemWith65534(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, 1700, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, NO_OVERRIDE, 1900])
+  rig.over.start()
+  await delay(150)
+  const during = rig.sim.rcOverride.pulses()
+  rig.over.release()
+  await delay(100)
+  const after = rig.sim.rcOverride.pulses()
+  rig.close()
+  expect(`${during[8]},${during[15]}`).toBe("1700,1900")
+  expect(`${after[8]},${after[15]}`).toBe("1000,1000")
+}
+
+async function aSenderOutsideTheVehiclesRangeHasNoEffect(): Promise<void> throws Error {
+  const rig = new Rig(254)
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  rig.over.start()
+  await delay(200)
+  const refused = rig.sim.rcOverride.refused
+  const frames = rig.sim.rcOverride.frames
+  const pulses = pulsesOf(rig, 3)
+  rig.close()
+  // (254 is the library's default id: a caller must give the connection the id the vehicle takes, 255)
+  expect(refused > 0).toBe(true)
+  expect(frames).toBe(0)
+  expect(pulses).toBe("1500,1500,1000")
+}
+
+async function theVehicleLetsGoAfterItsOverrideTimeWhenTheFramesStop(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.rcOverride.overrideTimeMs = 300
+  await sendByHand(rig, 1500)
+  await delay(100)
+  const within = pulsesOf(rig, 3)
+  await delay(350)
+  const after = pulsesOf(rig, 3)
+  rig.close()
+  expect(within).toBe("1500,1500,1500")
+  expect(after).toBe("1500,1500,1000")
+}
+
+async function aVehicleWithOverridesOffIgnoresThem(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.rcOverride.overrideTimeMs = 0
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  rig.over.start()
+  await delay(150)
+  const pulses = pulsesOf(rig, 3)
+  rig.close()
+  expect(pulses).toBe("1500,1500,1000")
+}
+
+describe("the RC override sender", () => {
+  it("sends what it is given, and the vehicle obeys it as its radio", sendsWhatItIsGivenAndTheVehicleObeysIt)
+  it("never sends faster than its rate, and holds the rate to 10 to 50 a second", neverSendsFasterThanItsRateAndHoldsTheRateToItsBounds)
+  it("holds the silence it allows to 100 ms to a second", holdsTheSilenceToItsBounds)
+  it("refuses what is not a pulse, and changes nothing for it", refusesWhatIsNotAPulseAndSendsNothingForIt)
+  it("releases once and stops when set is not called in time", releasesAndStopsWhenSetIsNotCalledInTime)
+  it("keeps sending while set is called", keepsSendingWhileSetIsCalled)
+  it("sends one release frame, and only when something was sent", releaseSendsOneReleaseFrameAndOnlyWhenThereIsAnOverrideToRelease)
+  it("overrides channels 9 to 16 and releases them with 65534", overridesChannelsNineToSixteenAndReleasesThemWith65534)
+})
+
+describe("the simulated vehicle's overrides", () => {
+  it("takes no override from a sender outside MAV_GCS_SYSID .. MAV_GCS_SYSID_HI", aSenderOutsideTheVehiclesRangeHasNoEffect)
+  it("lets go of a channel after RC_OVERRIDE_TIME when the frames stop", theVehicleLetsGoAfterItsOverrideTimeWhenTheFramesStop)
+  it("takes none when RC_OVERRIDE_TIME is 0", aVehicleWithOverridesOffIgnoresThem)
+})

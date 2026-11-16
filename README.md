@@ -48,6 +48,14 @@ Status: **in development (MV1).**
   `waitUntilUp` is the one rule for "can this vehicle be calibrated now": it said "AHRS: EKF3 active", or has been up for 10 s (ATTITUDE). The simulator
   (`SimulatedAutopilot.compass`, `.rc`) does the vehicle's side with failure statuses, lost acks and a mute link as faults. SITL (calibration model,
   `SITL_FLIGHT=1`): the compass calibrates with the vehicle turned as MAVProxy's `sitl_magcal` does, is kept only when accepted, and is cancelled when left.
+- **Done:** the RC override (src/rcoverride.pi, src/simrc.pi). `RcOverride` sends `RC_CHANNELS_OVERRIDE` (channels 1 to 16; 65535 leaves a channel to the
+  radio, `NO_OVERRIDE` in `set`) at 10 to 50 frames a second (25 by default), **only while `set` is called often enough** (`silenceMs`, 300 ms by default,
+  100 to 1000): when it is not it stops and sends ONE release frame (channels 1 to 8 with 0, 9 to 16 with 65534), as `release()` does. A pulse is 800 to 2200 µs,
+  else `INVALID_VALUE` and nothing changes. The vehicle takes an override only from a sender whose system id is in `MAV_GCS_SYSID` .. `MAV_GCS_SYSID_HI` (255 by
+  default; **this library's own default id is 254, so give the connection's protocol the id the vehicle takes**, or every frame is ignored silently), lets go of a
+  channel `RC_OVERRIDE_TIME` (3 s) after its last frame, and a NEGATIVE `RC_OVERRIDE_TIME` never lets go: the caller must refuse to send to such a vehicle.
+  The simulator (`SimulatedAutopilot.rcOverride`) does all of it and says it in RC_CHANNELS (checked against Copter SITL: the override shows within a frame, the
+  channel returns to the radio's after 3 s, an explicit release at once). Tests: src/rcoverride.test.pi.
 - **Done:** the motor test and the servo outputs (src/motortest.pi, src/servooutputs.pi). `MotorTest` sends `MAV_CMD_DO_MOTOR_TEST` and **never a timeout above
   2 s or a throttle above 20 %** (it throws instead): the vehicle takes 600 s, arms its motors and disables the throttle, GCS and EKF failsafes until the test
   ends. `hold` spins a motor by sending the same 1.5 s test every 800 ms until a signal is aborted, and ends with a stop (timeout 0) however it ends: released,
