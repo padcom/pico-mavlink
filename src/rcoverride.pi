@@ -100,12 +100,16 @@ export class RcOverride {
   /// How many frames of pulses, and how many release frames, were written.
   public sent: int = 0
   public released: int = 0
-  /// How many writes failed, and whether a release was given up (it is still owed: `release()` tries again).
   /// The least time (ms) between two frames of pulses started so far in this run, -1 before there are two (a test reads it).
   public closestMs: int = -1
   lastFrameAt: int = -1
+  /// How many writes failed, and whether a release was given up (it is still owed: `release()` tries again). THE CALLER MUST READ
+  /// `releaseFailed` after a release: true means the vehicle may still be holding the last pulses until its RC_OVERRIDE_TIME lapses.
   public failed: int = 0
   public releaseFailed: bool = false
+  /// The signal given in the options, and the function that takes the connection's close hook off (null while there is none).
+  readonly signal: AbortSignal?
+  unhook: (() => void)? = null
   /// Whether a release is owed: a frame of pulses may have gone out since the last release that was written.
   owed: bool = false
   /// Whether `set` was called since `start` (nothing is sent before).
@@ -125,15 +129,20 @@ export class RcOverride {
       this.values.push(NO_OVERRIDE)
       this.told.push(NO_OVERRIDE)
     }
-    conn.onClose(() => {
-      this.release()
-    })
+    this.signal = options.signal
     const signal = options.signal
     if (signal != null) {
+      // (it does not fire for a signal that is aborted already: `start` looks at `aborted` itself)
       signal!.addEventListener("abort", () => {
-        this.release()
+        this.end("aborted")
       })
     }
+  }
+
+  /// Whether the signal given in the options has aborted: nothing is sent then.
+  public isAborted(): bool {
+    const s = signal
+    return s != null && s!.aborted
   }
 
   /// What the next frames carry: `pulses[i]` is the pulse (µs) of channel i + 1, or `NO_OVERRIDE`; channels past the end are the
@@ -162,10 +171,21 @@ export class RcOverride {
     if (running) {
       return
     }
+    if (isAborted()) {
+      // refused: nothing is sent; a release still owed is sent
+      why = "aborted"
+      this.end("aborted")
+      return
+    }
     forget()
     running = true
     why = ""
     epoch += 1
+    // a release that is still being tried for the run before is dropped: it must not land on the pulses of this one
+    releasing = false
+    if (unhook == null) {
+      unhook = conn.onClose(() => this.release())
+    }
     closestMs = -1
     lastFrameAt = -1
     lastSetAt = now()
@@ -253,27 +273,43 @@ export class RcOverride {
   async end(reason: string): Promise<void> {
     const was = running
     running = false
-    epoch += 1
     if (was) {
       why = reason
+      epoch += 1
     }
     forget()
+    // the connection need not tell this sender that it closes any more (a sender that is started again hooks itself up again)
+    const off = unhook
+    unhook = null
+    if (off != null) {
+      off!()
+    }
     if (owed && !releasing) {
       releasing = true
-      await letGo()
-      releasing = false
+      const mine = epoch
+      await letGo(mine)
+      if (epoch == mine) {
+        releasing = false
+      }
     }
   }
 
-  /// Writes the release frame, again (a period later) when the write fails, up to `RELEASE_TRIES` times.
-  async letGo(): Promise<void> {
+  /// Writes the release frame, again (a period later) when the write fails, up to `RELEASE_TRIES` times. It gives up quietly when a
+  /// new `start` came meanwhile (`mine` is no longer the epoch): the release of the run before must not land on the pulses of this one.
+  async letGo(mine: int): Promise<void> {
     releaseFailed = false
     for (let i = 0; i < RELEASE_TRIES; i++) {
+      if (epoch != mine) {
+        return
+      }
       if (await write(frame(values, true))) {
-        owed = false
         released += 1
-        for (let c = 0; c < OVERRIDE_CHANNELS; c++) {
-          told[c] = NO_OVERRIDE
+        // (a new start while the write was out: its pulses are owed a release, this one does not pay it)
+        if (epoch == mine) {
+          owed = false
+          for (let c = 0; c < OVERRIDE_CHANNELS; c++) {
+            told[c] = NO_OVERRIDE
+          }
         }
         return
       }
@@ -281,7 +317,9 @@ export class RcOverride {
         await nap(periodMs)
       }
     }
-    releaseFailed = true
+    if (epoch == mine) {
+      releaseFailed = true
+    }
   }
 
   /// What was set is gone: `start` needs a new `set`.

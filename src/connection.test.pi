@@ -1,7 +1,8 @@
 import { describe, it, expect } from "std/test"
 import { bind } from "std/net"
+import { delay } from "std/timers"
 import { MavLinkConnection, packets } from "./connection"
-import { FileStream, MemoryStream, UdpStream } from "./stream"
+import { ByteStream, FileStream, MemoryStream, UdpStream } from "./stream"
 import { MavLinkPacketSignature, MavLinkProtocolV1, MavLinkProtocolV2 } from "./protocol"
 import { Heartbeat, MavType } from "./dialects/minimal"
 import { ParamValue } from "./dialects/common"
@@ -96,7 +97,84 @@ async function dropsUnknownIncompatibilityFlags(): Promise<void> throws Error {
   expect(n).toBe(1)
 }
 
+/// A stream that counts its closes.
+class CountingStream implements ByteStream {
+  readonly inner: ByteStream
+  public closes: int = 0
+
+  constructor(inner: ByteStream) {
+    this.inner = inner
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    return inner.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    await inner.write(bytes)
+  }
+
+  public close(): void {
+    closes += 1
+    inner.close()
+  }
+}
+
+/// A close hook that notes its name after a moment (the closing waits for it, or not).
+async function mark(ran: string[], name: string, ms: int): Promise<void> {
+  try {
+    await delay(ms)
+  } catch (e: Error) {
+    return
+  }
+  ran.push(name)
+}
+
+async function everyCloseHookRunsOnceAndTheStreamCloses(): Promise<void> throws Error {
+  const stream = new CountingStream(MemoryStream.pair()[0])
+  const conn = new MavLinkConnection(stream)
+  const ran: string[] = []
+  conn.onClose(() => mark(ran, "first", 0))
+  conn.onClose(() => mark(ran, "second", 0))
+  // close() starts the hooks and closes at once, and does not wait for them
+  conn.close()
+  expect(stream.closes).toBe(1)
+  await delay(20)
+  conn.close()
+  await delay(20)
+  expect(ran.join(",")).toBe("first,second")
+  expect(stream.closes).toBe(2)
+}
+
+async function shutdownWaitsForTheHooksThenCloses(): Promise<void> throws Error {
+  const stream = new CountingStream(MemoryStream.pair()[0])
+  const conn = new MavLinkConnection(stream)
+  const ran: string[] = []
+  conn.onClose(() => mark(ran, "slow", 50))
+  conn.onClose(() => mark(ran, "last", 0))
+  await conn.shutdown()
+  // both ran, in order, each waited for, and the stream closed after them
+  expect(ran.join(",")).toBe("slow,last")
+  expect(stream.closes).toBe(1)
+}
+
+async function aCloseHookCanBeTakenOff(): Promise<void> throws Error {
+  const stream = new CountingStream(MemoryStream.pair()[0])
+  const conn = new MavLinkConnection(stream)
+  const ran: string[] = []
+  const off = conn.onClose(() => mark(ran, "taken off", 0))
+  conn.onClose(() => mark(ran, "kept", 0))
+  off()
+  conn.close()
+  await delay(20)
+  expect(ran.join(",")).toBe("kept")
+  expect(stream.closes).toBe(1)
+}
+
 describe("connections", () => {
+  it("run every close hook once, then close the stream", everyCloseHookRunsOnceAndTheStreamCloses)
+  it("shut down: wait for every close hook, in order, then close", shutdownWaitsForTheHooksThenCloses)
+  it("do not run a close hook that was taken off", aCloseHookCanBeTakenOff)
   it("drop packets with incompatibility flags they don't understand", dropsUnknownIncompatibilityFlags)
   it("send and receive over an in-memory pipe, v1 and v2 mixed", talksOverAPipe)
   it("sign, and the receiver verifies", signedOverAPipe)

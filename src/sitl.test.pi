@@ -22,6 +22,9 @@ import { CompassCalibration, CompassProgress, CompassReport, CompassStatus } fro
 import { MotorTest } from "./motortest"
 import { VehicleControl, resultName } from "./arming"
 import { ServoMonitor } from "./servooutputs"
+import { RcMonitor } from "./rcchannels"
+import { NO_OVERRIDE, RcOverride } from "./rcoverride"
+import { MavLinkProtocolV2 } from "./protocol"
 import { SimState } from "./dialects/ardupilotmega"
 import { GlobalPositionInt } from "./dialects/standard"
 import { ParamDownload, ParamDownloadOptions, hasFtpBit } from "./paramftp"
@@ -1674,7 +1677,134 @@ async function missionProtocolOnTheRealVehicle(): Promise<void> throws Error {
   }
 }
 
+/// The pulse of channel `i` (0 based) in the latest RC_CHANNELS, or -1 when there is none.
+function pulseAt(monitor: RcMonitor, i: int): int {
+  const r = monitor.latest
+  if (r == null || r!.pulses.length <= i) {
+    return -1
+  }
+  return r!.pulses[i]
+}
+
+/// Waits until channel `i` is `pulse` (the vehicle's own say, RC_CHANNELS), at most `ms`; the ms it took, or -1. `keep` is called every
+/// 40 ms meanwhile: `over.set(keep)` when there is an `over` (a caller that has to keep calling `set`).
+async function pulseBecomes(monitor: RcMonitor, i: int, pulse: int, ms: int, over: RcOverride?, keep: int[]): Promise<int> throws Error {
+  const began = Date.now() as int
+  while ((Date.now() as int) - began < ms) {
+    if (pulseAt(monitor, i) == pulse) {
+      return (Date.now() as int) - began
+    }
+    if (over != null) {
+      over!.set(keep)
+    }
+    await delay(40)
+  }
+  return if (pulseAt(monitor, i) == pulse) (Date.now() as int) - began else -1
+}
+
+/// THE RC OVERRIDE AGAINST THE REAL VEHICLE (the proof the simulator's rules, simrc.pi, are ArduCopter's): the sender's id has to be
+/// 255 (`MAV_GCS_SYSID`), so it uses SERIAL1 with that id, and the vehicle's own connection (this library's default id, 254) is what shows
+/// the trap. What the vehicle does, as RC_CHANNELS says it, is printed as `RC`.
+async function theRealVehicleObeysAndLetsGoOfTheOverride(): Promise<void> throws Error {
+  const flight = env.get("SITL_FLIGHT")
+  if (!(flight != null && flight! == "1") && !(await exists(".sitl-rc"))) {
+    println("SITL RC override test skipped: set SITL_FLIGHT=1, or make a file named .sitl-rc in the directory the tests run in (about 1 min)")
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  const monitor = new RcMonitor(s.conn, s.target)
+  const links: MavLinkConnection[] = []
+  const senders: RcOverride[] = []
+  try {
+    await afterBoot(s, (Date.now() as int) + 60_000)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    // RC_CHANNELS ten times a second
+    expect(await cmd.run(MavCmd.SET_MESSAGE_INTERVAL, [65.0, 100000.0])).toBe(MavResult.ACCEPTED)
+    for (let i = 0; i < 60 && monitor.latest == null; i++) {
+      await delay(100)
+    }
+    const rest = pulseAt(monitor, 2)
+    const restTwo = pulseAt(monitor, 1)
+    println(`RC at rest: chan2 ${restTwo} chan3 ${rest}`)
+    expect(rest > 0).toBe(true)
+
+    // (e) THE TRAP: this library's default id (254) is outside MAV_GCS_SYSID .. MAV_GCS_SYSID_HI: the vehicle ignores every frame
+    const wrong = new RcOverride(s.conn, s.target)
+    senders.push(wrong)
+    wrong.start()
+    for (let i = 0; i < 30; i++) {
+      wrong.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+      await delay(50)
+    }
+    println(`RC with the default id ${s.conn.protocol.sysid}: sent ${wrong.sent}, chan3 ${pulseAt(monitor, 2)} (at rest ${rest})`)
+    expect(wrong.sent > 10).toBe(true)
+    expect(pulseAt(monitor, 2)).toBe(rest)
+    await wrong.release()
+
+    // the id the vehicle takes, on SERIAL1
+    const stream = new TcpStream(await connect(s.port + 2))
+    const gcs = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(255, 190) })
+    links.push(gcs)
+    gcs.run()
+    const over = new RcOverride(gcs, s.target)
+    senders.push(over)
+
+    // (a) channel 3 at 1500, sent at 25 Hz: the vehicle says it within a second
+    over.start()
+    const three = [NO_OVERRIDE, NO_OVERRIDE, 1500]
+    over.set(three)
+    const took = await pulseBecomes(monitor, 2, 1500, 1000, over, three)
+    println(`RC (a) chan3 1500 after ${took} ms`)
+    expect(took >= 0).toBe(true)
+
+    // (b) set stops: after silenceMs the sender releases, and the channel is the radio's again within a second (not the 3 s of
+    // RC_OVERRIDE_TIME)
+    const stoppedAt = Date.now() as int
+    expect(await pulseBecomes(monitor, 2, rest, 1500, null, three) >= 0).toBe(true)
+    const letGoAfter = (Date.now() as int) - stoppedAt
+    println(`RC (b) chan3 back to ${pulseAt(monitor, 2)} ${letGoAfter} ms after the last set; why ${over.why}, released ${over.released}`)
+    expect(letGoAfter < 1500).toBe(true)
+    expect(over.why).toBe("silent")
+    expect(over.released).toBe(1)
+
+    // (c) a channel that goes from a pulse to NO_OVERRIDE is released at once, the others stay
+    over.start()
+    const twoThree = [NO_OVERRIDE, 1400, 1500]
+    over.set(twoThree)
+    expect(await pulseBecomes(monitor, 2, 1500, 1000, over, twoThree) >= 0).toBe(true)
+    expect(await pulseBecomes(monitor, 1, 1400, 1000, over, twoThree) >= 0).toBe(true)
+    over.set(three)
+    const droppedAfter = await pulseBecomes(monitor, 1, restTwo, 1000, over, three)
+    println(`RC (c) chan2 released ${droppedAfter} ms after it went to NO_OVERRIDE; chan3 still ${pulseAt(monitor, 2)}`)
+    expect(droppedAfter >= 0).toBe(true)
+    expect(pulseAt(monitor, 2)).toBe(1500)
+
+    // (d) the connection is shut down with the override active: the sender releases first (`shutdown` waits for it), and the channel
+    // is the radio's within a second. (With a plain `close()`, over TCP, the release frame was lost with the socket: the channel stayed
+    // 1500 for the 3 s of RC_OVERRIDE_TIME. `shutdown` is what a caller that holds an override uses.)
+    const closedAt = Date.now() as int
+    await gcs.shutdown()
+    expect(await pulseBecomes(monitor, 2, rest, 1500, null, three) >= 0).toBe(true)
+    println(`RC (d) chan3 back to ${pulseAt(monitor, 2)} ${(Date.now() as int) - closedAt} ms after the close; released ${over.released}`)
+    expect((Date.now() as int) - closedAt < 1500).toBe(true)
+  } finally {
+    for (const o of senders) {
+      await o.release()
+    }
+    for (const l of links) {
+      l.close()
+    }
+    monitor.stop()
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
+  it("is overridden by the RC override as its radio, and lets go of it: after the silence, a NO_OVERRIDE, a close; not from id 254 (SITL_FLIGHT=1 or the file .sitl-rc)", theRealVehicleObeysAndLetsGoOfTheOverride)
   it("speaks the mission protocol: upload, download, clear, the count it takes, the transfer it denies (SITL_FLIGHT=1 or the file .sitl-mission)", missionProtocolOnTheRealVehicle)
   it("flies to a reposition, changes altitude, speed and home, in GUIDED only (SITL_FLIGHT=1 or the file .sitl-guided)", guidedControlMovesTheRealVehicle)
   it("spins a motor, shows it in SERVO_OUTPUT_RAW, and stops it at once and on release (SITL_FLIGHT=1)", spinsAMotorAndStopsItAtOnce)

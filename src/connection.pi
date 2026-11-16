@@ -55,7 +55,8 @@ export class MavLinkConnection {
   public readonly protocol: MavLinkProtocol
   public readonly signing: SigningPolicy?
   seq: int = 0
-  closeHooks: (() => void)[] = []
+  closeHooks: Map<int, () => Promise<void>> = new Map<int, () => Promise<void>>()
+  nextHook: int = 0
   readonly listeners: Map<int, (r: Received) => void> = new Map<int, (r: Received) => void>()
   nextListener: int = 0
 
@@ -169,17 +170,56 @@ export class MavLinkConnection {
 
   /// Calls `hook` when `close()` is called, BEFORE the stream is closed (a sender that holds something on the vehicle starts its
   /// release there: the write is begun before the stream goes).
-  public onClose(hook: () => void): void {
-    closeHooks.push(hook)
+  /// Returns the function that takes the hook off again (call it when the hook has nothing left to do: a hook stays for the life of
+  /// the connection otherwise). A hook that throws does not stop the others, nor the closing of the stream.
+  public onClose(hook: () => Promise<void>): () => void {
+    const id = nextHook
+    nextHook += 1
+    closeHooks.set(id, hook)
+    return () => {
+      this.closeHooks.delete(id)
+    }
   }
 
-  public close(): void {
-    const hooks = closeHooks
-    closeHooks = []
-    for (const h of hooks) {
-      h()
+  /// The hooks, taken off (each runs once).
+  takeHooks(): (() => Promise<void>)[] {
+    const hooks: (() => Promise<void>)[] = []
+    for (const h of closeHooks.values()) {
+      hooks.push(h)
     }
-    stream.close()
+    closeHooks.clear()
+    return hooks
+  }
+
+  /// Closes the stream at once. The hooks are STARTED first but not waited for, and on a socket the stream closing can take what they
+  /// wrote with it (seen against SITL over TCP: a release frame written in a hook, with the close right behind, never arrived). A caller
+  /// that has something to say before the link goes uses `shutdown`.
+  public close(): void {
+    const hooks = takeHooks()
+    try {
+      for (const h of hooks) {
+        h()
+      }
+    } finally {
+      stream.close()
+    }
+  }
+
+  /// Runs the close hooks one after the other, waits for each to finish, then closes the stream (in a `finally`: a hook that fails
+  /// does not keep it open, nor stop the hooks after it).
+  public async shutdown(): Promise<void> {
+    const hooks = takeHooks()
+    try {
+      for (const h of hooks) {
+        try {
+          await h()
+        } catch (e: Error) {
+          continue
+        }
+      }
+    } finally {
+      stream.close()
+    }
   }
 }
 

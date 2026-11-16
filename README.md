@@ -54,8 +54,9 @@ Status: **in development (MV1).**
   and sends ONE release frame (channels 1 to 8 with 0, 9 to 16 with 65534), as `release()` does; `start()` forgets what was set before it (the first frame needs a
   `set` after it) and so does every release. **65535 means "do not touch what is there"**: the vehicle keeps the last pulse of that channel until `RC_OVERRIDE_TIME`
   lapses, so a channel that goes from a pulse to `NO_OVERRIDE` is sent as its RELEASE value in that frame, never as 65535. Writes are awaited and counted only when
-  they finished; a release that fails is tried again (`RELEASE_TRIES`) and `releaseFailed` says it was given up; `conn.close()` and an abort signal start the
-  release too. A pulse is 800 to 2200 µs, else `INVALID_VALUE` and nothing changes. The vehicle takes an override only from a sender whose system id is in `MAV_GCS_SYSID` .. `MAV_GCS_SYSID_HI` (255 by
+  they finished; a release that fails is tried again (`RELEASE_TRIES`) and `releaseFailed` says it was given up; an abort signal releases too (a signal aborted before `start` refuses to start),
+  and so does the connection closing: **use `await conn.shutdown()`, which waits for the release; a plain `conn.close()` only starts it and, over TCP, the socket
+  closing took the frame with it (against SITL the channel stayed overridden for the vehicle's 3 s).** Read `releaseFailed` after a release. A pulse is 800 to 2200 µs, else `INVALID_VALUE` and nothing changes. The vehicle takes an override only from a sender whose system id is in `MAV_GCS_SYSID` .. `MAV_GCS_SYSID_HI` (255 by
   default; **this library's own default id is 254, so give the connection's protocol the id the vehicle takes**, or every frame is ignored silently), lets go of a
   channel `RC_OVERRIDE_TIME` (3 s) after its last frame, and a NEGATIVE `RC_OVERRIDE_TIME` never lets go: the caller must refuse to send to such a vehicle.
   The simulator (`SimulatedAutopilot.rcOverride`) does all of it and says it in RC_CHANNELS (checked against Copter SITL: the override shows within a frame, the

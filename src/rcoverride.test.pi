@@ -42,13 +42,17 @@ class Rig {
   public readonly over: RcOverride
   public readonly link: FlakyStream
 
-  constructor(sysid: int = 255, rateHz: int = 25, silenceMs: int = 300) {
+  constructor(sysid: int = 255, rateHz: int = 25, silenceMs: int = 300, signal: AbortSignal? = null) {
     const ends = MemoryStream.pair()
     this.sim = new SimulatedAutopilot(ends[1])
     this.sim.rc = [1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]
     this.link = new FlakyStream(ends[0])
     this.gcs = new MavLinkConnection(this.link, { protocol: new MavLinkProtocolV2(sysid, 190) })
-    this.over = new RcOverride(this.gcs, { system: 1, component: 1 }, { rateHz: rateHz, silenceMs: silenceMs })
+    if (signal == null) {
+      this.over = new RcOverride(this.gcs, { system: 1, component: 1 }, { rateHz: rateHz, silenceMs: silenceMs })
+    } else {
+      this.over = new RcOverride(this.gcs, { system: 1, component: 1 }, { rateHz: rateHz, silenceMs: silenceMs, signal: signal!})
+    }
     this.gcs.run()
     this.sim.start(1000)
   }
@@ -129,9 +133,9 @@ async function neverSendsFasterThanItsRateAndHoldsTheRateToItsBounds(): Promise<
   const closest = fast.over.closestMs
   fast.close()
   slow.close()
-  // 50 a second over the time measured: not less than 0.7 of it (the schedule does not drift; the timers of this runtime stall now and then, by tens of ms), not more than the rate allows
+  // 50 a second over the time measured: not less than 0.8 of it (the schedule does not drift), not more than the rate allows
   const expected = 50 * elapsed / 1000
-  expect(frames * 100 >= expected * 70).toBe(true)
+  expect(frames * 100 >= expected * 80).toBe(true)
   expect(frames * 100 <= expected * 105 + 100).toBe(true)
   // and no two frames closer than the period (20 ms) less the half the schedule gives away to a late timer (the sender's own write times: the
   // vehicle's reading of the link comes in bursts, which says nothing about the sender)
@@ -404,7 +408,96 @@ async function closingTheConnectionReleasesFirst(): Promise<void> throws Error {
   expect(pulses).toBe("1500,1500,1000")
 }
 
+async function anAbortedSignalMeansNothingIsSent(): Promise<void> throws Error {
+  // aborted before the sender is made: the abort event will never come, and the sender must look at the signal itself
+  const before = new AbortController()
+  before.abort()
+  const a = new Rig(255, 25, 300, before.signal)
+  a.over.start()
+  a.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  // aborted between the sender and its start
+  const between = new AbortController()
+  const b = new Rig(255, 25, 300, between.signal)
+  between.abort()
+  await delay(20)
+  b.over.start()
+  b.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  await delay(200)
+  const framesA = a.sim.rcOverride.frames
+  const framesB = b.sim.rcOverride.frames
+  const runningA = a.over.running
+  const runningB = b.over.running
+  const whyA = a.over.why
+  const pulsesB = pulsesOf(b, 3)
+  a.close()
+  b.close()
+  expect(framesA).toBe(0)
+  expect(framesB).toBe(0)
+  expect(runningA).toBe(false)
+  expect(runningB).toBe(false)
+  expect(whyA).toBe("aborted")
+  expect(pulsesB).toBe("1500,1500,1000")
+}
+
+async function anAbortWhileItSendsReleasesAndStops(): Promise<void> throws Error {
+  const stop = new AbortController()
+  const rig = new Rig(255, 25, 300, stop.signal)
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  await delay(100)
+  const during = pulsesOf(rig, 3)
+  stop.abort()
+  await delay(100)
+  const after = pulsesOf(rig, 3)
+  const released = rig.over.released
+  const running = rig.over.running
+  const why = rig.over.why
+  const frames = rig.sim.rcOverride.frames
+  // it does not start again with the signal aborted
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1700])
+  await delay(100)
+  const framesThen = rig.sim.rcOverride.frames
+  rig.close()
+  expect(during).toBe("1500,1500,1500")
+  expect(after).toBe("1500,1500,1000")
+  expect(released).toBe(1)
+  expect(running).toBe(false)
+  expect(why).toBe("aborted")
+  expect(framesThen).toBe(frames)
+}
+
+async function aNewStartDropsTheReleaseOfTheRunBefore(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  await delay(100)
+  // the link is down: the release is tried again, a period apart
+  rig.link.failWrites = 1000
+  rig.over.release()
+  await delay(60)
+  rig.link.failWrites = 0
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1200])
+  await delay(60)
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1200])
+  await delay(250)
+  const pulses = pulsesOf(rig, 3)
+  const released = rig.over.released
+  const gaveUp = rig.over.releaseFailed
+  const running = rig.over.running
+  rig.close()
+  // the old release did not land on the new pulses, and did not give up as if it had failed
+  expect(released).toBe(0)
+  expect(gaveUp).toBe(false)
+  expect(running).toBe(true)
+  expect(pulses).toBe("1500,1500,1200")
+}
+
 describe("the RC override sender", () => {
+  it("sends nothing when its signal is aborted, before it is made or before it starts", anAbortedSignalMeansNothingIsSent)
+  it("releases and stops when its signal aborts while it sends", anAbortWhileItSendsReleasesAndStops)
+  it("drops the release of the run before when it is started again", aNewStartDropsTheReleaseOfTheRunBefore)
   it("sends what it is given, and the vehicle obeys it as its radio", sendsWhatItIsGivenAndTheVehicleObeysIt)
   it("never sends faster than its rate, and holds the rate to 10 to 50 a second", neverSendsFasterThanItsRateAndHoldsTheRateToItsBounds)
   it("holds the silence it allows to 100 ms to a second", holdsTheSilenceToItsBounds)
