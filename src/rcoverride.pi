@@ -181,6 +181,13 @@ export class RcOverride {
       this.end("aborted")
       return
     }
+    if (conn.closing) {
+      // the connection is being shut down (its close hooks are running, and the stream goes after the grace): a new run would hold the
+      // vehicle's sticks with no way to let go of them
+      why = "closed"
+      this.end("closed")
+      return
+    }
     forget()
     running = true
     why = ""
@@ -354,7 +361,7 @@ export class RcOverride {
     while (writing) {
       await nap(1)
     }
-    if (mine >= 0 && epoch != mine) {
+    if (mine >= 0 && (epoch != mine || conn.closing)) {
       return false
     }
     writing = true
