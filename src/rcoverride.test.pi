@@ -442,6 +442,8 @@ async function noPulseFrameFollowsTheRelease(): Promise<void> throws Error {
   // writes are slow, so a pulse frame is out when the shutdown comes, and the caller goes on calling set
   rig.link.slowMs = 30
   await delay(60)
+  // what the vehicle had got BEFORE the shutdown began (the baseline of what must not grow)
+  const pulseFramesBefore = rig.sim.rcOverride.frames - rig.sim.rcOverride.releases
   await rig.gcs.shutdown()
   const releasesAtShutdown = rig.sim.rcOverride.releases
   const pulseFramesAtShutdown = rig.sim.rcOverride.frames - releasesAtShutdown
@@ -454,11 +456,37 @@ async function noPulseFrameFollowsTheRelease(): Promise<void> throws Error {
   const pulses = pulsesOf(rig, 3)
   const released = rig.over.released
   rig.sim.stop()
-  // for a second after the shutdown the vehicle gets no pulse frame, and no release but the one
+  // from the shutdown on the vehicle gets at most the one pulse frame that was already being written (writes take 30 ms here), and for a
+  // second after it none; no release but the one; and the channel is the radio's (which is what matters)
+  expect(pulseFramesAtShutdown - pulseFramesBefore <= 1).toBe(true)
   expect(pulseFrames).toBe(pulseFramesAtShutdown)
   expect(releases).toBe(1)
   expect(released).toBe(1)
   expect(pulses).toBe("1500,1500,1000")
+}
+
+async function aStartWhileTheConnectionIsShuttingDownIsRefused(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
+  await delay(100)
+  const done = rig.gcs.shutdown()
+  // (during the grace the stream is still open: a new run would write pulses nothing could let go of)
+  await delay(40)
+  rig.over.start()
+  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1700])
+  await done
+  const running = rig.over.running
+  const why = rig.over.why
+  const pulsesAfter = pulsesOf(rig, 3)
+  const framesAfter = rig.sim.rcOverride.frames
+  await delay(300)
+  const framesLater = rig.sim.rcOverride.frames
+  rig.sim.stop()
+  expect(running).toBe(false)
+  expect(why).toBe("closed")
+  expect(pulsesAfter).toBe("1500,1500,1000")
+  expect(framesLater).toBe(framesAfter)
 }
 
 async function aSilentEndThatIsRetryingIsWaitedForToo(): Promise<void> throws Error {
@@ -568,6 +596,7 @@ async function aNewStartDropsTheReleaseOfTheRunBefore(): Promise<void> throws Er
 describe("the RC override sender", () => {
   it("is waited for by a shutdown when its release is already out and slow", shutdownWaitsForARelaseThatIsAlreadyOutAndSlow)
   it("sends no pulse frame after the release, whatever is in flight and whatever the caller does", noPulseFrameFollowsTheRelease)
+  it("refuses to start while its connection is shutting down", aStartWhileTheConnectionIsShuttingDownIsRefused)
   it("is waited for by a shutdown when the silence began a release that is retried", aSilentEndThatIsRetryingIsWaitedForToo)
   it("sends nothing when its signal is aborted, before it is made or before it starts", anAbortedSignalMeansNothingIsSent)
   it("releases and stops when its signal aborts while it sends", anAbortWhileItSendsReleasesAndStops)

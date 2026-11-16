@@ -58,6 +58,9 @@ export class MavLinkConnection {
   seq: int = 0
   closeHooks: Map<int, () => Promise<void>> = new Map<int, () => Promise<void>>()
   shutting: Promise<void>? = null
+  /// Whether `close()` or `shutdown()` has begun: a sender that holds something on the vehicle (RcOverride) sends nothing new from
+  /// then on, only what lets go.
+  public closing: bool = false
   nextHook: int = 0
   readonly listeners: Map<int, (r: Received) => void> = new Map<int, (r: Received) => void>()
   nextListener: int = 0
@@ -197,6 +200,7 @@ export class MavLinkConnection {
   /// wrote with it (seen against SITL over TCP: a release frame written in a hook, with the close right behind, never arrived). A caller
   /// that has something to say before the link goes uses `shutdown`.
   public close(): void {
+    closing = true
     const hooks = takeHooks()
     try {
       for (const h of hooks) {
@@ -212,6 +216,7 @@ export class MavLinkConnection {
   /// The hooks together may take `SHUTDOWN_MS` (a write that never completes does not keep the stream open for ever); a second call
   /// while the first is under way waits for the same shutdown.
   public async shutdown(): Promise<void> {
+    closing = true
     const running = shutting
     if (running != null) {
       await running!
