@@ -55,6 +55,7 @@ export class MavLinkConnection {
   public readonly protocol: MavLinkProtocol
   public readonly signing: SigningPolicy?
   seq: int = 0
+  closeHooks: (() => void)[] = []
   readonly listeners: Map<int, (r: Received) => void> = new Map<int, (r: Received) => void>()
   nextListener: int = 0
 
@@ -166,7 +167,18 @@ export class MavLinkConnection {
     })
   }
 
+  /// Calls `hook` when `close()` is called, BEFORE the stream is closed (a sender that holds something on the vehicle starts its
+  /// release there: the write is begun before the stream goes).
+  public onClose(hook: () => void): void {
+    closeHooks.push(hook)
+  }
+
   public close(): void {
+    const hooks = closeHooks
+    closeHooks = []
+    for (const h of hooks) {
+      h()
+    }
     stream.close()
   }
 }

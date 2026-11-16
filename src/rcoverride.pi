@@ -6,15 +6,26 @@
 //    the vehicle's RC_OVERRIDE_TIME (3 s by default; 0 turns overrides off; a NEGATIVE time never expires, and the caller must refuse to
 //    send to a vehicle that has one). This helper adds its own, much shorter limit: it sends only while `set` is called often enough
 //    (`silenceMs`, 300 ms by default) and, when it is not, sends ONE release frame and stops. It never sends what it was not given
-//    lately, and never sends more often than 50 times a second, whatever it is asked.
+//    lately, and never sends more often than 50 times a second on average (and never two frames closer than half a period), whatever it
+//    is asked. `start` forgets everything given before it: the
+//    first frame needs a `set` AFTER the start; a release (by the caller, by silence, or by the connection closing) forgets what was set.
 //  - a frame carries channels 1 to 16 (the vehicle reads 16; the MAVLink 2 extension channels 17 and 18 are sent as "ignore"). Channels 1
 //    to 8: 65535 leaves the channel to the radio, 0 RELEASES it. Channels 9 to 16: 65535 or 0 leave it, 65534 RELEASES it. A pulse is
-//    800 to 2200 µs; anything else is an `INVALID_VALUE` MavLinkError and nothing is sent. `NO_OVERRIDE` in `set` is "not mine": the
-//    channel is sent as "ignore".
+//    800 to 2200 µs; anything else is an `INVALID_VALUE` MavLinkError and nothing is sent.
+//  - 65535 MEANS "DO NOT TOUCH WHAT IS THERE": the vehicle keeps the last pulse of that channel until its RC_OVERRIDE_TIME lapses. So
+//    `NO_OVERRIDE` in `set` for a channel that was a pulse in the frame before is NOT sent as 65535: the channel is RELEASED (0 for 1 to 8,
+//    65534 for 9 to 16) in that frame, and only a channel that was never a pulse (or was released) is sent as 65535.
+//  - frames are written one at a time and the write is awaited: a frame counts (`sent`, `released`) only when the write finished. A
+//    release that failed is owed and tried again (`RELEASE_TRIES` times, a period apart); `releaseFailed` says it never got out, and a
+//    later `release()` tries again. The connection closing (`conn.close()`) or the `signal` aborting starts the release too.
 //  - the SENDER's system id must be inside the vehicle's MAV_GCS_SYSID .. MAV_GCS_SYSID_HI (255 by default): from another id the vehicle
 //    takes no override, silently. The id is the connection's protocol's, and the caller has to know it.
-//  - the release frame (`release`) sets all 16 channels to release values, once. The vehicle gives the channels back to the radio at once
-//    (a vehicle with no receiver reads its channels at their minimum again).
+//  - the release frame sets all 16 channels to release values, once. The vehicle gives the channels back to the radio at once (a
+//    vehicle with no receiver reads its channels at their minimum again).
+//  - time is a MONOTONIC clock (`clock`, milliseconds since the program began); an elapsed time that is negative counts as expired.
+//    Frames are paced against a schedule (start + n * period), not period after period: they do not drift, and a sender that is late
+//    sends once and re-syncs, it does not catch up with a burst.
+import { delay } from "std/timers"
 import { MavLinkConnection } from "./connection"
 import { RcChannelsOverride } from "./dialects/common"
 import { Target } from "./operations"
@@ -24,7 +35,7 @@ import { MAX_PULSE, MIN_PULSE } from "./rcchannels"
 /// How many channels a frame sets.
 export const OVERRIDE_CHANNELS: int = 16
 
-/// In `set`: this channel is the radio's, not the override's (sent as "ignore").
+/// In `set`: this channel is the radio's, not the override's (sent as "ignore", or as a release when it was a pulse before).
 export const NO_OVERRIDE: int = -1
 
 /// How often frames are sent (Hz): the default, and what a rate asked for is held to.
@@ -37,6 +48,9 @@ export const DEFAULT_SILENCE_MS: int = 300
 export const MIN_SILENCE_MS: int = 100
 export const MAX_SILENCE_MS: int = 1000
 
+/// How many times a release that failed to be written is tried (a period apart) before it is given up (and `releaseFailed` is set).
+export const RELEASE_TRIES: int = 5
+
 /// What a frame says for "leave it to the radio", and for "release" (channels 1 to 8 are released with 0, 9 to 16 with 65534).
 const IGNORE: int = 65535
 const RELEASE_LOW: int = 0
@@ -48,10 +62,21 @@ export struct RcOptions {
   rateHz?: int
   /// How long without `set` before it releases and stops (held to `MIN_SILENCE_MS` .. `MAX_SILENCE_MS`).
   silenceMs?: int
+  /// When it aborts, the sender releases and stops.
+  signal?: AbortSignal
 }
 
 function held(value: int, least: int, most: int): int {
   if (value < least) least else if (value > most) most else value
+}
+
+function releaseValue(i: int): int {
+  if (i < 8) RELEASE_LOW else RELEASE_HIGH
+}
+
+/// What channel `i` says: its pulse, the release when it goes from a pulse to nothing, else "ignore".
+function wireOf(i: int, now: int[], before: int[]): int {
+  if (now[i] != NO_OVERRIDE) now[i] else if (before[i] != NO_OVERRIDE) releaseValue(i) else IGNORE
 }
 
 /// The sender of the override of one vehicle. `conn.run()` need not be running (it only sends).
@@ -62,19 +87,33 @@ export class RcOverride {
   public readonly rateHz: int
   public readonly periodMs: int
   public readonly silenceMs: int
+  /// Milliseconds on a monotonic clock (replaceable, for tests).
+  public clock: () => int = () => performance.now() as int
   /// What the next frames carry: a pulse, or `NO_OVERRIDE`, for each of the 16 channels.
   readonly values: int[] = []
+  /// What the vehicle was last told (written) for each channel: a pulse, or `NO_OVERRIDE`.
+  readonly told: int[] = []
   /// Whether frames are being sent now.
   public running: bool = false
   /// Why it stopped the last time: `""` while it runs or has not run, `released` (by the caller), `silent` (no `set` in `silenceMs`).
   public why: string = ""
-  /// How many frames of pulses, and how many release frames, it has sent.
+  /// How many frames of pulses, and how many release frames, were written.
   public sent: int = 0
   public released: int = 0
-  /// Whether a frame of pulses went out since the last release (a release is sent only then).
-  active: bool = false
+  /// How many writes failed, and whether a release was given up (it is still owed: `release()` tries again).
+  /// The least time (ms) between two frames of pulses started so far in this run, -1 before there are two (a test reads it).
+  public closestMs: int = -1
+  lastFrameAt: int = -1
+  public failed: int = 0
+  public releaseFailed: bool = false
+  /// Whether a release is owed: a frame of pulses may have gone out since the last release that was written.
+  owed: bool = false
+  /// Whether `set` was called since `start` (nothing is sent before).
+  fresh: bool = false
+  releasing: bool = false
   lastSetAt: int = 0
-  timer: int = -1
+  /// Bumped by every start and end: a sending loop of an earlier one stops.
+  epoch: int = 0
 
   constructor(conn: MavLinkConnection, target: Target, options: RcOptions = {}) {
     this.conn = conn
@@ -84,6 +123,16 @@ export class RcOverride {
     this.silenceMs = held(options.silenceMs ?? DEFAULT_SILENCE_MS, MIN_SILENCE_MS, MAX_SILENCE_MS)
     for (let i = 0; i < OVERRIDE_CHANNELS; i++) {
       this.values.push(NO_OVERRIDE)
+      this.told.push(NO_OVERRIDE)
+    }
+    conn.onClose(() => {
+      this.release()
+    })
+    const signal = options.signal
+    if (signal != null) {
+      signal!.addEventListener("abort", () => {
+        this.release()
+      })
     }
   }
 
@@ -103,64 +152,164 @@ export class RcOverride {
     for (let i = 0; i < OVERRIDE_CHANNELS; i++) {
       values[i] = if (i < pulses.length) pulses[i] else NO_OVERRIDE
     }
-    lastSetAt = Date.now() as int
+    fresh = true
+    lastSetAt = now()
   }
 
-  /// Starts sending, every `periodMs`, what `set` has given. Not at once: the first frame is the first tick, and a sender that was never
-  /// given a `set` sends only "ignore" frames (nothing is overridden). A second `start` while it runs does nothing.
+  /// Starts sending, every `periodMs`, what `set` gives from now on: nothing is sent before the first `set` after the start (what was
+  /// set before is forgotten), and when none comes within `silenceMs` the sender stops. A second `start` while it runs does nothing.
   public start(): void {
     if (running) {
       return
     }
+    forget()
     running = true
     why = ""
-    lastSetAt = Date.now() as int
-    timer = setInterval(() => this.tick(), periodMs)
+    epoch += 1
+    closestMs = -1
+    lastFrameAt = -1
+    lastSetAt = now()
+    this.loop(epoch)
   }
 
-  /// One round: the sender releases when `set` was not called in time, else it sends the frame.
-  tick(): void {
-    if (!running) {
+  /// Sends a frame every period, on a schedule: the n-th at start + n * period, so the rate does not sag by the time a round takes.
+  /// A timer that fires late (they do, by several ms) is made up for by the next one firing sooner, so the rate holds; but never sooner
+  /// than half a period after the frame before (no burst), and a round more than three periods late starts the schedule again from itself.
+  async loop(mine: int): Promise<void> {
+    let due = now()
+    while (running && epoch == mine) {
+      const began = now()
+      if (began - due > 3 * periodMs || began < due - periodMs) {
+        due = began
+      }
+      await tick()
+      if (!running || epoch != mine) {
+        return
+      }
+      due += periodMs
+      if (due < began + periodMs / 2) {
+        due = began + periodMs / 2
+      }
+      const at = now()
+      if (due - at > periodMs) {
+        due = at + periodMs
+      }
+      await nap(if (due > at) due - at else 0)
+    }
+  }
+
+  /// The time on the monotonic clock.
+  now(): int {
+    const c = clock
+    return c()
+  }
+
+  /// Waits `ms`; an abort of the wait is the end of it, not an error.
+  async nap(ms: int): Promise<void> {
+    try {
+      await delay(ms)
+    } catch (e: Error) {
       return
     }
-    if ((Date.now() as int) - lastSetAt > silenceMs) {
-      end("silent")
+  }
+
+  /// One round: the sender releases when `set` was not called in time (or the clock went back), else it sends the frame.
+  async tick(): Promise<void> {
+    const elapsed = now() - lastSetAt
+    if (!(elapsed >= 0 && elapsed <= silenceMs)) {
+      await end("silent")
       return
     }
-    conn.send(frame(false))
-    sent += 1
-    active = true
-  }
-
-  /// Stops sending and sends ONE release frame (when a frame of pulses went out since the last release). Safe to call again.
-  public release(): void {
-    end("released")
-  }
-
-  /// Stops the timer, sends the release frame when there is something to release, and records why.
-  end(reason: string): void {
-    if (timer >= 0) {
-      clearInterval(timer)
-      timer = -1
+    if (!fresh) {
+      return
     }
+    const snap: int[] = []
+    for (let i = 0; i < OVERRIDE_CHANNELS; i++) {
+      snap.push(values[i])
+    }
+    const m = frame(snap, false)
+    // a frame that fails to be written may still have reached the vehicle: the release is owed from here
+    owed = true
+    const at = now()
+    if (lastFrameAt >= 0 && (closestMs < 0 || at - lastFrameAt < closestMs)) {
+      closestMs = at - lastFrameAt
+    }
+    lastFrameAt = at
+    if (await write(m)) {
+      sent += 1
+      for (let i = 0; i < OVERRIDE_CHANNELS; i++) {
+        told[i] = snap[i]
+      }
+    }
+  }
+
+  /// Stops sending and sends ONE release frame (when a frame of pulses may have gone out since the last release). Safe to call again.
+  /// It does not throw: a release that cannot be written is tried again, and `releaseFailed` says it was given up.
+  public async release(): Promise<void> {
+    await end("released")
+  }
+
+  /// Stops sending, forgets what was set, and releases when a release is owed; records why.
+  async end(reason: string): Promise<void> {
     const was = running
     running = false
+    epoch += 1
     if (was) {
       why = reason
     }
-    if (active) {
-      active = false
-      conn.send(frame(true))
-      released += 1
+    forget()
+    if (owed && !releasing) {
+      releasing = true
+      await letGo()
+      releasing = false
     }
   }
 
-  /// RC_CHANNELS_OVERRIDE for the vehicle: the pulses given, or the release values.
-  frame(letGo: bool): RcChannelsOverride {
+  /// Writes the release frame, again (a period later) when the write fails, up to `RELEASE_TRIES` times.
+  async letGo(): Promise<void> {
+    releaseFailed = false
+    for (let i = 0; i < RELEASE_TRIES; i++) {
+      if (await write(frame(values, true))) {
+        owed = false
+        released += 1
+        for (let c = 0; c < OVERRIDE_CHANNELS; c++) {
+          told[c] = NO_OVERRIDE
+        }
+        return
+      }
+      if (i + 1 < RELEASE_TRIES) {
+        await nap(periodMs)
+      }
+    }
+    releaseFailed = true
+  }
+
+  /// What was set is gone: `start` needs a new `set`.
+  forget(): void {
+    fresh = false
+    for (let i = 0; i < OVERRIDE_CHANNELS; i++) {
+      values[i] = NO_OVERRIDE
+    }
+  }
+
+  /// Writes `m`; whether it was written.
+  async write(m: RcChannelsOverride): Promise<bool> {
+    try {
+      await conn.send(m)
+      return true
+    } catch (e: Error) {
+      failed += 1
+      return false
+    }
+  }
+
+  /// RC_CHANNELS_OVERRIDE for the vehicle: `now` as pulses (a channel that was a pulse in `told` and is not now is released), or all
+  /// release values.
+  frame(now: int[], letGo: bool): RcChannelsOverride {
     const m = new RcChannelsOverride()
     m.targetSystem = target.system as u8
     m.targetComponent = target.component as u8
-    const v = (i: int) => (if (letGo) (if (i < 8) RELEASE_LOW else RELEASE_HIGH) else (if (values[i] == NO_OVERRIDE) IGNORE else values[i])) as u16
+    const v = (i: int) => (if (letGo) releaseValue(i) else wireOf(i, now, told)) as u16
     m.chan1Raw = v(0)
     m.chan2Raw = v(1)
     m.chan3Raw = v(2)

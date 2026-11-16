@@ -138,6 +138,7 @@ export {
   MIN_SILENCE_MS,
   NO_OVERRIDE,
   OVERRIDE_CHANNELS,
+  RELEASE_TRIES,
   RcOptions,
   RcOverride,
 } from "./src/rcoverride"

@@ -49,9 +49,13 @@ Status: **in development (MV1).**
   (`SimulatedAutopilot.compass`, `.rc`) does the vehicle's side with failure statuses, lost acks and a mute link as faults. SITL (calibration model,
   `SITL_FLIGHT=1`): the compass calibrates with the vehicle turned as MAVProxy's `sitl_magcal` does, is kept only when accepted, and is cancelled when left.
 - **Done:** the RC override (src/rcoverride.pi, src/simrc.pi). `RcOverride` sends `RC_CHANNELS_OVERRIDE` (channels 1 to 16; 65535 leaves a channel to the
-  radio, `NO_OVERRIDE` in `set`) at 10 to 50 frames a second (25 by default), **only while `set` is called often enough** (`silenceMs`, 300 ms by default,
-  100 to 1000): when it is not it stops and sends ONE release frame (channels 1 to 8 with 0, 9 to 16 with 65534), as `release()` does. A pulse is 800 to 2200 µs,
-  else `INVALID_VALUE` and nothing changes. The vehicle takes an override only from a sender whose system id is in `MAV_GCS_SYSID` .. `MAV_GCS_SYSID_HI` (255 by
+  radio, `NO_OVERRIDE` in `set`) at 10 to 50 frames a second (25 by default; paced on a schedule against a monotonic clock, so the rate does not sag, and
+  never two frames closer than half a period), **only while `set` is called often enough** (`silenceMs`, 300 ms by default, 100 to 1000): when it is not it stops
+  and sends ONE release frame (channels 1 to 8 with 0, 9 to 16 with 65534), as `release()` does; `start()` forgets what was set before it (the first frame needs a
+  `set` after it) and so does every release. **65535 means "do not touch what is there"**: the vehicle keeps the last pulse of that channel until `RC_OVERRIDE_TIME`
+  lapses, so a channel that goes from a pulse to `NO_OVERRIDE` is sent as its RELEASE value in that frame, never as 65535. Writes are awaited and counted only when
+  they finished; a release that fails is tried again (`RELEASE_TRIES`) and `releaseFailed` says it was given up; `conn.close()` and an abort signal start the
+  release too. A pulse is 800 to 2200 µs, else `INVALID_VALUE` and nothing changes. The vehicle takes an override only from a sender whose system id is in `MAV_GCS_SYSID` .. `MAV_GCS_SYSID_HI` (255 by
   default; **this library's own default id is 254, so give the connection's protocol the id the vehicle takes**, or every frame is ignored silently), lets go of a
   channel `RC_OVERRIDE_TIME` (3 s) after its last frame, and a NEGATIVE `RC_OVERRIDE_TIME` never lets go: the caller must refuse to send to such a vehicle.
   The simulator (`SimulatedAutopilot.rcOverride`) does all of it and says it in RC_CHANNELS (checked against Copter SITL: the override shows within a frame, the
