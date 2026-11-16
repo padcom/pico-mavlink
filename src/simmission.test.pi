@@ -1,0 +1,283 @@
+// The simulated autopilot's missions, fences and rally points (simmission.pi), driven by the real mission client (mission.pi): that the simulator
+// does what ArduPilot does (what sitl.test.pi found out), so that a test of something that uses the client needs no SITL.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { SimulatedAutopilot } from "./simulator"
+import { MissionClient, MissionError, MissionItem, MissionProgress, firstDifference } from "./mission"
+import { MavFrame, MavMissionResult, MavMissionType, MavResult, MissionAck, MissionClearAll, MissionCount, MissionRequest } from "./dialects/common"
+
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly client: MissionClient
+  /// What the vehicle sent the ground station, as "REQUEST 1" (the old request) and "ACK 14" (a MISSION_ACK's result).
+  public readonly heard: string[] = []
+
+  constructor() {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.gcs = new MavLinkConnection(ends[0])
+    this.client = new MissionClient(this.gcs, { system: 1, component: 1 }, { timeoutMs: 300, retries: 2 })
+    this.gcs.on((r: Received) => {
+      const m = r.message
+      if (m instanceof MissionRequest) {
+        this.heard.push(`REQUEST ${m.seq}`)
+      } else if (m instanceof MissionAck) {
+        this.heard.push(`ACK ${m.type}`)
+      }
+    })
+    this.gcs.run()
+    this.sim.start(40)
+  }
+
+  public close(): void {
+    sim.stop()
+    gcs.close()
+  }
+}
+
+function waypoint(lat: f64, lon: f64, alt: f32): MissionItem {
+  return new MissionItem(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, alt)
+}
+
+/// Home (what is sent for item 0 is replaced by the vehicle's own), a takeoff and two waypoints.
+function fourItems(): MissionItem[] {
+  return [waypoint(0.0, 0.0, 0.0), new MissionItem(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), waypoint(52.23, 21.01, 20.0), waypoint(52.24, 21.02, 25.0)]
+}
+
+async function codeOf(work: Promise<void, Error>): Promise<string> {
+  try {
+    await work
+  } catch (e: MissionError) {
+    return e.code
+  } catch (e: Error) {
+    return "OTHER"
+  }
+  return ""
+}
+
+async function aFreshVehicleHoldsOnlyHome(): Promise<void> throws Error {
+  const rig = new Rig()
+  const got = await rig.client.download()
+  const fence = await rig.client.download(MavMissionType.FENCE)
+  rig.close()
+  expect(got.length).toBe(1)
+  expect(got[0].x).toBe(rig.sim.control.homeLat)
+  expect(got[0].y).toBe(rig.sim.control.homeLon)
+  expect(got[0].z).toBe(rig.sim.control.homeAmsl as f32)
+  expect(fence.length).toBe(0)
+}
+
+async function anUploadIsAskedForWithTheOldRequestAndItsFirstItemBecomesHome(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  const got = await rig.client.download()
+  rig.close()
+  expect(rig.heard.filter((h: string) => h.startsWith("REQUEST")).join(",")).toBe("REQUEST 1,REQUEST 2,REQUEST 3")
+  expect(got.length).toBe(4)
+  // the vehicle's own home, not what was sent for item 0
+  expect(got[0].x).toBe(rig.sim.control.homeLat)
+  expect(firstDifference(fourItems(), got)).toBe(0)
+  expect(firstDifference(fourItems().slice(1, 4), got.slice(1, 4))).toBe(-1)
+  expect(rig.sim.missions.uploads).toBe(1)
+}
+
+async function aFenceAndARallyPointKeepTheirOwnTypeAndLoseTheirAutocontinue(): Promise<void> throws Error {
+  const rig = new Rig()
+  const polygon = [
+    new MissionItem(5001, MavFrame.GLOBAL, 521000000, 211000000, 0.0),
+    new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211000000, 0.0),
+    new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211010000, 0.0),
+  ]
+  for (const v of polygon) {
+    v.param1 = 3.0
+  }
+  const rally = [new MissionItem(5100, MavFrame.GLOBAL_RELATIVE_ALT_INT, 521000000, 211000000, 30.0)]
+  await rig.client.upload(polygon, MavMissionType.FENCE)
+  await rig.client.upload(rally, MavMissionType.RALLY)
+  const fence = await rig.client.download(MavMissionType.FENCE)
+  const point = await rig.client.download(MavMissionType.RALLY)
+  const mission = await rig.client.download()
+  rig.close()
+  expect(fence.length).toBe(3)
+  expect(fence[2].param1).toBe(3.0)
+  expect(fence[0].autocontinue).toBe(0)
+  expect(point.length).toBe(1)
+  expect(point[0].autocontinue).toBe(0)
+  expect(mission.length).toBe(1)
+}
+
+async function aCountAboveWhatTheVehicleHoldsIsNoSpace(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.missions.maxMission = 3
+  const code = await codeOf(rig.client.upload(fourItems()))
+  const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  rig.sim.missions.maxFence = 2
+  const fence = await codeOf(rig.client.upload([waypoint(1.0, 1.0, 1.0), waypoint(1.0, 1.0, 1.0), waypoint(1.0, 1.0, 1.0)], MavMissionType.FENCE))
+  rig.close()
+  expect(code).toBe("NO_SPACE")
+  // (nothing was truncated by a count that was refused)
+  expect(held).toBe(1)
+  expect(fence).toBe("NO_SPACE")
+}
+
+async function aCountTruncatesAtOnceAndAStoppedUploadLeavesAMixture(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  // a count of 3 (home and two) that is never followed: the vehicle already holds only 3, its first two items of the old mission
+  const count = new MissionCount()
+  count.targetSystem = 1
+  count.targetComponent = 1
+  count.count = 3
+  count.missionType = 0
+  await rig.gcs.send(count)
+  await delay(120)
+  const held = rig.sim.missions.held(MavMissionType.MISSION)
+  rig.close()
+  expect(held.length).toBe(3)
+  expect(held[1].command).toBe(22)
+  expect(held[2].x).toBe(fourItems()[2].x)
+}
+
+async function aDownloadDuringAnUploadIsDeniedAndTheVehicleAsksAgain(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.sim.missions.askAgainMs = 150
+  const count = new MissionCount()
+  count.targetSystem = 1
+  count.targetComponent = 1
+  count.count = 3
+  count.missionType = 0
+  await rig.gcs.send(count)
+  await delay(60)
+  const denied = await codeOf(downloadOnly(rig.client))
+  // (no item is sent: the vehicle asks again for item 1 by itself)
+  await delay(300)
+  const asks = rig.heard.filter((h: string) => h == "REQUEST 1").length
+  rig.close()
+  expect(denied).toBe("DENIED")
+  expect(asks >= 2).toBe(true)
+}
+
+async function downloadOnly(client: MissionClient): Promise<void> throws Error {
+  const _items = await client.download()
+}
+
+async function anItemThatIsNotTheOneAskedForIsInvalidSequenceAndTheClientGoesOn(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  // the vehicle holds 4: the client's second upload is asked for again from item 1
+  await rig.client.upload(fourItems())
+  const uploads = rig.sim.missions.uploads
+  rig.close()
+  expect(uploads).toBe(2)
+}
+
+async function aClearOnTheGroundIsAcceptedAndTheTypeIs255Unsupported(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  await rig.client.clear()
+  const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  const clearAll = new MissionClearAll()
+  clearAll.targetSystem = 1
+  clearAll.targetComponent = 1
+  clearAll.missionType = 255
+  await rig.gcs.send(clearAll)
+  await delay(100)
+  const last = rig.heard[rig.heard.length - 1]
+  rig.close()
+  expect(held).toBe(1)
+  expect(last).toBe(`ACK ${MavMissionResult.UNSUPPORTED}`)
+}
+
+async function aClearWhileTheVehicleFliesItsMissionIsRefused(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  await delay(250)
+  expect(rig.sim.control.isArmed()).toBe(true)
+  expect(rig.sim.missions.start()).toBe(true)
+  const code = await codeOf(rig.client.clear())
+  const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  rig.sim.missions.running = false
+  const afterwards = await codeOf(rig.client.clear())
+  rig.close()
+  expect(code).toBe("ERROR")
+  expect(held).toBe(4)
+  expect(afterwards).toBe("")
+}
+
+async function theMissionIsFlownItemByItemAndTheProgressSaysSo(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  const progress = new MissionProgress(rig.gcs, { system: 1, component: 1 })
+  const seen: string[] = []
+  progress.onCurrent = (current: int, total: int, state: int) => {
+    seen.push(`${current}/${total}/${state}`)
+  }
+  progress.onReached = (seq: int) => {
+    seen.push(`reached ${seq}`)
+  }
+  // a mission of only home does not start
+  const empty = new Rig()
+  expect(empty.sim.missions.start()).toBe(false)
+  empty.close()
+  expect(rig.sim.missions.start()).toBe(true)
+  rig.sim.missions.step()
+  rig.sim.missions.step()
+  rig.sim.missions.step()
+  await delay(100)
+  progress.stop()
+  const running = rig.sim.missions.running
+  rig.close()
+  // (the total does not count home; state 3 is active, 5 complete)
+  expect(seen.join(",")).toBe("1/3/3,reached 1,2/3/3,reached 2,3/3/3,reached 3,3/3/5")
+  expect(running).toBe(false)
+}
+
+async function theCurrentItemIsSetOnceAndAnItemThatIsNotThereIsFailed(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  rig.sim.missions.start()
+  const moved = await rig.client.setCurrent(3)
+  const current = rig.sim.missions.current
+  const failed = await rig.client.setCurrent(99)
+  const commands = rig.sim.missions.setCurrents
+  await rig.client.setCurrentMessage(2)
+  await delay(100)
+  const byMessage = rig.sim.missions.current
+  rig.close()
+  expect(moved).toBe(MavResult.ACCEPTED)
+  expect(current).toBe(3)
+  expect(failed).toBe(MavResult.FAILED)
+  expect(commands).toBe(2)
+  expect(byMessage).toBe(2)
+}
+
+async function aLostAckOfAClearIsNeverAnsweredByASecondClear(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  rig.sim.missions.swallowAcks = 1
+  const code = await codeOf(rig.client.clear())
+  await delay(400)
+  const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  rig.close()
+  // the vehicle cleared, the answer was lost: unknown to the client, and nothing sent again
+  expect(code).toBe("TIMEOUT")
+  expect(held).toBe(1)
+}
+
+describe("the simulated autopilot's missions", () => {
+  it("holds only home when it is fresh", aFreshVehicleHoldsOnlyHome)
+  it("asks for an upload with the old request and makes the first item its own home", anUploadIsAskedForWithTheOldRequestAndItsFirstItemBecomesHome)
+  it("keeps a fence and a rally point apart from the mission, and loses their autocontinue", aFenceAndARallyPointKeepTheirOwnTypeAndLoseTheirAutocontinue)
+  it("answers a count above what it holds with NO_SPACE and truncates nothing for it", aCountAboveWhatTheVehicleHoldsIsNoSpace)
+  it("truncates at the count at once, so a stopped upload leaves a mixture", aCountTruncatesAtOnceAndAStoppedUploadLeavesAMixture)
+  it("denies a download during an upload and asks again by itself for the item it wants", aDownloadDuringAnUploadIsDeniedAndTheVehicleAsksAgain)
+  it("takes a second upload over the first", anItemThatIsNotTheOneAskedForIsInvalidSequenceAndTheClientGoesOn)
+  it("clears on the ground, and has no type 255", aClearOnTheGroundIsAcceptedAndTheTypeIs255Unsupported)
+  it("refuses a clear while it is armed and flies its mission", aClearWhileTheVehicleFliesItsMissionIsRefused)
+  it("flies the mission item by item and says which one it is on", theMissionIsFlownItemByItemAndTheProgressSaysSo)
+  it("sets the current item, FAILED for one that is not there", theCurrentItemIsSetOnceAndAnItemThatIsNotThereIsFailed)
+  it("clears when the ack of the clear is lost, and the client never sends it again", aLostAckOfAClearIsNeverAnsweredByASecondClear)
+})

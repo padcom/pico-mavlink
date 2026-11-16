@@ -20,6 +20,7 @@ import { SimLogs } from "./simlogs"
 import { SimCalibration } from "./simcal"
 import { SimCompass } from "./simcompass"
 import { SimMotors } from "./simmotor"
+import { SimMissions } from "./simmission"
 import { SimControl } from "./simcontrol"
 import { actualRate, desiredRate } from "./simrate"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
@@ -211,6 +212,9 @@ export class SimulatedAutopilot {
   public rcStream: bool = false
   /// The motor test (MAV_CMD_DO_MOTOR_TEST): see simmotor.pi. Refused when not landed; accepted while armed, as ArduPilot does.
   public readonly motors: SimMotors
+  /// Missions, fences and rally points (MISSION_COUNT, MISSION_REQUEST, MISSION_ITEM_INT, MISSION_ACK, MISSION_CLEAR_ALL, DO_SET_MISSION_CURRENT)
+  /// as ArduPilot does them, and a scripted flight of the mission: see simmission.pi.
+  public readonly missions: SimMissions
   /// SERVO_OUTPUT_RAW (the outputs of the motors, `motors.outputs()`) at each tick when on (off: nothing).
   public servoStream: bool = false
   /// Arming, flight modes, pause and the pre-arm checks (COMPONENT_ARM_DISARM, DO_SET_MODE, DO_PAUSE_CONTINUE, RUN_PREARM_CHECKS): see
@@ -232,6 +236,14 @@ export class SimulatedAutopilot {
     this.calibration = new SimCalibration(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
     this.compass = new SimCompass(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
     this.motors = new SimMotors(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
+    this.missions = new SimMissions(
+      conn,
+      () => this.control.isArmed(),
+      (system: int, component: int) => this.forMe(system, component),
+      () => this.control.homeLat,
+      () => this.control.homeLon,
+      () => this.control.homeAmsl,
+    )
     conn.on((r: Received) => this.handle(r))
   }
 
@@ -396,6 +408,7 @@ export class SimulatedAutopilot {
       sendServo()
     }
     control.advance(tickMs as f64 / 1000.0)
+    missions.update()
     if (positionStream) {
       sendPosition()
     }
@@ -471,7 +484,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || control.handle(r)) {
+    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || missions.handle(r) || control.handle(r)) {
       return
     }
     const m = r.message

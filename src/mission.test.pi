@@ -661,6 +661,48 @@ async function aNumberNoVehicleShouldGetIsRefusedBeforeTheCountIsSent(): Promise
   expect(heard).toBe(0)
 }
 
+async function aNanYawIsGoneWhereTheVehicleTakesItAndRefusedWhereItDoesNot(): Promise<void> throws Error {
+  // ArduPilot's nan_mask (AP_Mission::sanity_check_params): param4, the yaw, may be NaN for a waypoint (16), loiter unlimited (17), land (21),
+  // takeoff (22) and VTOL takeoff (84); params 2 to 4 for an arc (36); params 3 and 4 for VTOL land (85). QGroundControl plans have a NaN yaw.
+  const rig = new Rig()
+  const yaw = threeItems()
+  yaw[0].param4 = 0.0 / 0.0
+  yaw[1].param4 = 0.0 / 0.0
+  yaw[2].param4 = 0.0 / 0.0
+  await rig.client.upload(yaw)
+  const held = rig.vehicle.holds(MavMissionType.MISSION)
+  const stillNan = held[2].param4 != held[2].param4
+  const arc = [waypoint(52.0, 21.0), new MissionItem(36, MavFrame.GLOBAL_RELATIVE_ALT_INT, 520000000, 210000000, 20.0)]
+  arc[1].param2 = 0.0 / 0.0
+  arc[1].param3 = 0.0 / 0.0
+  arc[1].param4 = 0.0 / 0.0
+  await rig.client.upload(arc)
+  rig.vehicle.heard = []
+  // refused: a NaN yaw where the vehicle does not take it (a jump, 177), param3 of a waypoint, param2 of VTOL land, an infinite yaw anywhere
+  const jump = threeItems()
+  jump[1] = new MissionItem(177, MavFrame.MISSION, 0, 0, 0.0)
+  jump[1].param4 = 0.0 / 0.0
+  const third = threeItems()
+  third[2].param3 = 0.0 / 0.0
+  const land = threeItems()
+  land[2] = new MissionItem(85, MavFrame.GLOBAL_RELATIVE_ALT_INT, 520000000, 210000000, 0.0)
+  land[2].param2 = 0.0 / 0.0
+  const infinite = threeItems()
+  infinite[0].param4 = 1.0 / 0.0
+  const codes = [
+    await codeOf(rig.client.upload(jump)),
+    await codeOf(rig.client.upload(third)),
+    await codeOf(rig.client.upload(land)),
+    await codeOf(rig.client.upload(infinite)),
+  ]
+  const heard = rig.vehicle.heard.length
+  rig.close()
+  expect(held.length).toBe(3)
+  expect(stillNan).toBe(true)
+  expect(codes.join(",")).toBe("INVALID_VALUE,INVALID_VALUE,INVALID_VALUE,INVALID_VALUE")
+  expect(heard).toBe(0)
+}
+
 async function aRefusedClearOfAllLeavesNoReservationBehind(): Promise<void> throws Error {
   const rig = new Rig()
   const refused = await codeOf(rig.client.clear(MavMissionType.ALL))
@@ -760,6 +802,7 @@ describe("clearing and the other rules", () => {
   it("ends on a cancel and sends nothing more", aCancelEndsTheTransferAndSendsNothingMore)
   it("refuses an item that cannot go on the wire before it sends anything", anItemThatCannotGoIsRefusedBeforeAnythingIsSent)
   it("refuses a NaN, an infinity or a place off the globe before it sends the count", aNumberNoVehicleShouldGetIsRefusedBeforeTheCountIsSent)
+  it("takes a NaN yaw where ArduPilot does (waypoint, loiter, land, takeoff, arc, VTOL) and refuses any other NaN or infinity", aNanYawIsGoneWhereTheVehicleTakesItAndRefusedWhereItDoesNot)
   it("leaves no reservation behind a refused clear of the type 255", aRefusedClearOfAllLeavesNoReservationBehind)
   it("sets the current item once and never again when nothing answers", theCurrentItemIsSetOnceAndNeverAgain)
   it("sets the current item by the command or by the message", theCurrentItemIsSetByTheCommandOrByTheMessage)
