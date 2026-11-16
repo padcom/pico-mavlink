@@ -1565,7 +1565,15 @@ function aWaypoint(lat: f64, lon: f64, alt: f32): MissionItem {
 /// THE SPIKE of the mission protocol (a test, not a feature; no flight needed): what ArduCopter does with an upload, a download, a clear,
 /// a transfer started during another, and how many items it takes. What it finds is printed and the facts the library relies on are
 /// asserted. The vehicle is on the ground and disarmed.
+///
+/// It takes about 25 s and some 40 probes of the vehicle's mission storage, so it runs only when it is asked for: a file named `.sitl-mission`
+/// in the directory the tests run in (or `SITL_FLIGHT=1`, as for the other SITL tests that are slow).
 async function missionProtocolOnTheRealVehicle(): Promise<void> throws Error {
+  const flight = env.get("SITL_FLIGHT")
+  if (!(flight != null && flight! == "1") && !(await exists(".sitl-mission"))) {
+    println("SITL mission test skipped: set SITL_FLIGHT=1, or make a file named .sitl-mission in the directory the tests run in (about 25 s)")
+    return
+  }
   const sitl = await startSitl(1)
   if (sitl == null) {
     return
@@ -1633,8 +1641,8 @@ async function missionProtocolOnTheRealVehicle(): Promise<void> throws Error {
     expect(ackWord(dupAck)).toBe("INVALID_SEQUENCE")
     const again = s.conn.waitFor((r: Received) => r.message instanceof MissionRequest, 3000)
     println(`SPIKE the vehicle asks again for the item it wants (within 3 s): ${(await again) != null}`)
-    // ended by the count of 0
-    await client.upload([])
+    // the upload that is under way is ended by a raw count of 0 (only a probe sends one: the client refuses an empty upload)
+    println(`SPIKE a count of 0 ends it: ${await whatACountDraws(s, 0, MavMissionType.MISSION)}`)
     // fence and rally
     // a polygon of three vertices (param1 is the number of vertices)
     const fence = [
@@ -1667,7 +1675,7 @@ async function missionProtocolOnTheRealVehicle(): Promise<void> throws Error {
 }
 
 describe("ArduCopter SITL", () => {
-  it("speaks the mission protocol: upload, download, clear, the count it takes, the transfer it denies", missionProtocolOnTheRealVehicle)
+  it("speaks the mission protocol: upload, download, clear, the count it takes, the transfer it denies (SITL_FLIGHT=1 or the file .sitl-mission)", missionProtocolOnTheRealVehicle)
   it("flies to a reposition, changes altitude, speed and home, in GUIDED only (SITL_FLIGHT=1 or the file .sitl-guided)", guidedControlMovesTheRealVehicle)
   it("spins a motor, shows it in SERVO_OUTPUT_RAW, and stops it at once and on release (SITL_FLIGHT=1)", spinsAMotorAndStopsItAtOnce)
   it("accepts the motor test while armed: the refusal is the ground station's (SITL_FLIGHT=1)", acceptsTheMotorTestWhileArmed)

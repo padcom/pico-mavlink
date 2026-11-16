@@ -7,7 +7,15 @@
 //    not the one it asked for (a second answer to a repeated request) with an ACK of INVALID_SEQUENCE and goes on, which is not an end.
 //  - DOWNLOAD: MISSION_REQUEST_LIST, MISSION_COUNT, MISSION_REQUEST_INT(seq) for each item, MISSION_ITEM_INT, and the ground station ends
 //    it with MISSION_ACK (ACCEPTED).
-//  - CLEAR: MISSION_CLEAR_ALL, answered with MISSION_ACK.
+//  - CLEAR: MISSION_CLEAR_ALL (with the type), answered with MISSION_ACK. One type at a time: ArduPilot has no answer for the type 255 (ALL;
+//    GCS_Common.cpp: UNSUPPORTED), so each type is cleared by its own call. A clear goes through AP_Mission::clear(), which REFUSES (ERROR)
+//    while the vehicle is armed and its mission is running.
+//  - AN UPLOAD IS NOT A CLEAR, AND IT HAS NO ROLLBACK. The vehicle takes the count, TRUNCATES its mission to it AT ONCE (AP_Mission::truncate:
+//    no guard, also while armed and the mission is running) and writes each item as it arrives. So an upload to a vehicle that is flying its
+//    mission overwrites the LIVE mission from the first message on, and one that fails half way (a refusal, a timeout, a lost link) leaves a
+//    MIXTURE of the old and the new items, with the new count. After any failed upload the caller must read the mission back, or clear it,
+//    or upload it again, before anything flies it. For the same reason `upload` refuses an EMPTY list (a count of 0 is a truncation to
+//    nothing that no guard stops, where a clear is refused for a running mission): use `clear`.
 //  - THE HOME POSITION: for the MISSION type ArduPilot's item 0 is HOME and the count includes it. Nothing here adds or strips it: the items
 //    are what is on the wire, the caller decides (fence and rally have no home).
 //  - WHAT IS SENT AGAIN, and what is not. An upload that goes quiet is waited for `retries` more times; before the vehicle's first
@@ -215,10 +223,12 @@ export class MissionClient {
     this.signal = options.signal
   }
 
-  /// Sends `items` as the whole of the `type` (0 mission, 1 fence, 2 rally; an empty list clears it). Done when the vehicle acknowledged
-  /// it as ACCEPTED; otherwise a `MissionError` (see there). After a `TIMEOUT` the vehicle may or may not have it: read it back.
+  /// Sends `items` as the whole of the `type` (0 mission, 1 fence, 2 rally). Done when the vehicle acknowledged it as ACCEPTED; otherwise
+  /// a `MissionError` (see there). **The vehicle truncates its mission to the count at once and overwrites it item by item, with no
+  /// rollback, also while it flies it: after a failure, a `TIMEOUT` included, what it holds is a MIXTURE (see the top of the file): read it
+  /// back, clear it or send it again before it flies.** An empty list is an `INVALID_VALUE` error (nothing is sent): use `clear`.
   public async upload(items: MissionItem[], type: int = MavMissionType.MISSION): Promise<void> throws Error {
-    checkType(type, false)
+    checkType(type)
     checkItems(items)
     reserve(type)
     const inbox = new Inbox(conn, target, type)
@@ -236,7 +246,7 @@ export class MissionClient {
   /// The whole of the `type` as the vehicle has it, in the order of its seq, `current` set on the one it is on; ended with the ack the
   /// vehicle waits for. A count above `maxItems` is a `TOO_MANY` error (nothing is asked for).
   public async download(type: int = MavMissionType.MISSION): Promise<MissionItem[]> throws Error {
-    checkType(type, false)
+    checkType(type)
     reserve(type)
     const inbox = new Inbox(conn, target, type)
     let items: MissionItem[] = []
@@ -252,62 +262,62 @@ export class MissionClient {
     return items
   }
 
-  /// Clears the `type` (255, ALL, clears the three): MISSION_CLEAR_ALL SENT ONCE. Done on ACCEPTED, a `MissionError` of the vehicle's
-  /// answer otherwise (ArduPilot refuses with ERROR when the vehicle is armed and its mission is running). Without an answer: a
-  /// `TIMEOUT` that says that it is NOT KNOWN whether the vehicle cleared.
+  /// Clears the `type` (0, 1 or 2; one at a time: ArduPilot does not know 255): MISSION_CLEAR_ALL SENT ONCE. Done on ACCEPTED, a
+  /// `MissionError` of the vehicle's answer otherwise (ArduPilot refuses with ERROR when the vehicle is armed and its mission is
+  /// running). Without an answer: a `TIMEOUT` that says that it is NOT KNOWN whether the vehicle cleared.
   public async clear(type: int = MavMissionType.MISSION): Promise<void> throws Error {
-    checkType(type, true)
-    const all = type == MavMissionType.ALL
-    if (all) {
-      for (let t = 0; t <= 2; t++) {
-        reserve(t)
-      }
-    } else {
-      reserve(type)
-    }
+    checkType(type)
+    reserve(type)
     const inbox = new Inbox(conn, target, type)
     try {
       await clearOnce(inbox, type)
     } catch (e: Error) {
       inbox.close()
-      releaseAll(type)
+      release(type)
       throw e
     }
     inbox.close()
-    releaseAll(type)
+    release(type)
   }
 
   /// MAV_RESULT of MAV_CMD_DO_SET_MISSION_CURRENT: the vehicle goes on from item `seq` (`reset` also sets the mission's state back, so a
   /// finished one runs again). It is the command that has an answer; for a vehicle that does not know it (UNSUPPORTED) there is
-  /// `setCurrentMessage`. Sent as the client's `retries` say (setting the same item again does no harm).
+  /// `setCurrentMessage`. SENT ONCE, never again, like everything that moves a vehicle: a vehicle in AUTO flies to that item, so a command
+  /// sent again after a lost ack would send it back (and with `reset` start a finished mission over). Without an answer it is a `TIMEOUT`
+  /// MavLinkError: it is NOT KNOWN what the vehicle is flying to (MISSION_CURRENT says).
   public async setCurrent(seq: int, reset: bool = false): Promise<int> throws Error {
     if (seq < 0 || seq > MISSION_MAX_COUNT) {
       throw new MissionError("INVALID_VALUE", `item ${seq} is not 0 to ${MISSION_MAX_COUNT}`)
     }
-    const call = new CommandCall(conn, target, { timeoutMs: timeoutMs, retries: retries, signal: signal })
-    return await call.run(MavCmd.DO_SET_MISSION_CURRENT, [seq as f64, if (reset) 1.0 else 0.0])
+    const call = new CommandCall(conn, target, { timeoutMs: timeoutMs, retries: 0, signal: signal })
+    try {
+      return await call.run(MavCmd.DO_SET_MISSION_CURRENT, [seq as f64, if (reset) 1.0 else 0.0])
+    } catch (e: MavLinkError) {
+      if (e.code == "TIMEOUT") {
+        throw new MissionError("TIMEOUT", `no answer to setting item ${seq} as the current one: it is not known what the vehicle flies to`)
+      }
+      throw e
+    }
   }
 
-  /// MISSION_SET_CURRENT (the message the vehicle announces as deprecated): done when the vehicle says that item is the current one
-  /// (MISSION_CURRENT); a `TIMEOUT` when it does not.
+  /// MISSION_SET_CURRENT (the message the vehicle announces as deprecated), SENT ONCE (see `setCurrent`): done when the vehicle says that
+  /// item is the current one (MISSION_CURRENT) within the timeout; otherwise a `TIMEOUT` (it is not known what the vehicle flies to).
   public async setCurrentMessage(seq: int): Promise<void> throws Error {
     if (seq < 0 || seq > MISSION_MAX_COUNT) {
       throw new MissionError("INVALID_VALUE", `item ${seq} is not 0 to ${MISSION_MAX_COUNT}`)
     }
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      checkAborted(signal, "setting the current item")
-      const reply = conn.waitFor((r: Received) => isCurrent(r, target, seq), timeoutMs, signal)
-      const m = new MissionSetCurrent()
-      m.targetSystem = target.system as u8
-      m.targetComponent = target.component as u8
-      m.seq = seq as u16
-      await conn.send(m)
-      if ((await reply) != null) {
-        return
-      }
+    checkAborted(signal, "setting the current item")
+    const reply = conn.waitFor((r: Received) => isCurrent(r, target, seq), timeoutMs, signal)
+    const m = new MissionSetCurrent()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    m.seq = seq as u16
+    await conn.send(m)
+    if ((await reply) != null) {
+      return
     }
     checkAborted(signal, "setting the current item")
-    throw new MissionError("TIMEOUT", `the vehicle did not say that item ${seq} is the current one`)
+    throw new MissionError("TIMEOUT", `the vehicle did not say that item ${seq} is the current one: it is not known what it flies to`)
   }
 
   reserve(type: int): void throws Error {
@@ -319,16 +329,6 @@ export class MissionClient {
 
   release(type: int): void {
     working.set(type, false)
-  }
-
-  releaseAll(type: int): void {
-    if (type == MavMissionType.ALL) {
-      for (let t = 0; t <= 2; t++) {
-        release(t)
-      }
-    } else {
-      release(type)
-    }
   }
 
   async sendItems(inbox: Inbox, items: MissionItem[], type: int): Promise<void> throws Error {
@@ -582,16 +582,30 @@ function typeName(type: int): string {
   return (MavMissionType.nameOf(type) ?? "mission").toLowerCase()
 }
 
-function checkType(type: int, allowAll: bool): void throws MissionError {
+function checkType(type: int): void throws MissionError {
   if (type < 0 || type > 2) {
-    if (!(allowAll && type == MavMissionType.ALL)) {
-      throw new MissionError("INVALID_VALUE", `mission type ${type} is not 0 (mission), 1 (fence) or 2 (rally)`)
-    }
+    throw new MissionError("INVALID_VALUE", `mission type ${type} is not 0 (mission), 1 (fence) or 2 (rally)`)
   }
 }
 
-/// Throws, before anything is sent, for an item that cannot go on the wire.
+/// MAV_FRAMEs whose x and y are a latitude and a longitude in degrees times 1e7 (GLOBAL, GLOBAL_RELATIVE_ALT, GLOBAL_INT,
+/// GLOBAL_RELATIVE_ALT_INT, GLOBAL_TERRAIN_ALT, GLOBAL_TERRAIN_ALT_INT).
+function isGlobalFrame(frame: int): bool {
+  return frame == 0 || frame == 3 || frame == 5 || frame == 6 || frame == 10 || frame == 11
+}
+
+/// Whether `v` is a number a vehicle can be told (not NaN, not infinite).
+function finite(v: f32): bool {
+  return v == v && v - v == 0.0
+}
+
+/// Throws, before anything is sent (not even the count: the vehicle truncates its mission at the count), for an item that cannot go on
+/// the wire or that no vehicle should be given: a number that does not fit its field, a NaN or an infinity in a parameter or the
+/// altitude, a place off the globe (in a frame whose x and y are one).
 function checkItems(items: MissionItem[]): void throws MissionError {
+  if (items.length == 0) {
+    throw new MissionError("INVALID_VALUE", "an empty upload would truncate the mission to nothing, without the guard of a clear: use clear")
+  }
   if (items.length > MISSION_MAX_COUNT) {
     throw new MissionError("INVALID_VALUE", `${items.length} items are more than ${MISSION_MAX_COUNT}`)
   }
@@ -608,6 +622,12 @@ function checkItems(items: MissionItem[]): void throws MissionError {
     }
     if (it.x < -2147483648 || it.x > 2147483647 || it.y < -2147483648 || it.y > 2147483647) {
       throw new MissionError("INVALID_VALUE", `item ${i}: x or y does not fit 32 bits`)
+    }
+    if (!finite(it.param1) || !finite(it.param2) || !finite(it.param3) || !finite(it.param4) || !finite(it.z)) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: a parameter or the altitude is NaN or infinite`)
+    }
+    if (isGlobalFrame(it.frame) && (it.x < -900000000 || it.x > 900000000 || it.y < -1800000000 || it.y > 1800000000)) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: latitude ${it.x} or longitude ${it.y} (degrees times 1e7) is off the globe`)
     }
   }
 }
