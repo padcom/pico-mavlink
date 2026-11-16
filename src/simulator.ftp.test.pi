@@ -62,11 +62,11 @@ async function readAll(client: FtpClient, path: string): Promise<Uint8Array> thr
     }
     pos += part.length
   }
-  out
+  return out
 }
 
 function shown(p: PackedParam): string {
-  `${p.name}=${showParam(p.value)}`
+  return `${p.name}=${showParam(p.value)}`
 }
 
 function many(count: int): SimParam[] {
@@ -75,7 +75,7 @@ function many(count: int): SimParam[] {
     const p: SimParam = { id: `P${i % 90}_V${i}`, value: TypedParamValue.Int(i - 500, MavParamType.INT32) }
     list.push(p)
   }
-  list
+  return list
 }
 
 async function advertisesTheCapability(): Promise<void> throws Error {
@@ -201,7 +201,7 @@ async function ask(r: Rig, opcode: int, session: int, offset: int, size: int, da
   if (msg instanceof FileTransferProtocol) {
     return ftpPacketOf(msg)
   }
-  null
+  return null
 }
 
 function isFtpReplyTo(m: Received, opcode: int, seq: int): bool {
@@ -214,7 +214,7 @@ function isFtpReplyTo(m: Received, opcode: int, seq: int): bool {
       return false
     }
   }
-  false
+  return false
 }
 
 function errorOf(p: FtpPacket?): string {
@@ -224,7 +224,7 @@ function errorOf(p: FtpPacket?): string {
   if (p!.opcode == FtpOpcode.ACK) {
     return "ack"
   }
-  `nack ${p!.data[0]}`
+  return `nack ${p!.data[0]}`
 }
 
 async function answersAsTheVehicleDoes(): Promise<void> throws Error {
@@ -419,7 +419,7 @@ async function burst(r: Rig, session: int, offset: int, size: int, waitMs: int):
     }
   }
   r.gcs.off(id)
-  got
+  return got
 }
 
 async function burstsTheWholeFile(): Promise<void> throws Error {

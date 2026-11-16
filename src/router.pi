@@ -89,7 +89,7 @@ class Link {
 
   /// Whether to write to it and route to it.
   public usable(): bool {
-    up && !failed
+    return up && !failed
   }
 }
 
@@ -115,7 +115,7 @@ function sameBytes(a: Uint8Array, b: Uint8Array): bool {
       return false
     }
   }
-  true
+  return true
 }
 
 /// What a dropped slot of the read queue holds.
@@ -172,14 +172,14 @@ export class MavLinkRouter implements ByteStream {
     const link = new Link(links.length, stream)
     links.push(link)
     pump(link)
-    link.id
+    return link.id
   }
 
   /// What the router knows about each link.
   public linkInfo(): LinkInfo[] {
     links.map((l: Link) => {
       const i: LinkInfo = { id: l.id, up: l.usable(), frames: l.frames, duplicates: l.duplicates }
-      i
+      return i
     })
   }
 
@@ -190,7 +190,7 @@ export class MavLinkRouter implements ByteStream {
 
   /// How many frames the router passed on to another link.
   public forwardedCount(): int {
-    forwarded
+    return forwarded
   }
 
   /// How many duplicate frames it dropped, over all links.
@@ -199,22 +199,22 @@ export class MavLinkRouter implements ByteStream {
     for (const l of links) {
       n += l.duplicates
     }
-    n
+    return n
   }
 
   /// How many frames were dropped from the queue because nobody read them in time.
   public droppedCount(): int {
-    dropped
+    return dropped
   }
 
   /// How many frames wait to be read.
   public queuedCount(): int {
-    queue.length - head
+    return queue.length - head
   }
 
   /// How many slots the read queue holds in memory (the frames waiting, plus dropped ones not yet compacted).
   public queuedSlots(): int {
-    queue.length
+    return queue.length
   }
 
   /// How many writes were refused because a link had too many waiting behind a stalled write.
@@ -223,7 +223,7 @@ export class MavLinkRouter implements ByteStream {
     for (const l of links) {
       n += l.skipped
     }
-    n
+    return n
   }
 
   /// How many writes were not sent because they waited too long for their turn on a link.
@@ -232,7 +232,7 @@ export class MavLinkRouter implements ByteStream {
     for (const l of links) {
       n += l.expired
     }
-    n
+    return n
   }
 
   /// How many senders are remembered, over all links.
@@ -241,7 +241,7 @@ export class MavLinkRouter implements ByteStream {
     for (const l of links) {
       n += l.heard.size
     }
-    n
+    return n
   }
 
   /// The next frame from any link, once; null when every link has ended (or after `close()`).
@@ -315,7 +315,7 @@ export class MavLinkRouter implements ByteStream {
         return false
       }
     }
-    true
+    return true
   }
 
   wake(): void {
@@ -453,7 +453,7 @@ export class MavLinkRouter implements ByteStream {
         out.push(l.id)
       }
     }
-    out
+    return out
   }
 
   /// The links, other than `except`, that are in use and reach the system (and component, unless 0): looked
@@ -467,7 +467,7 @@ export class MavLinkRouter implements ByteStream {
         collect(system * 256 + c, now, except, out)
       }
     }
-    out
+    return out
   }
 
   collect(source: int, now: int, except: int, out: int[]): void {
@@ -634,6 +634,6 @@ export class MavLinkRouter implements ByteStream {
       taken = false
     }
     release(link)
-    taken
+    return taken
   }
 }

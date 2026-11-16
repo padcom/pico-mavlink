@@ -182,7 +182,7 @@ export class SimControl {
       }
       answer(command, result)
     }
-    true
+    return true
   }
 
   /// A COMMAND_INT: the reposition and the set of home; whether it was one of those.
@@ -273,7 +273,7 @@ export class SimControl {
     armedSet = 0
     flying = false
     disarms += 1
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   setMode(baseMode: int, custom: int): int {
@@ -286,7 +286,7 @@ export class SimControl {
     }
     modeSet = custom
     modeChanges += 1
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   pauseOrContinue(flag: int): int {
@@ -299,7 +299,7 @@ export class SimControl {
       return MavResult.FAILED
     }
     paused = flag == 0
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   /// ArduPilot (takeoff.cpp `do_user_takeoff_U_m`, mode.h `has_user_takeoff`): FAILED unless the vehicle is armed, on the ground and in
@@ -316,7 +316,7 @@ export class SimControl {
     targetLat = lat
     targetLon = lon
     targetHeight = altitude
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 
   /// ArduPilot (GCS_MAVLink_Copter.cpp:431): DENIED outside GUIDED unless param2 has the change-mode bit, for a place off the globe, a NaN
@@ -425,6 +425,6 @@ export class SimControl {
     if (prearm != "") {
       say(`PreArm: ${prearm}`)
     }
-    MavResult.ACCEPTED
+    return MavResult.ACCEPTED
   }
 }

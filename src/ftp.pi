@@ -100,7 +100,7 @@ export class FtpPacket {
     for (let i = 0; i < data.length; i++) {
       b.set(FTP_HEADER_SIZE + i, data[i])
     }
-    b
+    return b
   }
 
   /// A packet from the bytes of a payload. A payload shorter than the header, or one that says it carries more than it does or
@@ -130,7 +130,7 @@ export class FtpPacket {
     if (p.size > have && (p.opcode == FtpOpcode.ACK || p.opcode == FtpOpcode.NACK)) {
       throw new FtpError("FTP_PROTOCOL", `an FTP reply that says it carries ${p.size} bytes and has ${have}`)
     }
-    p
+    return p
   }
 }
 
@@ -146,7 +146,7 @@ export function ftpMessage(target: Target, p: FtpPacket): FileTransferProtocol t
     payload.push(bytes[i] as u8)
   }
   m.payload = payload
-  m
+  return m
 }
 
 /// The packet in a FILE_TRANSFER_PROTOCOL message.
@@ -274,7 +274,7 @@ function isUtf8(b: Uint8Array): bool {
     }
     i += n + 1
   }
-  true
+  return true
 }
 
 /// One entry of a listing, as ListDirectory writes it (`withTime` false) or ArduPilot's ListDirectoryWithTime:
@@ -314,7 +314,7 @@ export function hexOf(b: Uint8Array, max: int = 64): string {
     const v = b[i] as int
     out += `${if (i > 0) " " else ""}${digits.slice(v >> 4, (v >> 4) + 1)}${digits.slice(v & 15, (v & 15) + 1)}`
   }
-  `${b.length} bytes: ${out}${if (b.length > shown) " ..." else ""}`
+  return `${b.length} bytes: ${out}${if (b.length > shown) " ..." else ""}`
 }
 
 /// The entries in the data of a ListDirectory (`withTime` false) or ListDirectoryWithTime reply: each ends with a NUL byte (one
@@ -390,7 +390,7 @@ function request(seq: int, session: int, opcode: int, offset: int, data: Uint8Ar
   p.size = size
   p.offset = offset
   p.data = data
-  p
+  return p
 }
 
 /// Whether `r` answers the request `seq` / `opcode` that went to `target`: an Ack or Nack from it for that opcode, with the
@@ -441,13 +441,13 @@ export class FtpClient {
   }
 
   public aborted(): bool {
-    signal != null && signal!.aborted
+    return signal != null && signal!.aborted
   }
 
   /// The sequence number of the next request (for the burst reads of `readFile`, which are answered by many packets).
   public nextSeq(): int {
     seq = (seq + 1) & 0xFFFF
-    seq
+    return seq
   }
 
   /// Sends a request and waits for its reply, asking again (with the same sequence number) after a timeout. Gives the Ack or the
@@ -540,7 +540,7 @@ export class FtpClient {
     if (r.data.length == 0) {
       throw new FtpError("FTP_PROTOCOL", `asked for the bytes at ${offset}, got none and no end of file`)
     }
-    r.data
+    return r.data
   }
 
   /// The entries of the directory `path` ("/APM/LOGS", no trailing slash needed), in the order the vehicle gives them, in pages: each
@@ -575,7 +575,7 @@ export class FtpClient {
       throw e
     }
     await endSession(0)
-    entries
+    return entries
   }
 
   /// 0: it is not known yet whether the vehicle has ListDirectoryWithTime; 1: it has; 2: it has not (the plain one is used).
@@ -657,7 +657,7 @@ export class FtpClient {
         throw new FtpError("FTP_PROTOCOL", `listing ${path}: more than ${FTP_MAX_ENTRIES} entries`)
       }
     }
-    all
+    return all
   }
 
   /// The CRC-32 of the file `path`, computed by the vehicle (CalcFileCRC32; see `Crc32` for which CRC-32 it is). The vehicle reads the

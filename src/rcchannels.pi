@@ -40,7 +40,7 @@ export function rcReadingOf(m: RcChannels): RcReading {
   }
   const rssi = m.rssi as int
   const reading: RcReading = { timeBootMs: m.timeBootMs as int, count: count, pulses: pulses, rssi: if (rssi == 255) -1 else rssi }
-  reading
+  return reading
 }
 
 /// Keeps the latest RC_CHANNELS of a vehicle. `conn.run()` must be running; `stop()` ends it.

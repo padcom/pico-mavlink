@@ -161,7 +161,7 @@ function hex(b: Uint8Array): string {
   for (let i = 0; i < b.length; i++) {
     s += \`\${digits[b[i] >> 4]}\${digits[b[i] & 0xF]}\`
   }
-  s
+  return s
 }
 
 function nibble(s: string, i: int): int {
@@ -173,7 +173,7 @@ function unhex(s: string): Uint8Array {
   for (let i = 0; i < b.length; i++) {
     b.set(i, nibble(s, i * 2) * 16 + nibble(s, i * 2 + 1))
   }
-  b
+  return b
 }
 ${cases.join('\n')}
 

@@ -53,7 +53,7 @@ class Rig {
 }
 
 function show(r: RateResult): string {
-  `${r.method} ${r.ok} ${r.result}`
+  return `${r.method} ${r.ok} ${r.result}`
 }
 
 /// `ok` when `n` is from `low` to `high`, else what it was (so a failure shows the number).

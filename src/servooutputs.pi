@@ -26,7 +26,7 @@ export function servoReadingOf(m: ServoOutputRaw): ServoReading {
     m.servo13Raw as int, m.servo14Raw as int, m.servo15Raw as int, m.servo16Raw as int,
   ]
   const reading: ServoReading = { timeUsec: m.timeUsec as int, port: m.port as int, pulses: pulses }
-  reading
+  return reading
 }
 
 /// Keeps the latest SERVO_OUTPUT_RAW of each port of a vehicle. `conn.run()` must be running; `stop()` ends it.

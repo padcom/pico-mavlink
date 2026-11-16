@@ -51,12 +51,12 @@ export class CompassStatus {
 
   /// Whether the calibration is still going on in `value`.
   public static isRunning(value: int): bool {
-    value >= WAITING_TO_START && value <= RUNNING_STEP_TWO
+    return value >= WAITING_TO_START && value <= RUNNING_STEP_TWO
   }
 
   /// Whether `value` is the end of a calibration (it succeeded or failed).
   public static isDone(value: int): bool {
-    value >= SUCCESS && value <= FAILED_RESIDUALS_HIGH
+    return value >= SUCCESS && value <= FAILED_RESIDUALS_HIGH
   }
 
   /// The name of `value` (`SUCCESS` ...), or null for a number that is none.
@@ -153,7 +153,7 @@ export function progressOf(m: MagCalProgress): CompassProgress {
   const p: CompassProgress = { compassId: m.compassId as int, calMask: m.calMask as int, status: m.calStatus as int,
     attempt: m.attempt as int, completionPct: m.completionPct as int, completionMask: mask,
     direction: [m.directionX as f64, m.directionY as f64, m.directionZ as f64] }
-  p
+  return p
 }
 
 /// The report `m` says, as a value.
@@ -163,7 +163,7 @@ export function reportOf(m: MagCalReport): CompassReport {
     diagonals: [m.diagX as f64, m.diagY as f64, m.diagZ as f64], offDiagonals: [m.offdiagX as f64, m.offdiagY as f64, m.offdiagZ as f64],
     orientationConfidence: m.orientationConfidence as f64, oldOrientation: m.oldOrientation as int,
     newOrientation: m.newOrientation as int, scaleFactor: m.scaleFactor as f64 }
-  r
+  return r
 }
 
 /// How many sections of the sphere a completion mask holds samples in (of 80).
@@ -176,7 +176,7 @@ export function sectionsLit(mask: int[]): int {
       v = v >> 1
     }
   }
-  n
+  return n
 }
 
 /// Whether bit `section` (0 to 79) of a completion mask is lit.
@@ -185,7 +185,7 @@ export function sectionLit(mask: int[], section: int): bool {
     return false
   }
   const at = section / 8
-  at < mask.length && ((mask[at] >> (section % 8)) & 1) != 0
+  return at < mask.length && ((mask[at] >> (section % 8)) & 1) != 0
 }
 
 /// The compass calibration of a vehicle. `conn.run()` must be running.
@@ -239,7 +239,7 @@ export class CompassCalibration {
     if (m instanceof MagCalReport) {
       return { progress: null, report: reportOf(m) }
     }
-    null
+    return null
   }
 
   /// The calibration as a whole, for a caller that is a page: the vehicle is told to start, `work` runs (it reads `next`, shows it, and
@@ -280,7 +280,7 @@ export class CompassCalibration {
       }
     }
     cancelFailed = true
-    "TIMEOUT"
+    return "TIMEOUT"
   }
 
   /// The whole run, as far as the reports: starts, tells `onProgress` of each progress (it returns false to stop: the user left), and ends
@@ -312,7 +312,7 @@ export class CompassCalibration {
       ok = ok && r.status == CompassStatus.SUCCESS
     }
     const run: CompassRun = { reports: reports, ok: ok && reason == "", reason: reason, result: result }
-    run
+    return run
   }
 
   /// Reads events until every compass that calibrates has reported; "" then, `stopped` or `silent` when it stopped.
@@ -339,7 +339,7 @@ export class CompassCalibration {
         }
       }
     }
-    ""
+    return ""
   }
 }
 
@@ -362,7 +362,7 @@ function covers(reports: CompassReport[], mask: int): bool {
       have = have | (1 << r.compassId)
     }
   }
-  (mask & have) == mask
+  return (mask & have) == mask
 }
 
 /// The most compasses a vehicle has: the ids are 0 to 7 (the masks are a byte).
@@ -381,5 +381,5 @@ function isEvent(r: Received, target: Target): bool {
   if (m instanceof MagCalReport) {
     return (m.compassId as int) < MAX_COMPASSES
   }
-  false
+  return false
 }

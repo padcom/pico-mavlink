@@ -43,7 +43,7 @@ function listing(entries: string[]): Uint8Array {
   for (let i = 0; i < bytes.length; i++) {
     out.set(i, bytes[i])
   }
-  out
+  return out
 }
 
 /// A file of `size` bytes, to list (what is in it does not matter).
@@ -59,7 +59,7 @@ function withLogs(): Rig {
   r.sim.fsFiles.set("/APM/LOGS/LASTLOG.TXT", file(2))
   r.sim.fsFiles.set("/APM/notes.txt", file(5))
   r.sim.fsDirs.push("/APM/EMPTY")
-  r
+  return r
 }
 
 function parsesFilesAndDirectories(): void throws FtpError {
@@ -141,7 +141,7 @@ function padded(entries: string[], n: int): Uint8Array {
   for (let i = 0; i < base.length; i++) {
     out.set(i, base[i])
   }
-  out
+  return out
 }
 
 function ignoresZeroPaddingAfterTheLastEntry(): void throws FtpError {

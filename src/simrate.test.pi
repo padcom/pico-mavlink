@@ -4,7 +4,7 @@ import { describe, it, expect } from "std/test"
 import { DAMPING, NATURAL_RAD_S, OVERSHOOT, RATE_STEP, STEP_PERIOD_MS, actualRate, desiredRate } from "./simrate"
 
 function near(a: f64, b: f64, tolerance: f64): bool {
-  Math.abs(a - b) <= tolerance
+  return Math.abs(a - b) <= tolerance
 }
 
 function theDesiredRateIsASquareWave(): void {

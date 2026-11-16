@@ -18,11 +18,11 @@ export function readUint(b: Uint8Array, at: int, n: int): int {
   for (let i = n - 1; i >= 0; i--) {
     v = (v << 8) | byteAt(b, at + i)
   }
-  v
+  return v
 }
 
 export function readU8(b: Uint8Array, at: int): u8 {
-  byteAt(b, at) as u8
+  return byteAt(b, at) as u8
 }
 
 /// `v` (`bits` wide, unsigned) as two's complement: Pico's `as` checks ranges, it doesn't reinterpret.
@@ -31,32 +31,32 @@ function signed(v: int, bits: int): int {
 }
 
 export function readI8(b: Uint8Array, at: int): i8 {
-  signed(byteAt(b, at), 8) as i8
+  return signed(byteAt(b, at), 8) as i8
 }
 
 export function readU16(b: Uint8Array, at: int): u16 {
-  readUint(b, at, 2) as u16
+  return readUint(b, at, 2) as u16
 }
 
 export function readI16(b: Uint8Array, at: int): i16 {
-  signed(readUint(b, at, 2), 16) as i16
+  return signed(readUint(b, at, 2), 16) as i16
 }
 
 export function readU32(b: Uint8Array, at: int): u32 {
-  readUint(b, at, 4) as u32
+  return readUint(b, at, 4) as u32
 }
 
 export function readI32(b: Uint8Array, at: int): i32 {
-  signed(readUint(b, at, 4), 32) as i32
+  return signed(readUint(b, at, 4), 32) as i32
 }
 
 export function readU64(b: Uint8Array, at: int): u64 {
-  ((readUint(b, at + 4, 4) as u64) << 32) | (readUint(b, at, 4) as u64)
+  return ((readUint(b, at + 4, 4) as u64) << 32) | (readUint(b, at, 4) as u64)
 }
 
 export function readI64(b: Uint8Array, at: int): i64 {
   // The high half signed carries the sign; the low half is added unsigned.
-  (signed(readUint(b, at + 4, 4), 32) << 32) | readUint(b, at, 4)
+  return (signed(readUint(b, at + 4, 4), 32) << 32) | readUint(b, at, 4)
 }
 
 export function readF32(b: Uint8Array, at: int): f32 {

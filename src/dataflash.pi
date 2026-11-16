@@ -54,7 +54,7 @@ function sizeOfKind(kind: int): int {
   if (kind == 0x5A || kind == 0x61) {
     return 64
   }
-  0
+  return 0
 }
 
 /// The factor a field character puts on its value: 0.01 for c C e E, 1e-7 for L, else 1.
@@ -65,12 +65,12 @@ function scaleOfKind(kind: int): f64 {
   if (kind == 0x4C) {
     return 0.0000001
   }
-  1.0
+  return 1.0
 }
 
 /// Whether the field holds text (n N Z).
 export function isTextKind(kind: int): bool {
-  kind == 0x6E || kind == 0x4E || kind == 0x5A
+  return kind == 0x6E || kind == 0x4E || kind == 0x5A
 }
 
 /// `v` as an int, or null when it is not a number or is beyond what an int holds. (Pico's `as` stops the program on a value that
@@ -79,7 +79,7 @@ export function intOf(v: f64): int? {
   if (v != v || v < -9000000000000000000.0 || v > 9000000000000000000.0) {
     return null
   }
-  v as int
+  return v as int
 }
 
 /// One field of a format.
@@ -154,7 +154,7 @@ export class DfFormat {
         return i
       }
     }
-    -1
+    return -1
   }
 }
 
@@ -226,7 +226,7 @@ export class DfTables {
 
   /// The name of the unit of a field ("" when the log has none), as UNIT gave it.
   public unitOf(field: DfField): string {
-    units.get(field.unitId) ?? ""
+    return units.get(field.unitId) ?? ""
   }
 
   /// The multiplier of a field from MULT: 1 when there is none or it is not known (a log gives 0 for the id '-', "no multiplier").
@@ -272,7 +272,7 @@ function commaSeparated(text: string): string[] {
     }
   }
   out.push(text.slice(from, text.length))
-  out
+  return out
 }
 
 /// The format an FMT payload defines, or null (with the reason in `why`) when it does not add up.
@@ -310,7 +310,7 @@ function formatFromFmt(payload: Uint8Array, why: string[]): DfFormat? {
 /// Whether an FMT payload is the definition of FMT that the reader has built in (the first message of every log): the type, the
 /// length, the name and the field characters; the names of the columns are ArduPilot's to word ("Columns" in 4.7).
 function isFmtOfFmt(payload: Uint8Array): bool {
-  readU8(payload, 0) as int == DF_FMT_TYPE && readU8(payload, 1) as int == DF_FMT_LENGTH && readChars(payload, 2, 4) == "FMT" &&
+  return readU8(payload, 0) as int == DF_FMT_TYPE && readU8(payload, 1) as int == DF_FMT_LENGTH && readChars(payload, 2, 4) == "FMT" &&
     readChars(payload, 6, 16) == "BBnNZ"
 }
 
@@ -346,7 +346,7 @@ function numberAt(b: Uint8Array, p: int, k: int): f64 {
   if (k == 0x51) {
     return readU64(b, p) as f64
   }
-  0.0
+  return 0.0
 }
 
 /// Decodes the fields of a message of format `f` out of `b`, whose payload starts at `at`.
@@ -379,7 +379,7 @@ function arrayAt(b: Uint8Array, p: int): f64[] {
   for (let i = 0; i < 32; i++) {
     out.push(readI16(b, p + 2 * i) as f64)
   }
-  out
+  return out
 }
 
 /// Reads messages from chunks of a log, fed with `push`, and gives them with `next`. Holds only what has not been given yet (a
@@ -458,12 +458,12 @@ export class DfDecoder {
         return m
       }
     }
-    null
+    return null
   }
 
   /// How many bytes are held, waiting for the rest of a message (never more than a chunk and a message).
   public held(): int {
-    buf.length - start
+    return buf.length - start
   }
 
   /// Ends the log: bytes left over that are not a whole message are a truncated end.
@@ -491,7 +491,7 @@ export class DfDecoder {
     const m = decodeFields(f, payload, 0)
     const msg = new DfMessage(f, base + at, m.nums, m.texts, m.lists)
     note(msg)
-    msg
+    return msg
   }
 
   /// An FMT message: defines the format it describes (when it adds up) and is given as a message too.
@@ -543,7 +543,7 @@ export class DfDecoder {
       problems.note(`${m.format.name} at ${m.offset}: ${name} is not an id`)
       return null
     }
-    id
+    return id
   }
 
   /// Takes note of the messages that carry units and multipliers.
@@ -625,7 +625,7 @@ export class DataFlashReader {
         decoder.push(chunk!)
       }
     }
-    null
+    return null
   }
 }
 
@@ -660,12 +660,12 @@ export class DfIndex {
 
   /// How many messages of the type there are.
   public count(type: int): int {
-    counts.get(type) ?? 0
+    return counts.get(type) ?? 0
   }
 
   /// The offsets of the messages of the type that were kept (the first ones).
   public offsetsOf(type: int): int[] {
-    offsets.get(type) ?? []
+    return offsets.get(type) ?? []
   }
 }
 
@@ -680,7 +680,7 @@ export async function indexLog(stream: ByteStream, maxOffsets: int = 1000000): P
     }
     index.add(m!.format.type, m!.offset)
   }
-  index
+  return index
 }
 
 /// Writes logs, for tests: the same format the reader reads. Formats are defined with `define` (which writes the FMT message),
@@ -719,7 +719,7 @@ export class DfEncoder {
     }
     formats[type] = f
     write(DF_FMT_TYPE, payload)
-    true
+    return true
   }
 
   /// Writes a message of a defined type: `nums` and `texts` have a value for each field (the unused one 0 or ""). A number is
@@ -749,7 +749,7 @@ export class DfEncoder {
       }
     }
     write(type, payload)
-    true
+    return true
   }
 
   /// Writes bytes as they are (garbage, a cut message): for tests of damaged logs.
@@ -767,7 +767,7 @@ export class DfEncoder {
         at += 1
       }
     }
-    out
+    return out
   }
 
   write(type: int, payload: Uint8Array): void {
@@ -784,7 +784,7 @@ export class DfEncoder {
 
 /// The nearest integer to `v` (halves away from zero).
 function roundOf(v: f64): int {
-  (if (v < 0.0) v - 0.5 else v + 0.5) as int
+  return (if (v < 0.0) v - 0.5 else v + 0.5) as int
 }
 
 /// Writes 32 int16 at `at`: the values (rounded), the missing ones as zeros.

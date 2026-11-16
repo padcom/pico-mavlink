@@ -25,7 +25,7 @@ export function encodingOf(capabilities: u64): ParamEncoding? {
   if ((c & MavProtocolCapability.PARAM_ENCODE_C_CAST) != 0) {
     return ParamEncoding.CCast
   }
-  null
+  return null
 }
 
 /// A parameter's value with its type: an integer, or a real number.
@@ -62,15 +62,15 @@ function intBits(type: int): int {
   if (type == MavParamType.UINT64 || type == MavParamType.INT64) {
     return 64
   }
-  0
+  return 0
 }
 
 function isSigned(type: int): bool {
-  type == MavParamType.INT8 || type == MavParamType.INT16 || type == MavParamType.INT32 || type == MavParamType.INT64
+  return type == MavParamType.INT8 || type == MavParamType.INT16 || type == MavParamType.INT32 || type == MavParamType.INT64
 }
 
 function isReal(type: int): bool {
-  type == MavParamType.REAL32 || type == MavParamType.REAL64
+  return type == MavParamType.REAL32 || type == MavParamType.REAL64
 }
 
 /// The float's 4 bytes as an unsigned integer.
@@ -112,7 +112,7 @@ function castInt(f: f64, type: int): int {
   if (f >= hi) {
     return hi as int
   }
-  f as int
+  return f as int
 }
 
 /// The float field for `value` (its type goes in `param_type`).
@@ -145,7 +145,7 @@ function encodeInt(v: int, type: int, encoding: ParamEncoding): f32 throws Param
   if ((f as f64) as int != v) {
     throw new ParamError("NOT_EXACT", `${v} can't travel exactly as a float (C-cast encoding)`)
   }
-  f
+  return f
 }
 
 /// Whether two values are the same parameter value (what a PARAM_SET's read-back is checked

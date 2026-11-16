@@ -8,7 +8,7 @@ import { RcChannels } from "./dialects/common"
 
 function reading(pulses: int[]): RcReading {
   const r: RcReading = { timeBootMs: 0, count: pulses.length, pulses: pulses, rssi: 100 }
-  r
+  return r
 }
 
 async function keepsTheLatestReading(): Promise<void> throws Error {

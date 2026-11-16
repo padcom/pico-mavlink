@@ -153,12 +153,12 @@ export class TlogReader {
 
   /// The size of the buffer: a chunk and a record, whatever the file.
   public get capacity(): int {
-    buffer.length
+    return buffer.length
   }
 
   /// The bytes fed that no record has taken yet: less than a record, once `next` has returned null.
   public get waiting(): int {
-    end - start
+    return end - start
   }
 
   /// Feeds the next chunk of the file. Call `next` until it gives null before feeding another, so that only a record is ever kept.
@@ -222,7 +222,7 @@ export class TlogReader {
         return record
       }
     }
-    null
+    return null
   }
 
   /// The length of the frame that starts at `at`, or -1 when its header cannot be a frame's (flags that are not known). The
@@ -239,7 +239,7 @@ export class TlogReader {
       return -1
     }
     const signature = if ((flags & MavLinkProtocolV2.IFLAG_SIGNED) != 0) SIGNATURE_LENGTH else 0
-    MavLinkProtocolV2.PAYLOAD_OFFSET + buffer[at + 1] + CHECKSUM_LENGTH + signature
+    return MavLinkProtocolV2.PAYLOAD_OFFSET + buffer[at + 1] + CHECKSUM_LENGTH + signature
   }
 
   /// Looks at the record at `start`, whose frame is `need` bytes and is all here: a record to give, or null when it was skipped
@@ -287,7 +287,7 @@ export class TlogReader {
       return plausible(timeAt(p))
     }
     const crcAt = at + need - CHECKSUM_LENGTH - (if (v2 && (buffer[at + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0) SIGNATURE_LENGTH else 0)
-    readUint(buffer, crcAt, 2) == x25crc(buffer, at + 1, crcAt, magic!)
+    return readUint(buffer, crcAt, 2) == x25crc(buffer, at + 1, crcAt, magic!)
   }
 
   /// Whether a whole record starts anywhere after `start` (at the end of the file: the start at `start` was false).
@@ -297,12 +297,12 @@ export class TlogReader {
         return true
       }
     }
-    false
+    return false
   }
 
   /// Whether a time is where the recording is: after a first record, not more than the jitter before the last, not more than the gap after.
   plausible(time: int): bool {
-    last >= 0 && time >= 0 && time + jitterUs >= last && time - last <= maxGapUs
+    return last >= 0 && time >= 0 && time + jitterUs >= last && time - last <= maxGapUs
   }
 
   /// A frame of a message that is not in the dialect: skipped whole if its time is where the recording is, else it was noise.
@@ -319,7 +319,7 @@ export class TlogReader {
     report.unknown += 1
     report.bytesUnknown += TLOG_TIMESTAMP_LENGTH + need
     start += TLOG_TIMESTAMP_LENGTH + need
-    null
+    return null
   }
 
   /// A whole record: the segment it is in, the counts, and the record itself.
@@ -371,7 +371,7 @@ export class TlogReader {
     for (let i = 0; i < 8; i++) {
       us = us * 256 + buffer[at + i]
     }
-    us
+    return us
   }
 
   /// Drops `n` bytes that are no record.
@@ -466,5 +466,5 @@ export function signedCopy(frame: Uint8Array, magic: int): Uint8Array {
   const crc = x25crc(out, 1, crcAt, magic)
   out.set(crcAt, crc & 255)
   out.set(crcAt + 1, (crc >> 8) & 255)
-  out
+  return out
 }

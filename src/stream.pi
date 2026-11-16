@@ -27,7 +27,7 @@ export class MemoryStream implements ByteStream {
     const b = new MemoryStream()
     a.peer = b
     b.peer = a
-    [a, b]
+    return [a, b]
   }
 
   /// Bytes for this end to read (what the peer writes).
@@ -128,7 +128,7 @@ export class UdpStream implements ByteStream {
       peerPort = d!.addr.port
       peerHost = d!.addr.hostname
     }
-    d!.data
+    return d!.data
   }
 
   /// Sends one datagram (dropped while no peer is known yet).
@@ -167,7 +167,7 @@ export class FileStream implements ByteStream {
     const end = if (at + chunkSize < b.length) at + chunkSize else b.length
     const chunk = b.slice(at, end)
     at = end
-    chunk
+    return chunk
   }
 
   public async write(bytes: Uint8Array): Promise<void> throws Error {

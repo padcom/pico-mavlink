@@ -110,7 +110,7 @@ export class MotorTest {
     for (let i = 0; i < unanswered; i++) {
       result = await stopCall.run(MavCmd.DO_MOTOR_TEST, [lastMotor as f64, 0.0, 0.0, 0.0, 1.0, 0.0])
     }
-    result
+    return result
   }
 
   /// Spins motor `motor` at `throttlePercent` until `released` is aborted: a test of `HOLD_TEST_SECONDS` sent every `repeatMs`. However it
@@ -145,7 +145,7 @@ export class MotorTest {
     }
     const stopped = await stopQuietly(unanswered)
     const out: HoldResult = { starts: starts, first: first, why: why, stopped: stopped }
-    out
+    return out
   }
 
   /// Sends the stop and says whether the vehicle acknowledged it.
@@ -167,7 +167,7 @@ function whyItEnded(e: Error, released: AbortSignal): string {
     }
     return if (e.code == "TIMEOUT") "unacknowledged" else e.code
   }
-  "ERROR"
+  return "ERROR"
 }
 
 /// Waits `ms`, or until `released` is aborted (looking every 20 ms: a release is answered with the stop in that time).

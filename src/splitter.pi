@@ -47,22 +47,22 @@ export class MavLinkPacketSplitter {
 
   /// Frames whose CRC matched.
   public get validPackets(): int {
-    valid
+    return valid
   }
 
   /// Frames of known messages whose CRC didn't match, and bytes dropped from an overfull buffer.
   public get invalidPackets(): int {
-    invalid
+    return invalid
   }
 
   /// Frames of messages missing from `magicNumbers`.
   public get unknownPackets(): int {
-    unknown
+    return unknown
   }
 
   /// Bytes waiting for the rest of a frame.
   public get buffered(): int {
-    end - start
+    return end - start
   }
 
   public resetCounters(): void {
@@ -125,7 +125,7 @@ export class MavLinkPacketSplitter {
       }
     }
     bound()
-    out
+    return out
   }
 
   /// The first start byte from `scan` on (in a tlog, with 8 bytes before it), or -1.
@@ -137,7 +137,7 @@ export class MavLinkPacketSplitter {
         return i
       }
     }
-    -1
+    return -1
   }
 
   readTimestamp(at: int): int {
@@ -145,7 +145,7 @@ export class MavLinkPacketSplitter {
     for (let i = at - 8; i < at; i++) {
       us = (us << 8) | buffer[i]
     }
-    us / 1000
+    return us / 1000
   }
 
   append(chunk: Uint8Array): void {

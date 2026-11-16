@@ -33,7 +33,7 @@ function copyOf(p: FtpPacket): FtpPacket {
   q.burstComplete = p.burstComplete
   q.offset = p.offset
   q.data = p.data
-  q
+  return q
 }
 
 /// The bytes as text ("" when they are not).
@@ -183,7 +183,7 @@ class FakeFtp {
         n += 1
       }
     }
-    n
+    return n
   }
 }
 
@@ -193,7 +193,7 @@ function fileOf(n: int): Uint8Array {
   for (let i = 0; i < n; i++) {
     b.set(i, (i * 7 + 3) & 0xFF)
   }
-  b
+  return b
 }
 
 class Rig {
@@ -216,7 +216,7 @@ function rig(): Rig {
 }
 
 function codeOf(e: FtpError): string {
-  e.code
+  return e.code
 }
 
 // --- the packet ---

@@ -135,7 +135,7 @@ function messageCode(m) {
   lines.push(`  public static decode(payload: Uint8Array): ${name} {`)
   lines.push(`    const m = new ${name}()`)
   for (const f of placed) lines.push(...decodeField(f))
-  lines.push('    m')
+  lines.push('    return m')
   lines.push('  }')
   lines.push('')
   lines.push('  public override encode(into: Uint8Array, at: int): void {')
@@ -143,7 +143,7 @@ function messageCode(m) {
   lines.push('  }')
   lines.push('')
   lines.push(`  public override info(): MessageInfo {`)
-  lines.push(`    ${name}.INFO`)
+  lines.push(`    return ${name}.INFO`)
   lines.push('  }')
   lines.push('}')
   return { name, lines }

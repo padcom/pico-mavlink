@@ -44,7 +44,7 @@ async function walksThroughAllSixPositions(): Promise<void> throws Error {
   const placed: string[] = []
   const result = await rig.cal.run((p: int) => {
     placed.push(AccelPosition.nameOf(p) ?? "?")
-    true
+    return true
   }, 500)
   rig.close()
   expect(result.ok).toBe(true)
@@ -96,7 +96,7 @@ async function givesUpOnAVehicleThatAcceptsNoAnswer(): Promise<void> throws Erro
   let placed = 0
   const result = await rig.cal.run((_p: int) => {
     placed += 1
-    true
+    return true
   }, 500)
   rig.close()
   expect(result.ok).toBe(false)
