@@ -599,6 +599,39 @@ function finite(v: f32): bool {
   return v == v && v - v == 0.0
 }
 
+/// The parameters of `command` that ArduPilot lets be NaN, as bits (bit 0 is param1 ... bit 3 is param4); every other NaN is refused by
+/// the vehicle (INVALID_PARAMn), and an infinity everywhere (AP_Mission::sanity_check_params, `nan_mask`): param4, the yaw, "no change", of
+/// NAV_WAYPOINT (16), NAV_LOITER_UNLIM (17), NAV_LAND (21), NAV_TAKEOFF (22) and NAV_VTOL_TAKEOFF (84); param3 and 4 of NAV_VTOL_LAND (85);
+/// param2, 3 and 4 of NAV_ARC_WAYPOINT (36). QGroundControl plans have a NaN yaw.
+function nanAllowed(command: int): int {
+  if (command == 16 || command == 17 || command == 21 || command == 22 || command == 84) {
+    return 8
+  }
+  if (command == 36) {
+    return 14
+  }
+  if (command == 85) {
+    return 12
+  }
+  return 0
+}
+
+/// Which of the four parameters (1 to 4) the vehicle would refuse (an infinity, or a NaN where `nanAllowed` does not say so), 0 when none.
+function badParameter(it: MissionItem): int {
+  const values: f32[] = [it.param1, it.param2, it.param3, it.param4]
+  const allowed = nanAllowed(it.command)
+  for (let k = 0; k < 4; k++) {
+    const v = values[k]
+    if (v == v && v - v != 0.0) {
+      return k + 1
+    }
+    if (v != v && (allowed & (1 << k)) == 0) {
+      return k + 1
+    }
+  }
+  return 0
+}
+
 /// Throws, before anything is sent (not even the count: the vehicle truncates its mission at the count), for an item that cannot go on
 /// the wire or that no vehicle should be given: a number that does not fit its field, a NaN or an infinity in a parameter or the
 /// altitude, a place off the globe (in a frame whose x and y are one).
@@ -617,14 +650,23 @@ function checkItems(items: MissionItem[]): void throws MissionError {
     if (it.frame < 0 || it.frame > 255) {
       throw new MissionError("INVALID_VALUE", `item ${i}: frame ${it.frame} is not 0 to 255`)
     }
-    if (it.autocontinue < 0 || it.autocontinue > 255 || it.current < 0 || it.current > 255) {
-      throw new MissionError("INVALID_VALUE", `item ${i}: autocontinue or current is not 0 to 255`)
+    if (it.autocontinue < 0 || it.autocontinue > 255) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: autocontinue is not 0 to 255`)
+    }
+    // ArduPilot does not store an item of the mission whose `current` is 2 or 3 (a guided go-to, a change of altitude: GCS_Common.cpp:987-1012): a
+    // vehicle flying its mission is told to fly there NOW, and the item is dropped from the mission. So `current` is 0 or 1 here.
+    if (it.current < 0 || it.current > 1) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: current ${it.current} is not 0 or 1 (2 and 3 are orders to a flying vehicle, not mission items)`)
     }
     if (it.x < -2147483648 || it.x > 2147483647 || it.y < -2147483648 || it.y > 2147483647) {
       throw new MissionError("INVALID_VALUE", `item ${i}: x or y does not fit 32 bits`)
     }
-    if (!finite(it.param1) || !finite(it.param2) || !finite(it.param3) || !finite(it.param4) || !finite(it.z)) {
-      throw new MissionError("INVALID_VALUE", `item ${i}: a parameter or the altitude is NaN or infinite`)
+    const bad = badParameter(it)
+    if (bad > 0) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: param${bad} is an infinity, or a NaN that the vehicle refuses for command ${it.command}`)
+    }
+    if (!finite(it.z)) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: the altitude is NaN or infinite`)
     }
     if (isGlobalFrame(it.frame) && (it.x < -900000000 || it.x > 900000000 || it.y < -1800000000 || it.y > 1800000000)) {
       throw new MissionError("INVALID_VALUE", `item ${i}: latitude ${it.x} or longitude ${it.y} (degrees times 1e7) is off the globe`)

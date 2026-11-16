@@ -1,0 +1,530 @@
+// The missions, fences and rally points of the simulated autopilot, as ArduPilot (Copter 4.7.2, SITL and the source: GCS_MAVLink/
+// MissionItemProtocol*.cpp, AP_Mission.cpp) does them. What mission.pi's client does against a real vehicle is what a test of it can do against this:
+//  - UPLOAD: MISSION_COUNT; a count above what the vehicle holds is NO_SPACE (`maxMission` 650, `maxFence` 70, `maxRally` 46: SITL's);
+//    the vehicle TRUNCATES to the count AT ONCE (no guard, also while it flies the mission, armed or not) and asks for the items with the OLD
+//    MISSION_REQUEST(seq), one at a time, and again about every second (`update`) while it hears nothing. An item that is not the one it asked
+//    for gets an ACK of INVALID_SEQUENCE and the transfer goes on; an item from another sender, DENIED. Items are written AS THEY COME (an item
+//    below the count it has is replaced, the next one is appended): a transfer that stops half way leaves a MIXTURE, with no rollback. After
+//    the last item the vehicle sends MISSION_ACK (ACCEPTED). A count from the sender that is uploading restarts the transfer; from another, DENIED.
+//    A count of 0 truncates to nothing (and is ACCEPTED), also while armed and running.
+//  - DOWNLOAD: MISSION_REQUEST_LIST is answered with MISSION_COUNT (DENIED while an upload is under way), MISSION_REQUEST_INT(seq) with
+//    MISSION_ITEM_INT (INVALID_SEQUENCE past the end); the GCS' final ACK is let go.
+//  - THE HOME POSITION: item 0 of the MISSION type is the vehicle's own HOME (NAV_WAYPOINT, frame 0, `homeLat`, `homeLon`, `homeAmsl`), and the
+//    count includes it. A fresh vehicle holds just that. An uploaded item 0 is replaced by it.
+//  - FENCE and RALLY items come back with `autocontinue` 0, as the vehicle writes them.
+//  - CLEAR: MISSION_CLEAR_ALL of one type is ACCEPTED, but ERROR while the vehicle is armed and flies its mission (`running`: AP_Mission::clear);
+//    the type 255 is UNSUPPORTED.
+//  - THE FLIGHT, scripted: `start` sets the vehicle flying its mission from item 1 (it needs a mission of more than the home, else it does not
+//    start); `step` reaches the item it is on (MISSION_ITEM_REACHED) and goes on to the next, and after the last the mission is COMPLETE
+//    (`running` off); `autoStep` does a step at every `update`. MISSION_CURRENT (seq, total WITHOUT home, state) is sent at every `update` while
+//    `stream` is on, and at once when the current item is set. MAV_CMD_DO_SET_MISSION_CURRENT and MISSION_SET_CURRENT move to an item that
+//    exists (FAILED for the command, nothing for the message, when it does not).
+// What a test reads: `held(type)` (the items as the vehicle has them), `uploads` (transfers that ended ACCEPTED), `counts`, `current`, `reached`,
+// `running`, `setCurrents` (how many DO_SET_MISSION_CURRENT commands came: to check that none was sent twice). Faults: `refuse` (a count is answered
+// with this MAV_MISSION_RESULT), `deaf` (nothing is answered), `swallowAcks` (a number of the next acks, of an upload or a clear, are not sent).
+import { MavLinkConnection, Received } from "./connection"
+import { MissionItem } from "./mission"
+import {
+  CommandAck,
+  CommandLong,
+  MavCmd,
+  MavFrame,
+  MavMissionResult,
+  MavMissionType,
+  MavResult,
+  MissionAck,
+  MissionClearAll,
+  MissionCount,
+  MissionCurrent,
+  MissionItemInt,
+  MissionItemReached,
+  MissionRequest,
+  MissionRequestInt,
+  MissionRequestList,
+  MissionSetCurrent,
+} from "./dialects/common"
+
+/// MISSION_STATE: no mission, not started, active, complete.
+const STATE_NO_MISSION: int = 1
+const STATE_NOT_STARTED: int = 2
+const STATE_ACTIVE: int = 3
+const STATE_COMPLETE: int = 5
+
+/// The missions of the simulated autopilot.
+export class SimMissions {
+  readonly conn: MavLinkConnection
+  readonly armed: () => bool
+  readonly forMe: (system: int, component: int) => bool
+  /// Where home is: degrees times 1e7 (latitude, longitude) and metres above sea level.
+  readonly homeLat: () => int
+  readonly homeLon: () => int
+  readonly homeAmsl: () => f64
+  /// What the vehicle holds, by type: the items after home for the MISSION type (home is added when it is read), all of them for the others.
+  readonly stored: Map<int, MissionItem[]> = new Map<int, MissionItem[]>()
+  /// The most items of each type it takes (what SITL says), the home of a mission included.
+  public maxMission: int = 650
+  public maxFence: int = 70
+  public maxRally: int = 46
+  /// How long (ms) the vehicle waits for the item it asked for before it asks again (ArduPilot: about a second).
+  public askAgainMs: int = 1000
+  /// Every count is answered with this MAV_MISSION_RESULT (0: it is not).
+  public refuse: int = 0
+  /// Nothing is answered.
+  public deaf: bool = false
+  /// How many of the next acks of an upload or a clear are not sent.
+  public swallowAcks: int = 0
+  /// MISSION_CURRENT is sent at every `update` (off by default: the other messages of the simulator are not sent unless a test wants them).
+  public stream: bool = false
+  /// Every `update` is a `step` while the mission runs.
+  public autoStep: bool = false
+  /// Transfers that ended ACCEPTED, counts that came, DO_SET_MISSION_CURRENT commands that came.
+  public uploads: int = 0
+  public counts: int = 0
+  public setCurrents: int = 0
+  /// The item the vehicle is on (0: none yet, as before a start), and the last item it reached (-1: none).
+  public current: int = 0
+  public reached: int = -1
+  /// How many items with `current` 2 (a guided go-to) and 3 (a change of altitude) came, and whether the vehicle is in GUIDED (a go-to is ERROR when not).
+  public guidedItems: int = 0
+  public altitudeItems: int = 0
+  public guided: bool = false
+  /// Whether it flies its mission now.
+  public running: bool = false
+  complete: bool = false
+  /// The upload that is under way: its type (-1: none), who sends it, how many items it will have and when the last request went out.
+  public receiving: int = -1
+  fromSystem: int = 0
+  fromComponent: int = 0
+  expected: int = 0
+  nextSeq: int = 0
+  askedAt: int = 0
+
+  constructor(
+    conn: MavLinkConnection,
+    armed: () => bool,
+    forMe: (system: int, component: int) => bool,
+    homeLat: () => int,
+    homeLon: () => int,
+    homeAmsl: () => f64,
+  ) {
+    this.conn = conn
+    this.armed = armed
+    this.forMe = forMe
+    this.homeLat = homeLat
+    this.homeLon = homeLon
+    this.homeAmsl = homeAmsl
+  }
+
+  /// The items of `type` as the vehicle has them: for the MISSION type home first (the vehicle's own), then what was uploaded.
+  public held(type: int): MissionItem[] {
+    const own = stored.get(type) ?? []
+    if (type != MavMissionType.MISSION) {
+      return own
+    }
+    const out: MissionItem[] = [homeItem()]
+    for (const item of own) {
+      out.push(item)
+    }
+    return out
+  }
+
+  /// Puts `items` (home not among them) in the vehicle as the `type`, as if they had been uploaded (a test's starting point).
+  public put(type: int, items: MissionItem[]): void {
+    stored.set(type, items)
+  }
+
+  /// The home item: where the vehicle's home is, above sea level.
+  public homeItem(): MissionItem {
+    const lat = homeLat
+    const lon = homeLon
+    const amsl = homeAmsl
+    const item = new MissionItem(MavCmd.NAV_WAYPOINT, MavFrame.GLOBAL, lat(), lon(), amsl() as f32)
+    item.autocontinue = 1
+    return item
+  }
+
+  isArmed(): bool {
+    const f = armed
+    f()
+  }
+
+  mine(system: int, component: int): bool {
+    const f = forMe
+    f(system, component)
+  }
+
+  /// Handles one message; whether it was one of the mission protocol's (or the command that sets the current item).
+  public handle(r: Received): bool {
+    const m = r.message
+    if (m instanceof CommandLong) {
+      if (m.command as int != MavCmd.DO_SET_MISSION_CURRENT) {
+        return false
+      }
+      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        setCurrentCommand(m._param1 as int, (m._param2 as int) != 0)
+      }
+      return true
+    }
+    const sender = r.packet.header.sysid
+    const component = r.packet.header.compid
+    if (m instanceof MissionCount) {
+      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        count(m, sender, component)
+      }
+    } else if (m instanceof MissionItemInt) {
+      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        if (m.missionType as int == MavMissionType.MISSION && (m.current as int == 2 || m.current as int == 3)) {
+          flagged(m, sender, component)
+        } else {
+          item(m, sender, component)
+        }
+      }
+    } else if (m instanceof MissionRequestList) {
+      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        list(m.missionType as int, sender, component)
+      }
+    } else if (m instanceof MissionRequestInt) {
+      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        request(m.seq as int, m.missionType as int, sender, component)
+      }
+    } else if (m instanceof MissionClearAll) {
+      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        clear(m.missionType as int, sender, component)
+      }
+    } else if (m instanceof MissionSetCurrent) {
+      if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        setCurrentMessage(m.seq as int)
+      }
+    } else if (m instanceof MissionAck) {
+      // (the GCS' end of a download)
+    } else {
+      return false
+    }
+    return true
+  }
+
+  /// What the vehicle does with time: asks again for the item it is waiting for, goes on in its mission when `autoStep` is on, and says which
+  /// item it is on (MISSION_CURRENT) when `stream` is on.
+  public update(): void {
+    if (deaf) {
+      return
+    }
+    if (receiving >= 0 && (Date.now() as int) - askedAt >= askAgainMs) {
+      ask()
+    }
+    if (autoStep && running) {
+      step()
+    }
+    if (stream) {
+      sendCurrent()
+    }
+  }
+
+  /// The most items of `type`.
+  public maxOf(type: int): int {
+    if (type == MavMissionType.MISSION) {
+      return maxMission
+    }
+    return if (type == MavMissionType.FENCE) maxFence else maxRally
+  }
+
+  count(m: MissionCount, sender: int, component: int): void {
+    counts += 1
+    const type = m.missionType as int
+    if (type < 0 || type > 2) {
+      ack(MavMissionResult.UNSUPPORTED, type, sender, component)
+      return
+    }
+    if (receiving >= 0 && (sender != fromSystem || component != fromComponent)) {
+      // someone else is uploading
+      ack(MavMissionResult.DENIED, type, sender, component)
+      return
+    }
+    receiving = -1
+    if (refuse != 0) {
+      ack(refuse, type, sender, component)
+      return
+    }
+    const n = m.count as int
+    if (n > maxOf(type)) {
+      ack(MavMissionResult.NO_SPACE, type, sender, component)
+      return
+    }
+    // truncate to the count AT ONCE (the home of a mission is not among the stored items: it is item 0 of the count)
+    const own = stored.get(type) ?? []
+    const keep = if (type == MavMissionType.MISSION) (if (n > 0) n - 1 else 0) else n
+    if (keep < own.length) {
+      const kept: MissionItem[] = []
+      for (let i = 0; i < keep; i++) {
+        kept.push(own[i])
+      }
+      stored.set(type, kept)
+    }
+    if (n == 0) {
+      done(type, sender, component)
+      return
+    }
+    receiving = type
+    fromSystem = sender
+    fromComponent = component
+    expected = n
+    // (ArduPilot asks for item 0 first for every type, home's too: it is received and let go, home being its own; a count of 1 asks once)
+    nextSeq = 0
+    ask()
+  }
+
+  item(m: MissionItemInt, sender: int, component: int): void {
+    const type = m.missionType as int
+    if (receiving < 0 || type != receiving) {
+      return
+    }
+    // ArduPilot looks at the seq first (INVALID_SEQUENCE), then at who sends (DENIED): MissionItemProtocol.cpp:272-284
+    if (m.seq as int != nextSeq) {
+      ack(MavMissionResult.INVALID_SEQUENCE, type, sender, component)
+      return
+    }
+    if (sender != fromSystem || component != fromComponent) {
+      ack(MavMissionResult.DENIED, type, sender, component)
+      return
+    }
+    if (type != MavMissionType.MISSION || nextSeq > 0) {
+      const own = stored.get(type) ?? []
+      const at = if (type == MavMissionType.MISSION) nextSeq - 1 else nextSeq
+      const written = itemFrom(m, type)
+      if (at < own.length) {
+        own[at] = written
+      } else {
+        own.push(written)
+      }
+      stored.set(type, own)
+    }
+    nextSeq += 1
+    if (nextSeq >= expected) {
+      receiving = -1
+      done(type, sender, component)
+      return
+    }
+    ask()
+  }
+
+  /// An item of the MISSION type whose `current` is 2 or 3 is NOT a part of the protocol (GCS_Common.cpp:987-1012): 2 is a go-to for the guided
+  /// mode, 3 a change of altitude only; the vehicle acts on it (counted in `guidedItems` and `altitudeItems`) and never stores it, and an upload that
+  /// is under way is not touched. A go-to is ERROR out of GUIDED (`guided` says whether it is in it); an altitude change is ACCEPTED.
+  flagged(m: MissionItemInt, sender: int, component: int): void {
+    if (m.current as int == 2) {
+      guidedItems += 1
+      ack(if (guided) MavMissionResult.ACCEPTED else MavMissionResult.ERROR, MavMissionType.MISSION, sender, component)
+      return
+    }
+    altitudeItems += 1
+    ack(MavMissionResult.ACCEPTED, MavMissionType.MISSION, sender, component)
+  }
+
+  /// The item as the vehicle writes it: the fence's and the rally's lose their `autocontinue`.
+  itemFrom(m: MissionItemInt, type: int): MissionItem {
+    const it = new MissionItem(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
+    it.param1 = m.param1
+    it.param2 = m.param2
+    it.param3 = m.param3
+    it.param4 = m.param4
+    it.autocontinue = if (type == MavMissionType.MISSION) m.autocontinue as int else 0
+    return it
+  }
+
+  /// The end of an upload: the vehicle says ACCEPTED (unless the ack is to be lost).
+  done(type: int, sender: int, component: int): void {
+    uploads += 1
+    if (type == MavMissionType.MISSION && running) {
+      // a mission that was replaced under the vehicle: its place may be gone
+      if (current >= held(type).length) {
+        running = false
+        complete = true
+      }
+    }
+    answerAck(MavMissionResult.ACCEPTED, type, sender, component)
+  }
+
+  /// Asks for the next item with the old MISSION_REQUEST, as ArduPilot does.
+  ask(): void {
+    const q = new MissionRequest()
+    q.targetSystem = fromSystem as u8
+    q.targetComponent = fromComponent as u8
+    q.seq = nextSeq as u16
+    q.missionType = receiving as u8
+    askedAt = Date.now() as int
+    conn.send(q)
+  }
+
+  list(type: int, sender: int, component: int): void {
+    if (type < 0 || type > 2) {
+      ack(MavMissionResult.UNSUPPORTED, type, sender, component)
+      return
+    }
+    if (receiving >= 0) {
+      ack(MavMissionResult.DENIED, type, sender, component)
+      return
+    }
+    const c = new MissionCount()
+    c.targetSystem = sender as u8
+    c.targetComponent = component as u8
+    c.count = held(type).length as u16
+    c.missionType = type as u8
+    conn.send(c)
+  }
+
+  request(seq: int, type: int, sender: int, component: int): void {
+    const items = held(type)
+    if (type < 0 || type > 2) {
+      ack(MavMissionResult.UNSUPPORTED, type, sender, component)
+      return
+    }
+    if (receiving >= 0) {
+      ack(MavMissionResult.DENIED, type, sender, component)
+      return
+    }
+    if (seq >= items.length) {
+      // ArduPilot teaches the ground station the real size first (MissionItemProtocol.cpp:160-169), then answers INVALID_SEQUENCE
+      list(type, sender, component)
+      ack(MavMissionResult.INVALID_SEQUENCE, type, sender, component)
+      return
+    }
+    const it = items[seq]
+    const out = new MissionItemInt()
+    out.targetSystem = sender as u8
+    out.targetComponent = component as u8
+    out.seq = seq as u16
+    out.frame = it.frame as u8
+    out.command = it.command as u16
+    out.current = if (type == MavMissionType.MISSION && seq == current && (running || current > 0)) 1 else 0
+    out.autocontinue = it.autocontinue as u8
+    out.param1 = it.param1
+    out.param2 = it.param2
+    out.param3 = it.param3
+    out.param4 = it.param4
+    out.x = it.x as i32
+    out.y = it.y as i32
+    out.z = it.z
+    out.missionType = type as u8
+    conn.send(out)
+  }
+
+  clear(type: int, sender: int, component: int): void {
+    if (type < 0 || type > 2) {
+      ack(MavMissionResult.UNSUPPORTED, type, sender, component)
+      return
+    }
+    if (receiving == type && (sender != fromSystem || component != fromComponent)) {
+      // someone else is uploading: the clear does not cancel it. ArduPilot answers DENIED (cancel_upload) and, as the clear then did not
+      // succeed, ERROR as well (MissionItemProtocol.cpp:32-39, 57-67)
+      ack(MavMissionResult.DENIED, type, sender, component)
+      ack(MavMissionResult.ERROR, type, sender, component)
+      return
+    }
+    if (type == MavMissionType.MISSION && isArmed() && running) {
+      // AP_Mission::clear refuses while the vehicle is armed and flies its mission
+      ack(MavMissionResult.ERROR, type, sender, component)
+      return
+    }
+    receiving = -1
+    stored.set(type, [])
+    if (type == MavMissionType.MISSION) {
+      current = 0
+      reached = -1
+      running = false
+      complete = false
+    }
+    answerAck(MavMissionResult.ACCEPTED, type, sender, component)
+  }
+
+  /// An ack that may be lost (`swallowAcks`).
+  answerAck(result: int, type: int, sender: int, component: int): void {
+    if (swallowAcks > 0) {
+      swallowAcks -= 1
+      return
+    }
+    ack(result, type, sender, component)
+  }
+
+  ack(result: int, type: int, sender: int, component: int): void {
+    const a = new MissionAck()
+    a.targetSystem = sender as u8
+    a.targetComponent = component as u8
+    a.type = result as u8
+    a.missionType = type as u8
+    conn.send(a)
+  }
+
+  /// Sets the vehicle flying its mission from item 1 (not when it holds nothing but home). Whether it did.
+  public start(): bool {
+    if (held(MavMissionType.MISSION).length < 2) {
+      return false
+    }
+    running = true
+    complete = false
+    current = 1
+    reached = -1
+    sendCurrent()
+    return true
+  }
+
+  /// The vehicle reaches the item it is on (MISSION_ITEM_REACHED) and goes on to the next; after the last the mission is complete.
+  public step(): void {
+    if (!running) {
+      return
+    }
+    reached = current
+    const r = new MissionItemReached()
+    r.seq = current as u16
+    conn.send(r)
+    if (current + 1 >= held(MavMissionType.MISSION).length) {
+      running = false
+      complete = true
+    } else {
+      current += 1
+    }
+    sendCurrent()
+  }
+
+  setCurrentCommand(seq: int, reset: bool): void {
+    setCurrents += 1
+    const ack = new CommandAck()
+    ack.command = MavCmd.DO_SET_MISSION_CURRENT as u16
+    if (seq < 0 || seq >= held(MavMissionType.MISSION).length) {
+      ack.result = MavResult.FAILED as u8
+    } else {
+      moveTo(seq, reset)
+      ack.result = MavResult.ACCEPTED as u8
+    }
+    if (swallowAcks > 0) {
+      swallowAcks -= 1
+      return
+    }
+    conn.send(ack)
+  }
+
+  setCurrentMessage(seq: int): void {
+    if (seq >= 0 && seq < held(MavMissionType.MISSION).length) {
+      moveTo(seq, false)
+    }
+  }
+
+  /// Makes `seq` the current item (a finished mission starts again when `reset`, else it is paused there), and says so.
+  moveTo(seq: int, reset: bool): void {
+    current = seq
+    if (complete && reset) {
+      complete = false
+      running = true
+    }
+    sendCurrent()
+  }
+
+  sendCurrent(): void {
+    const total = held(MavMissionType.MISSION).length
+    const c = new MissionCurrent()
+    c.seq = current as u16
+    // (the total does not count home; 65535: no mission)
+    c.total = (if (total > 1) total - 1 else 65535) as u16
+    c.missionState = (if (total < 2) STATE_NO_MISSION else if (complete) STATE_COMPLETE else if (running) STATE_ACTIVE else STATE_NOT_STARTED) as u8
+    conn.send(c)
+  }
+}
