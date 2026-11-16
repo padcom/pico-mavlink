@@ -551,6 +551,13 @@ async function deliversARepeatOnTheSameLink(): Promise<void> throws Error {
   gcs.close()
 }
 
+/// Waits until `done()`, looking every 5 ms, for at most 3 s (a test that waited for a fixed time on a slow or busy machine looked too early).
+async function until(done: () => bool): Promise<void> throws Error {
+  for (let i = 0; i < 600 && !done(); i++) {
+    await delay(5)
+  }
+}
+
 async function boundsAndExpiresWhatItRemembersOfSenders(): Promise<void> throws Error {
   const l = MemoryStream.pair()
   const router = new MavLinkRouter({ maxRoutesPerLink: 50 })
@@ -558,7 +565,8 @@ async function boundsAndExpiresWhatItRemembersOfSenders(): Promise<void> throws 
   for (let s = 1; s <= 200; s++) {
     await l[1].write(heartbeatFrame(s, 0))
   }
-  await delay(30)
+  // (the last sender is heard, and the oldest are gone)
+  await until(() => router.linksTo(200, 1).length == 1 && router.routeCount() == 50)
   // 200 senders were heard; the 50 most recent (151 to 200) are kept.
   expect(`${router.routeCount()} ${router.linksTo(200, 1).join(",")} ${router.linksTo(1, 1).length} ${router.linksTo(151, 1).length} ${router.linksTo(150, 1).length}`).toBe("50 0 0 1 0")
 
@@ -568,11 +576,11 @@ async function boundsAndExpiresWhatItRemembersOfSenders(): Promise<void> throws 
   const quick = new MavLinkRouter({ routeTtlMs: 100 })
   quick.addLink(m[0])
   await m[1].write(heartbeatFrame(7, 0))
-  await delay(30)
+  await until(() => quick.linksTo(7, 1).length == 1)
   expect(quick.linksTo(7, 1).join(",")).toBe("0")
   await delay(220)
   await m[1].write(heartbeatFrame(8, 0))
-  await delay(30)
+  await until(() => quick.linksTo(8, 1).length == 1)
   expect(`${quick.routeCount()} ${quick.linksTo(7, 1).length} ${quick.linksTo(8, 1).join(",")}`).toBe("1 0 0")
 }
 
@@ -898,7 +906,7 @@ async function writesToALinkOneAtATime(): Promise<void> throws Error {
   for (let i = 0; i < 5; i++) {
     await a[1].write(heartbeatFrame(7, i))
   }
-  await delay(100)
+  await until(() => slow.writes == 5 && seqs.length == 5)
   // Five forwarded frames, one write at a time, in the order they came.
   expect(`${slow.writes} ${slow.peak} ${seqs.join(",")}`).toBe("5 1 0,1,2,3,4")
 }
