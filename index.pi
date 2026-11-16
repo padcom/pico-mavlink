@@ -145,7 +145,7 @@ export {
   MISSION_MAX_COUNT,
   MissionClient,
   MissionError,
-  MissionItem,
+  MissionEntry,
   MissionOptions,
   MissionProgress,
   firstDifference,

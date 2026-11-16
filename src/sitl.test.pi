@@ -16,7 +16,7 @@ import { TcpStream } from "./stream"
 import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
 import { Heartbeat } from "./dialects/minimal"
 import { MavCmd, MavFrame, MavMissionType, MavParamType, MavResult, MissionAck, MissionCount, MissionItemInt, MissionRequest, MissionRequestInt, RequestDataStream, StatusText } from "./dialects/common"
-import { MissionClient, MissionError, MissionItem, firstDifference, missionResultName } from "./mission"
+import { MissionClient, MissionError, MissionEntry, firstDifference, missionResultName } from "./mission"
 import { AccelCalKind, AccelPosition, Calibration } from "./accelcal"
 import { CompassCalibration, CompassProgress, CompassReport, CompassStatus } from "./compasscal"
 import { MotorTest } from "./motortest"
@@ -1542,7 +1542,7 @@ function ackWord(r: Received?): string {
 }
 
 /// `item` as the MISSION_ITEM_INT of `seq` for the vehicle.
-function aMissionItemOf(s: Sitl, item: MissionItem, seq: int): MissionItemInt {
+function aMissionItemOf(s: Sitl, item: MissionEntry, seq: int): MissionItemInt {
   const m = new MissionItemInt()
   m.targetSystem = s.target.system as u8
   m.targetComponent = s.target.component as u8
@@ -1558,8 +1558,8 @@ function aMissionItemOf(s: Sitl, item: MissionItem, seq: int): MissionItemInt {
 }
 
 /// A waypoint at (lat, lon) degrees, `alt` m above home.
-function aWaypoint(lat: f64, lon: f64, alt: f32): MissionItem {
-  return new MissionItem(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, alt)
+function aWaypoint(lat: f64, lon: f64, alt: f32): MissionEntry {
+  return new MissionEntry(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, alt)
 }
 
 /// THE SPIKE of the mission protocol (a test, not a feature; no flight needed): what ArduCopter does with an upload, a download, a clear,
@@ -1591,7 +1591,7 @@ async function missionProtocolOnTheRealVehicle(): Promise<void> throws Error {
     }
     println(`SPIKE vehicle says: ${f.texts.join(" | ")}`)
     // item 0 is the home position: what comes back for it?
-    const sent = [aWaypoint(52.1, 21.1, 0.0), new MissionItem(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), aWaypoint(52.2, 21.2, 20.0)]
+    const sent = [aWaypoint(52.1, 21.1, 0.0), new MissionEntry(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), aWaypoint(52.2, 21.2, 20.0)]
     sent[2].param1 = 3.0
     await client.upload(sent)
     const back = await client.download()
@@ -1646,14 +1646,14 @@ async function missionProtocolOnTheRealVehicle(): Promise<void> throws Error {
     // fence and rally
     // a polygon of three vertices (param1 is the number of vertices)
     const fence = [
-      new MissionItem(5001, MavFrame.GLOBAL, 521000000, 211000000, 0.0),
-      new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211000000, 0.0),
-      new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211010000, 0.0),
+      new MissionEntry(5001, MavFrame.GLOBAL, 521000000, 211000000, 0.0),
+      new MissionEntry(5001, MavFrame.GLOBAL, 521010000, 211000000, 0.0),
+      new MissionEntry(5001, MavFrame.GLOBAL, 521010000, 211010000, 0.0),
     ]
     for (const v of fence) {
       v.param1 = 3.0
     }
-    const rally = [new MissionItem(5100, MavFrame.GLOBAL_RELATIVE_ALT_INT, 521000000, 211000000, 30.0)]
+    const rally = [new MissionEntry(5100, MavFrame.GLOBAL_RELATIVE_ALT_INT, 521000000, 211000000, 30.0)]
     for (const t of [MavMissionType.FENCE, MavMissionType.RALLY]) {
       try {
         await client.upload(if (t == MavMissionType.FENCE) fence else rally, t)

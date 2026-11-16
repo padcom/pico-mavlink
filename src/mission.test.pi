@@ -5,14 +5,14 @@ import { MemoryStream } from "./stream"
 import { MavLinkProtocolV2 } from "./protocol"
 import { MavLinkData } from "./data"
 import { CommandAck, CommandLong, MavCmd, MavFrame, MavMissionResult, MavMissionType, MavResult, MissionAck, MissionClearAll, MissionCount, MissionCurrent, MissionItemInt, MissionItemReached, MissionRequest, MissionRequestInt, MissionRequestList, MissionSetCurrent } from "./dialects/common"
-import { MissionClient, MissionError, MissionItem, MissionProgress, firstDifference, missionResultName, sameItem } from "./mission"
+import { MissionClient, MissionError, MissionEntry, MissionProgress, firstDifference, missionResultName, sameItem } from "./mission"
 
 /// A vehicle that speaks the mission protocol as ArduPilot does (one transfer at a time, request by request, an ack at the end), with the
 /// faults a link and a vehicle have switched on by the test.
 class Vehicle {
   public readonly conn: MavLinkConnection
   /// What it holds, by MAV_MISSION_TYPE.
-  public readonly stored: Map<int, MissionItem[]> = new Map<int, MissionItem[]>()
+  public readonly stored: Map<int, MissionEntry[]> = new Map<int, MissionEntry[]>()
   /// What it was sent, in order, as "COUNT 3", "ITEM 1", "REQUEST_LIST", "REQUEST 2", "CLEAR 0", "ACK 0".
   public heard: string[] = []
   /// The most items it takes (more is NO_SPACE).
@@ -44,7 +44,7 @@ class Vehicle {
   public setCurrentMessages: int = 0
   /// The number it has been told to make current, -1 before.
   public current: int = -1
-  incoming: MissionItem[] = []
+  incoming: MissionEntry[] = []
   expected: int = 0
   receiving: int = -1
   type: int = 0
@@ -60,7 +60,7 @@ class Vehicle {
     conn.close()
   }
 
-  public holds(type: int): MissionItem[] {
+  public holds(type: int): MissionEntry[] {
     return stored.get(type) ?? []
   }
 
@@ -125,7 +125,7 @@ class Vehicle {
       ack(MavMissionResult.INVALID_SEQUENCE, receiving)
       return
     }
-    const item = new MissionItem(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
+    const item = new MissionEntry(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
     item.param1 = m.param1
     item.param2 = m.param2
     item.param3 = m.param3
@@ -306,15 +306,15 @@ class Rig {
 }
 
 /// A waypoint at (lat, lon) in degrees, 20 m above home.
-function waypoint(lat: f64, lon: f64): MissionItem {
-  const item = new MissionItem(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, 20.0)
+function waypoint(lat: f64, lon: f64): MissionEntry {
+  const item = new MissionEntry(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, 20.0)
   item.param1 = 0.5
   return item
 }
 
 /// Home, a takeoff and a waypoint: the three items of a small mission.
-function threeItems(): MissionItem[] {
-  return [waypoint(52.0, 21.0), new MissionItem(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), waypoint(52.001, 21.001)]
+function threeItems(): MissionEntry[] {
+  return [waypoint(52.0, 21.0), new MissionEntry(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), waypoint(52.001, 21.001)]
 }
 
 async function codeOf(work: Promise<void, Error>): Promise<string> {
@@ -690,7 +690,7 @@ async function aNanYawIsGoneWhereTheVehicleTakesItAndRefusedWhereItDoesNot(): Pr
   await rig.client.upload(yaw)
   const held = rig.vehicle.holds(MavMissionType.MISSION)
   const stillNan = held[2].param4 != held[2].param4
-  const arc = [waypoint(52.0, 21.0), new MissionItem(36, MavFrame.GLOBAL_RELATIVE_ALT_INT, 520000000, 210000000, 20.0)]
+  const arc = [waypoint(52.0, 21.0), new MissionEntry(36, MavFrame.GLOBAL_RELATIVE_ALT_INT, 520000000, 210000000, 20.0)]
   arc[1].param2 = 0.0 / 0.0
   arc[1].param3 = 0.0 / 0.0
   arc[1].param4 = 0.0 / 0.0
@@ -698,12 +698,12 @@ async function aNanYawIsGoneWhereTheVehicleTakesItAndRefusedWhereItDoesNot(): Pr
   rig.vehicle.heard = []
   // refused: a NaN yaw where the vehicle does not take it (a jump, 177), param3 of a waypoint, param2 of VTOL land, an infinite yaw anywhere
   const jump = threeItems()
-  jump[1] = new MissionItem(177, MavFrame.MISSION, 0, 0, 0.0)
+  jump[1] = new MissionEntry(177, MavFrame.MISSION, 0, 0, 0.0)
   jump[1].param4 = 0.0 / 0.0
   const third = threeItems()
   third[2].param3 = 0.0 / 0.0
   const land = threeItems()
-  land[2] = new MissionItem(85, MavFrame.GLOBAL_RELATIVE_ALT_INT, 520000000, 210000000, 0.0)
+  land[2] = new MissionEntry(85, MavFrame.GLOBAL_RELATIVE_ALT_INT, 520000000, 210000000, 0.0)
   land[2].param2 = 0.0 / 0.0
   const infinite = threeItems()
   infinite[0].param4 = 1.0 / 0.0

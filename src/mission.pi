@@ -54,7 +54,7 @@ export const MISSION_MAX_COUNT: int = 65535
 export const MISSION_DEFAULT_MAX_ITEMS: int = 2000
 
 /// One item as it is on the wire (MISSION_ITEM_INT). Its place in the list is its seq.
-export class MissionItem {
+export class MissionEntry {
   /// MAV_CMD.
   public command: int
   /// MAV_FRAME.
@@ -85,7 +85,7 @@ export class MissionItem {
 
 /// Whether two items are the same on the wire: every field but `current` (the vehicle sets that one itself). Parameters are compared
 /// as the floats that travel, and a NaN is the same as a NaN.
-export function sameItem(a: MissionItem, b: MissionItem): bool {
+export function sameItem(a: MissionEntry, b: MissionEntry): bool {
   return a.command == b.command && a.frame == b.frame && a.x == b.x && a.y == b.y && a.autocontinue == b.autocontinue
     && sameFloat(a.param1, b.param1) && sameFloat(a.param2, b.param2) && sameFloat(a.param3, b.param3) && sameFloat(a.param4, b.param4)
     && sameFloat(a.z, b.z)
@@ -96,7 +96,7 @@ function sameFloat(a: f32, b: f32): bool {
 }
 
 /// The index of the first item of `a` that differs from the one of `b` at the same place (or that one list lacks); -1 when they are the same.
-export function firstDifference(a: MissionItem[], b: MissionItem[]): int {
+export function firstDifference(a: MissionEntry[], b: MissionEntry[]): int {
   const n = if (a.length < b.length) a.length else b.length
   for (let i = 0; i < n; i++) {
     if (!sameItem(a[i], b[i])) {
@@ -227,7 +227,7 @@ export class MissionClient {
   /// a `MissionError` (see there). **The vehicle truncates its mission to the count at once and overwrites it item by item, with no
   /// rollback, also while it flies it: after a failure, a `TIMEOUT` included, what it holds is a MIXTURE (see the top of the file): read it
   /// back, clear it or send it again before it flies.** An empty list is an `INVALID_VALUE` error (nothing is sent): use `clear`.
-  public async upload(items: MissionItem[], type: int = MavMissionType.MISSION): Promise<void> throws Error {
+  public async upload(items: MissionEntry[], type: int = MavMissionType.MISSION): Promise<void> throws Error {
     checkType(type)
     checkItems(items)
     reserve(type)
@@ -245,11 +245,11 @@ export class MissionClient {
 
   /// The whole of the `type` as the vehicle has it, in the order of its seq, `current` set on the one it is on; ended with the ack the
   /// vehicle waits for. A count above `maxItems` is a `TOO_MANY` error (nothing is asked for).
-  public async download(type: int = MavMissionType.MISSION): Promise<MissionItem[]> throws Error {
+  public async download(type: int = MavMissionType.MISSION): Promise<MissionEntry[]> throws Error {
     checkType(type)
     reserve(type)
     const inbox = new Inbox(conn, target, type)
-    let items: MissionItem[] = []
+    let items: MissionEntry[] = []
     try {
       items = await receiveItems(inbox, type)
     } catch (e: Error) {
@@ -331,7 +331,7 @@ export class MissionClient {
     working.set(type, false)
   }
 
-  async sendItems(inbox: Inbox, items: MissionItem[], type: int): Promise<void> throws Error {
+  async sendItems(inbox: Inbox, items: MissionEntry[], type: int): Promise<void> throws Error {
     const n = items.length
     const deadline = (Date.now() as int) + overallMs
     // The seq of the last item sent (-1: none yet), and whether the vehicle has asked for the last one.
@@ -394,10 +394,10 @@ export class MissionClient {
     }
   }
 
-  async receiveItems(inbox: Inbox, type: int): Promise<MissionItem[]> throws Error {
+  async receiveItems(inbox: Inbox, type: int): Promise<MissionEntry[]> throws Error {
     const deadline = (Date.now() as int) + overallMs
     const count = await askCount(inbox, type, deadline)
-    const items: MissionItem[] = []
+    const items: MissionEntry[] = []
     for (let seq = 0; seq < count; seq++) {
       items.push(await askItem(inbox, type, seq, deadline))
       const report = this.progress
@@ -442,7 +442,7 @@ export class MissionClient {
   }
 
   /// Item `seq`: MISSION_REQUEST_INT, asked again when it does not come. Items that are not it (a late one) are let go.
-  async askItem(inbox: Inbox, type: int, seq: int, deadline: int): Promise<MissionItem> throws Error {
+  async askItem(inbox: Inbox, type: int, seq: int, deadline: int): Promise<MissionEntry> throws Error {
     let silent = 0
     await conn.send(requestOf(seq, type))
     while (true) {
@@ -534,7 +534,7 @@ export class MissionClient {
     return m
   }
 
-  itemOf(item: MissionItem, seq: int, type: int): MissionItemInt {
+  itemOf(item: MissionEntry, seq: int, type: int): MissionItemInt {
     const m = new MissionItemInt()
     m.targetSystem = target.system as u8
     m.targetComponent = target.component as u8
@@ -567,8 +567,8 @@ function requestedSeq(m: MavLinkData?): int {
   return -1
 }
 
-function itemFrom(m: MissionItemInt): MissionItem {
-  const item = new MissionItem(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
+function itemFrom(m: MissionItemInt): MissionEntry {
+  const item = new MissionEntry(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
   item.param1 = m.param1
   item.param2 = m.param2
   item.param3 = m.param3
@@ -617,7 +617,7 @@ function nanAllowed(command: int): int {
 }
 
 /// Which of the four parameters (1 to 4) the vehicle would refuse (an infinity, or a NaN where `nanAllowed` does not say so), 0 when none.
-function badParameter(it: MissionItem): int {
+function badParameter(it: MissionEntry): int {
   const values: f32[] = [it.param1, it.param2, it.param3, it.param4]
   const allowed = nanAllowed(it.command)
   for (let k = 0; k < 4; k++) {
@@ -635,7 +635,7 @@ function badParameter(it: MissionItem): int {
 /// Throws, before anything is sent (not even the count: the vehicle truncates its mission at the count), for an item that cannot go on
 /// the wire or that no vehicle should be given: a number that does not fit its field, a NaN or an infinity in a parameter or the
 /// altitude, a place off the globe (in a frame whose x and y are one).
-function checkItems(items: MissionItem[]): void throws MissionError {
+function checkItems(items: MissionEntry[]): void throws MissionError {
   if (items.length == 0) {
     throw new MissionError("INVALID_VALUE", "an empty upload would truncate the mission to nothing, without the guard of a clear: use clear")
   }
