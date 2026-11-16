@@ -247,7 +247,9 @@ async function theCurrentItemIsSetOnceAndAnItemThatIsNotThereIsFailed(): Promise
   await rig.client.setCurrentMessage(2)
   await delay(100)
   const byMessage = rig.sim.missions.current
+  const messages = rig.sim.missions.setCurrentMessages
   rig.close()
+  expect(messages).toBe(1)
   expect(moved).toBe(MavResult.ACCEPTED)
   expect(current).toBe(3)
   expect(failed).toBe(MavResult.FAILED)
@@ -387,10 +389,12 @@ async function aLostAckOfAClearIsNeverAnsweredByASecondClear(): Promise<void> th
   const code = await codeOf(rig.client.clear())
   await delay(400)
   const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  const clears = rig.sim.missions.clears
   rig.close()
-  // the vehicle cleared, the answer was lost: unknown to the client, and nothing sent again
+  // the vehicle cleared, the answer was lost: unknown to the client, and nothing sent again (ONE MISSION_CLEAR_ALL came)
   expect(code).toBe("TIMEOUT")
   expect(held).toBe(1)
+  expect(clears).toBe(1)
 }
 
 describe("the simulated autopilot's missions", () => {

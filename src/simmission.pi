@@ -20,7 +20,7 @@
 //    `stream` is on, and at once when the current item is set. MAV_CMD_DO_SET_MISSION_CURRENT and MISSION_SET_CURRENT move to an item that
 //    exists (FAILED for the command, nothing for the message, when it does not).
 // What a test reads: `held(type)` (the items as the vehicle has them), `uploads` (transfers that ended ACCEPTED), `counts`, `current`, `reached`,
-// `running`, `setCurrents` (how many DO_SET_MISSION_CURRENT commands came: to check that none was sent twice). Faults: `refuse` (a count is answered
+// `running`, `setCurrents` (how many DO_SET_MISSION_CURRENT commands came: to check that none was sent twice), `setCurrentMessages` and `clears` (the same for MISSION_SET_CURRENT and MISSION_CLEAR_ALL). Faults: `refuse` (a count is answered
 // with this MAV_MISSION_RESULT), `deaf` (nothing is answered), `swallowAcks` (a number of the next acks, of an upload or a clear, are not sent).
 import { MavLinkConnection, Received } from "./connection"
 import { MissionEntry } from "./mission"
@@ -81,6 +81,10 @@ export class SimMissions {
   public uploads: int = 0
   public counts: int = 0
   public setCurrents: int = 0
+  /// MISSION_CLEAR_ALL messages that came for this vehicle (of any type, answered or not): to check that a clear was sent once and not twice.
+  public clears: int = 0
+  /// MISSION_SET_CURRENT messages (not the command) that came for this vehicle.
+  public setCurrentMessages: int = 0
   /// The item the vehicle is on (0: none yet, as before a start), and the last item it reached (-1: none).
   public current: int = 0
   public reached: int = -1
@@ -189,10 +193,12 @@ export class SimMissions {
       }
     } else if (m instanceof MissionClearAll) {
       if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        clears += 1
         clear(m.missionType as int, sender, component)
       }
     } else if (m instanceof MissionSetCurrent) {
       if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
+        setCurrentMessages += 1
         setCurrentMessage(m.seq as int)
       }
     } else if (m instanceof MissionAck) {
