@@ -1,0 +1,782 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkProtocolV2 } from "./protocol"
+import { MavLinkData } from "./data"
+import { CommandAck, CommandLong, MavCmd, MavFrame, MavMissionResult, MavMissionType, MavResult, MissionAck, MissionClearAll, MissionCount, MissionCurrent, MissionItemInt, MissionItemReached, MissionRequest, MissionRequestInt, MissionRequestList, MissionSetCurrent } from "./dialects/common"
+import { MissionClient, MissionError, MissionItem, MissionProgress, firstDifference, missionResultName, sameItem } from "./mission"
+
+/// A vehicle that speaks the mission protocol as ArduPilot does (one transfer at a time, request by request, an ack at the end), with the
+/// faults a link and a vehicle have switched on by the test.
+class Vehicle {
+  public readonly conn: MavLinkConnection
+  /// What it holds, by MAV_MISSION_TYPE.
+  public readonly stored: Map<int, MissionItem[]> = new Map<int, MissionItem[]>()
+  /// What it was sent, in order, as "COUNT 3", "ITEM 1", "REQUEST_LIST", "REQUEST 2", "CLEAR 0", "ACK 0".
+  public heard: string[] = []
+  /// The most items it takes (more is NO_SPACE).
+  public max: int = 100
+  /// The first answers it does not send (a request for an item, a count, an item for a download): the link lost them.
+  public lose: int = 0
+  /// It answers a count with this MAV_MISSION_RESULT instead of starting (0: it starts).
+  public refuse: int = 0
+  /// It never answers a clear.
+  public deaf: bool = false
+  /// It answers a clear with this result (0: ACCEPTED).
+  public clearResult: int = 0
+  /// It asks for this seq twice, once more after the first time it is sent.
+  public askTwice: int = -1
+  /// It asks for an item that is not there (after the first one).
+  public askFor: int = -1
+  /// It accepts the mission right after the count.
+  public acceptEarly: bool = false
+  /// It does not answer a request for the items at all (a vehicle that went away mid-transfer).
+  public silentAfter: int = -1
+  /// It asks with MISSION_REQUEST_INT instead of the old MISSION_REQUEST.
+  public useInt: bool = false
+  /// The request for this seq is lost once (the link dropped it).
+  public dropSeq: int = -1
+  /// It never answers a set of the current item (the command's ack, the message's echo).
+  public noAck: bool = false
+  /// How many DO_SET_MISSION_CURRENT commands and MISSION_SET_CURRENT messages it was sent.
+  public commands: int = 0
+  public setCurrentMessages: int = 0
+  /// The number it has been told to make current, -1 before.
+  public current: int = -1
+  incoming: MissionItem[] = []
+  expected: int = 0
+  receiving: int = -1
+  type: int = 0
+  asked: int = 0
+
+  constructor(stream: MemoryStream) {
+    this.conn = new MavLinkConnection(stream, { protocol: new MavLinkProtocolV2(1, 1) })
+    this.conn.on((r: Received) => this.take(r))
+    this.conn.run()
+  }
+
+  public close(): void {
+    conn.close()
+  }
+
+  public holds(type: int): MissionItem[] {
+    return stored.get(type) ?? []
+  }
+
+  take(r: Received): void {
+    const m = r.message
+    if (m instanceof MissionCount) {
+      heard.push(`COUNT ${m.count}`)
+      onCount(m.count as int, m.missionType as int)
+    } else if (m instanceof MissionItemInt) {
+      heard.push(`ITEM ${m.seq}`)
+      onItem(m)
+    } else if (m instanceof MissionRequestList) {
+      heard.push("REQUEST_LIST")
+      onList(m.missionType as int)
+    } else if (m instanceof MissionRequestInt) {
+      heard.push(`REQUEST ${m.seq}`)
+      onRequest(m.seq as int, m.missionType as int)
+    } else if (m instanceof MissionClearAll) {
+      heard.push(`CLEAR ${m.missionType}`)
+      onClear(m.missionType as int)
+    } else if (m instanceof MissionAck) {
+      heard.push(`ACK ${m.type}`)
+    } else if (m instanceof CommandLong) {
+      onCommand(m)
+    } else if (m instanceof MissionSetCurrent) {
+      setCurrentMessages += 1
+      if (!noAck) {
+        current = m.seq as int
+        announce(current)
+      }
+    }
+  }
+
+  onCount(count: int, type: int): void {
+    this.type = type
+    if (refuse != 0) {
+      ack(refuse, type)
+      return
+    }
+    if (count > max) {
+      ack(MavMissionResult.NO_SPACE, type)
+      return
+    }
+    incoming = []
+    expected = count
+    receiving = type
+    if (count == 0) {
+      finish()
+    } else if (acceptEarly) {
+      ack(MavMissionResult.ACCEPTED, type)
+    } else {
+      request(0)
+    }
+  }
+
+  onItem(m: MissionItemInt): void {
+    if (receiving < 0) {
+      return
+    }
+    if (m.seq as int != incoming.length) {
+      // ArduPilot: an item that is not the one it asked for is answered with INVALID_SEQUENCE, and the transfer goes on
+      ack(MavMissionResult.INVALID_SEQUENCE, receiving)
+      return
+    }
+    const item = new MissionItem(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
+    item.param1 = m.param1
+    item.param2 = m.param2
+    item.param3 = m.param3
+    item.param4 = m.param4
+    item.autocontinue = m.autocontinue as int
+    incoming.push(item)
+    if (incoming.length == expected) {
+      finish()
+    } else {
+      request(incoming.length)
+    }
+  }
+
+  finish(): void {
+    stored.set(receiving, incoming)
+    const t = receiving
+    receiving = -1
+    ack(MavMissionResult.ACCEPTED, t)
+  }
+
+  request(seq: int): void {
+    if (silentAfter >= 0 && seq >= silentAfter) {
+      return
+    }
+    if (lose > 0) {
+      lose -= 1
+      return
+    }
+    if (dropSeq == seq) {
+      dropSeq = -1
+      // the vehicle's own timeout asks again (ArduPilot does, about every second)
+      setTimeout(() => this.send(this.requestMessage(seq, this.receiving)), 150)
+      return
+    }
+    send(requestMessage(seq, receiving))
+    if (askTwice == seq) {
+      askTwice = -1
+      send(requestMessage(seq, receiving))
+    }
+    if (askFor >= 0 && seq == 1) {
+      send(requestMessage(askFor, receiving))
+    }
+  }
+
+  /// What the vehicle asks with: the OLD MISSION_REQUEST, as ArduPilot does (MISSION_REQUEST_INT when `useInt`).
+  requestMessage(seq: int, type: int): MavLinkData {
+    if (useInt) {
+      const m = new MissionRequestInt()
+      m.targetSystem = 255
+      m.targetComponent = 190
+      m.seq = seq as u16
+      m.missionType = type as u8
+      return m
+    }
+    const old = new MissionRequest()
+    old.targetSystem = 255
+    old.targetComponent = 190
+    old.seq = seq as u16
+    old.missionType = type as u8
+    return old
+  }
+
+  onList(type: int): void {
+    if (lose > 0) {
+      lose -= 1
+      return
+    }
+    const m = new MissionCount()
+    m.targetSystem = 255
+    m.targetComponent = 190
+    m.count = holds(type).length as u16
+    m.missionType = type as u8
+    send(m)
+  }
+
+  onRequest(seq: int, type: int): void {
+    if (lose > 0) {
+      lose -= 1
+      return
+    }
+    const items = holds(type)
+    if (seq >= items.length) {
+      ack(MavMissionResult.INVALID_SEQUENCE, type)
+      return
+    }
+    const item = items[seq]
+    const m = new MissionItemInt()
+    m.targetSystem = 255
+    m.targetComponent = 190
+    m.seq = seq as u16
+    m.frame = item.frame as u8
+    m.command = item.command as u16
+    m.current = if (seq == current) 1 else 0
+    m.autocontinue = item.autocontinue as u8
+    m.param1 = item.param1
+    m.param2 = item.param2
+    m.param3 = item.param3
+    m.param4 = item.param4
+    m.x = item.x as i32
+    m.y = item.y as i32
+    m.z = item.z
+    m.missionType = type as u8
+    send(m)
+  }
+
+  onClear(type: int): void {
+    if (deaf) {
+      return
+    }
+    if (clearResult != 0) {
+      ack(clearResult, type)
+      return
+    }
+    stored.set(type, [])
+    ack(MavMissionResult.ACCEPTED, type)
+  }
+
+  onCommand(m: CommandLong): void {
+    if (m.command as int == MavCmd.DO_SET_MISSION_CURRENT) {
+      commands += 1
+      if (noAck) {
+        return
+      }
+      current = m._param1 as int
+      const a = new CommandAck()
+      a.command = m.command
+      a.result = MavResult.ACCEPTED as u8
+      send(a)
+      announce(current)
+    }
+  }
+
+  public announce(seq: int): void {
+    const c = new MissionCurrent()
+    c.seq = seq as u16
+    c.total = 3
+    c.missionState = 3
+    send(c)
+  }
+
+  public reach(seq: int): void {
+    const m = new MissionItemReached()
+    m.seq = seq as u16
+    send(m)
+  }
+
+  ack(result: int, type: int): void {
+    const a = new MissionAck()
+    a.targetSystem = 255
+    a.targetComponent = 190
+    a.type = result as u8
+    a.missionType = type as u8
+    send(a)
+  }
+
+  send(m: MavLinkData): void {
+    conn.send(m)
+  }
+}
+
+class Rig {
+  public readonly vehicle: Vehicle
+  public readonly gcs: MavLinkConnection
+  public readonly client: MissionClient
+
+  constructor(timeoutMs: int = 120, retries: int = 2) {
+    const ends = MemoryStream.pair()
+    this.vehicle = new Vehicle(ends[1])
+    this.gcs = new MavLinkConnection(ends[0], { protocol: new MavLinkProtocolV2(255, 190) })
+    this.client = new MissionClient(this.gcs, { system: 1, component: 1 }, { timeoutMs: timeoutMs, retries: retries })
+    this.gcs.run()
+  }
+
+  public close(): void {
+    vehicle.close()
+    gcs.close()
+  }
+}
+
+/// A waypoint at (lat, lon) in degrees, 20 m above home.
+function waypoint(lat: f64, lon: f64): MissionItem {
+  const item = new MissionItem(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, 20.0)
+  item.param1 = 0.5
+  return item
+}
+
+/// Home, a takeoff and a waypoint: the three items of a small mission.
+function threeItems(): MissionItem[] {
+  return [waypoint(52.0, 21.0), new MissionItem(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), waypoint(52.001, 21.001)]
+}
+
+async function codeOf(work: Promise<void, Error>): Promise<string> {
+  try {
+    await work
+  } catch (e: MissionError) {
+    return e.code
+  } catch (e: Error) {
+    return "OTHER"
+  }
+  return ""
+}
+
+async function anUploadIsAnsweredRequestByRequestAndReportsProgress(): Promise<void> throws Error {
+  const rig = new Rig()
+  const seen: string[] = []
+  rig.client.progress = (done: int, total: int) => {
+    seen.push(`${done}/${total}`)
+  }
+  await rig.client.upload(threeItems())
+  const held = rig.vehicle.holds(MavMissionType.MISSION)
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(heard).toBe("COUNT 3,ITEM 0,ITEM 1,ITEM 2")
+  expect(held.length).toBe(3)
+  expect(firstDifference(held, threeItems())).toBe(-1)
+  expect(seen.join(",")).toBe("1/3,2/3,3/3")
+}
+
+async function anEmptyUploadIsRefusedAndSendsNothing(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(threeItems())
+  rig.vehicle.heard = []
+  const code = await codeOf(rig.client.upload([]))
+  const heard = rig.vehicle.heard.length
+  const held = rig.vehicle.holds(MavMissionType.MISSION).length
+  rig.close()
+  expect(code).toBe("INVALID_VALUE")
+  expect(heard).toBe(0)
+  expect(held).toBe(3)
+}
+
+async function aDownloadReadsEveryItemAndEndsWithTheAck(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(threeItems())
+  rig.vehicle.current = 1
+  rig.vehicle.heard = []
+  const seen: string[] = []
+  rig.client.progress = (done: int, total: int) => {
+    seen.push(`${done}/${total}`)
+  }
+  const got = await rig.client.download()
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(heard).toBe("REQUEST_LIST,REQUEST 0,REQUEST 1,REQUEST 2,ACK 0")
+  expect(firstDifference(got, threeItems())).toBe(-1)
+  expect(got[1].current).toBe(1)
+  expect(got[0].current).toBe(0)
+  expect(seen.join(",")).toBe("1/3,2/3,3/3")
+}
+
+async function anEmptyDownloadIsEmptyAndAcknowledged(): Promise<void> throws Error {
+  const rig = new Rig()
+  const got = await rig.client.download()
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(got.length).toBe(0)
+  expect(heard).toBe("REQUEST_LIST,ACK 0")
+}
+
+async function theTypesAreKeptApart(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(threeItems(), MavMissionType.MISSION)
+  await rig.client.upload([waypoint(52.0, 21.0)], MavMissionType.FENCE)
+  const fence = await rig.client.download(MavMissionType.FENCE)
+  const rally = await rig.client.download(MavMissionType.RALLY)
+  const mission = rig.vehicle.holds(MavMissionType.MISSION).length
+  rig.close()
+  expect(fence.length).toBe(1)
+  expect(rally.length).toBe(0)
+  expect(mission).toBe(3)
+}
+
+async function aRefusalIsAnErrorWithTheVehiclesResult(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.max = 2
+  let code = ""
+  let result = -2
+  try {
+    await rig.client.upload(threeItems())
+  } catch (e: MissionError) {
+    code = e.code
+    result = e.result
+  }
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(code).toBe("NO_SPACE")
+  expect(result).toBe(MavMissionResult.NO_SPACE)
+  expect(heard).toBe("COUNT 3")
+  expect(missionResultName(MavMissionResult.DENIED)).toBe("DENIED")
+  expect(missionResultName(99)).toBe("RESULT_99")
+}
+
+async function aLostRequestIsAnsweredByTheCountSentAgain(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.lose = 1
+  await rig.client.upload(threeItems())
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(heard).toBe("COUNT 3,COUNT 3,ITEM 0,ITEM 1,ITEM 2")
+}
+
+async function aLostRequestMidWayIsWaitedForNotAnsweredWithAnythingNew(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.dropSeq = 1
+  await rig.client.upload(threeItems())
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(heard).toBe("COUNT 3,ITEM 0,ITEM 1,ITEM 2")
+}
+
+async function aVehicleThatNeverAnswersIsATimeoutAfterTheRetries(): Promise<void> throws Error {
+  const rig = new Rig(60, 2)
+  rig.vehicle.silentAfter = 0
+  const code = await codeOf(rig.client.upload(threeItems()))
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  expect(heard).toBe("COUNT 3,COUNT 3,COUNT 3")
+}
+
+async function aRequestAskedTwiceIsAnsweredTwiceBySeq(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.askTwice = 1
+  await rig.client.upload(threeItems())
+  const heard = rig.vehicle.heard.join(",")
+  const held = rig.vehicle.holds(MavMissionType.MISSION).length
+  rig.close()
+  expect(heard).toBe("COUNT 3,ITEM 0,ITEM 1,ITEM 1,ITEM 2")
+  expect(held).toBe(3)
+}
+
+async function aVehicleThatAsksWithTheNewRequestIsAnsweredAsWell(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.useInt = true
+  await rig.client.upload(threeItems())
+  const held = rig.vehicle.holds(MavMissionType.MISSION).length
+  rig.close()
+  expect(held).toBe(3)
+}
+
+async function aRequestBeyondTheCountIsAProtocolError(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.askFor = 7
+  const code = await codeOf(rig.client.upload(threeItems()))
+  rig.close()
+  expect(code).toBe("PROTOCOL")
+}
+
+async function anAcceptBeforeTheLastItemIsAProtocolError(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.acceptEarly = true
+  const code = await codeOf(rig.client.upload(threeItems()))
+  rig.close()
+  expect(code).toBe("PROTOCOL")
+}
+
+async function aDownloadAsksAgainForWhatDoesNotCome(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(threeItems())
+  rig.vehicle.heard = []
+  rig.vehicle.lose = 1
+  const got = await rig.client.download()
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(got.length).toBe(3)
+  expect(heard).toBe("REQUEST_LIST,REQUEST_LIST,REQUEST 0,REQUEST 1,REQUEST 2,ACK 0")
+}
+
+async function aDownloadOfTooManyItemsAsksForNone(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const vehicle = new Vehicle(ends[1])
+  vehicle.max = 1000
+  const gcs = new MavLinkConnection(ends[0], { protocol: new MavLinkProtocolV2(255, 190) })
+  const client = new MissionClient(gcs, { system: 1, component: 1 }, { timeoutMs: 120, retries: 1, maxItems: 2 })
+  gcs.run()
+  await new MissionClient(gcs, { system: 1, component: 1 }, { timeoutMs: 120 }).upload(threeItems())
+  vehicle.heard = []
+  const code = await codeOf(downloadOnly(client))
+  const heard = vehicle.heard.join(",")
+  vehicle.close()
+  gcs.close()
+  expect(code).toBe("TOO_MANY")
+  expect(heard).toBe("REQUEST_LIST")
+}
+
+async function downloadOnly(client: MissionClient): Promise<void> throws Error {
+  const _items = await client.download()
+}
+
+async function aClearIsSentOnceAndAcknowledged(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(threeItems())
+  rig.vehicle.heard = []
+  await rig.client.clear()
+  const heard = rig.vehicle.heard.join(",")
+  const held = rig.vehicle.holds(MavMissionType.MISSION).length
+  rig.close()
+  expect(heard).toBe("CLEAR 0")
+  expect(held).toBe(0)
+}
+
+async function aClearThatIsNotAnsweredIsNeverSentAgainAndIsUnknown(): Promise<void> throws Error {
+  const rig = new Rig(80, 3)
+  rig.vehicle.deaf = true
+  let message = ""
+  let code = ""
+  try {
+    await rig.client.clear()
+  } catch (e: MissionError) {
+    code = e.code
+    message = e.message
+  }
+  // (what was sent by the time the wait is over; a later send would show up here too)
+  await delay(200)
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  expect(message.includes("not known")).toBe(true)
+  expect(heard).toBe("CLEAR 0")
+}
+
+async function aClearTheVehicleRefusesIsAnErrorWithItsResult(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.clearResult = MavMissionResult.ERROR
+  const code = await codeOf(rig.client.clear(MavMissionType.RALLY))
+  const heard = rig.vehicle.heard.join(",")
+  rig.close()
+  expect(code).toBe("ERROR")
+  expect(heard).toBe("CLEAR 2")
+}
+
+async function aSecondTransferOfTheSameTypeIsBusyAndSendsNothing(): Promise<void> throws Error {
+  const rig = new Rig()
+  rig.vehicle.silentAfter = 0
+  const first = rig.client.upload(threeItems())
+  await delay(20)
+  const sentBefore = rig.vehicle.heard.length
+  const second = await codeOf(rig.client.upload(threeItems()))
+  const download = await codeOf(downloadOnly(rig.client))
+  const clear = await codeOf(rig.client.clear(MavMissionType.MISSION))
+  const sentAfter = rig.vehicle.heard.length
+  // another type may go on at the same time
+  const other = await codeOf(rig.client.clear(MavMissionType.FENCE))
+  let firstCode = ""
+  try {
+    await first
+  } catch (e: MissionError) {
+    firstCode = e.code
+  }
+  rig.close()
+  expect(second).toBe("BUSY")
+  expect(download).toBe("BUSY")
+  expect(clear).toBe("BUSY")
+  expect(sentAfter).toBe(sentBefore)
+  expect(other).toBe("")
+  expect(firstCode).toBe("TIMEOUT")
+}
+
+async function theTypeIsFreeAgainWhenATransferEnds(): Promise<void> throws Error {
+  const rig = new Rig(60, 0)
+  rig.vehicle.silentAfter = 0
+  const failed = await codeOf(rig.client.upload(threeItems()))
+  rig.vehicle.silentAfter = -1
+  await rig.client.upload(threeItems())
+  rig.close()
+  expect(failed).toBe("TIMEOUT")
+}
+
+async function aCancelEndsTheTransferAndSendsNothingMore(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const vehicle = new Vehicle(ends[1])
+  vehicle.silentAfter = 0
+  const gcs = new MavLinkConnection(ends[0], { protocol: new MavLinkProtocolV2(255, 190) })
+  const stop = new AbortController()
+  const client = new MissionClient(gcs, { system: 1, component: 1 }, { timeoutMs: 100, retries: 5, signal: stop.signal })
+  gcs.run()
+  setTimeout(() => stop.abort(), 30)
+  const code = await codeOf(client.upload(threeItems()))
+  await delay(300)
+  const heard = vehicle.heard.join(",")
+  vehicle.close()
+  gcs.close()
+  expect(code).toBe("ABORTED")
+  expect(heard).toBe("COUNT 3")
+}
+
+async function anItemThatCannotGoIsRefusedBeforeAnythingIsSent(): Promise<void> throws Error {
+  const rig = new Rig()
+  const bad = threeItems()
+  bad[2].command = 70000
+  const code = await codeOf(rig.client.upload(bad))
+  const badFrame = threeItems()
+  badFrame[1].frame = 256
+  const frame = await codeOf(rig.client.upload(badFrame))
+  const type = await codeOf(rig.client.upload(threeItems(), 3))
+  const typeAll = await codeOf(rig.client.upload(threeItems(), MavMissionType.ALL))
+  // (ArduPilot has no answer for the type 255: each type is cleared by its own call)
+  const clearAll = await codeOf(rig.client.clear(MavMissionType.ALL))
+  const heard = rig.vehicle.heard.length
+  rig.close()
+  expect(code).toBe("INVALID_VALUE")
+  expect(frame).toBe("INVALID_VALUE")
+  expect(type).toBe("INVALID_VALUE")
+  expect(typeAll).toBe("INVALID_VALUE")
+  expect(clearAll).toBe("INVALID_VALUE")
+  expect(heard).toBe(0)
+}
+
+async function aNumberNoVehicleShouldGetIsRefusedBeforeTheCountIsSent(): Promise<void> throws Error {
+  const rig = new Rig()
+  const nan = threeItems()
+  nan[1].param2 = 0.0 / 0.0
+  const infinite = threeItems()
+  infinite[2].z = 1.0 / 0.0
+  const north = threeItems()
+  north[0].x = 900000001
+  const east = threeItems()
+  east[2].y = -1800000001
+  const codes = [
+    await codeOf(rig.client.upload(nan)),
+    await codeOf(rig.client.upload(infinite)),
+    await codeOf(rig.client.upload(north)),
+    await codeOf(rig.client.upload(east)),
+  ]
+  const heard = rig.vehicle.heard.length
+  // (x and y are not a place in the frame of a command's own: this goes)
+  const own = threeItems()
+  own[1].frame = 2
+  own[1].y = 2000000000
+  await rig.client.upload(own)
+  rig.close()
+  expect(codes.join(",")).toBe("INVALID_VALUE,INVALID_VALUE,INVALID_VALUE,INVALID_VALUE")
+  expect(heard).toBe(0)
+}
+
+async function aRefusedClearOfAllLeavesNoReservationBehind(): Promise<void> throws Error {
+  const rig = new Rig()
+  const refused = await codeOf(rig.client.clear(MavMissionType.ALL))
+  await rig.client.upload(threeItems(), MavMissionType.MISSION)
+  await rig.client.upload(threeItems(), MavMissionType.FENCE)
+  await rig.client.upload(threeItems(), MavMissionType.RALLY)
+  rig.close()
+  expect(refused).toBe("INVALID_VALUE")
+}
+
+async function theCurrentItemIsSetOnceAndNeverAgain(): Promise<void> throws Error {
+  const rig = new Rig(80, 3)
+  rig.vehicle.noAck = true
+  let code = ""
+  try {
+    const _r = await rig.client.setCurrent(2)
+  } catch (e: MissionError) {
+    code = e.code
+  }
+  let code2 = ""
+  try {
+    await rig.client.setCurrentMessage(1)
+  } catch (e: MissionError) {
+    code2 = e.code
+  }
+  await delay(200)
+  const commands = rig.vehicle.commands
+  const messages = rig.vehicle.setCurrentMessages
+  rig.close()
+  expect(code).toBe("TIMEOUT")
+  expect(code2).toBe("TIMEOUT")
+  expect(commands).toBe(1)
+  expect(messages).toBe(1)
+}
+
+async function theCurrentItemIsSetByTheCommandOrByTheMessage(): Promise<void> throws Error {
+  const rig = new Rig()
+  const result = await rig.client.setCurrent(2)
+  const byCommand = rig.vehicle.current
+  await rig.client.setCurrentMessage(1)
+  const byMessage = rig.vehicle.current
+  const bad = await codeOf(rig.client.setCurrentMessage(70000))
+  rig.close()
+  expect(result).toBe(MavResult.ACCEPTED)
+  expect(byCommand).toBe(2)
+  expect(byMessage).toBe(1)
+  expect(bad).toBe("INVALID_VALUE")
+}
+
+async function theProgressSaysWhichItemTheVehicleIsOnAndWhichItReached(): Promise<void> throws Error {
+  const rig = new Rig()
+  const progress = new MissionProgress(rig.gcs, { system: 1, component: 1 })
+  const seen: string[] = []
+  progress.onCurrent = (current: int, total: int, state: int) => {
+    seen.push(`current ${current} of ${total} state ${state}`)
+  }
+  progress.onReached = (seq: int) => {
+    seen.push(`reached ${seq}`)
+  }
+  rig.vehicle.announce(1)
+  rig.vehicle.reach(1)
+  await delay(60)
+  progress.stop()
+  rig.vehicle.announce(2)
+  await delay(60)
+  rig.close()
+  expect(seen.join(",")).toBe("current 1 of 3 state 3,reached 1")
+  expect(progress.current).toBe(1)
+  expect(progress.reached).toBe(1)
+  expect(progress.state).toBe(3)
+}
+
+describe("the mission protocol", () => {
+  it("answers an upload request by request and reports its progress", anUploadIsAnsweredRequestByRequestAndReportsProgress)
+  it("refuses an empty upload (it is no clear) and sends nothing", anEmptyUploadIsRefusedAndSendsNothing)
+  it("downloads every item and ends with the ack", aDownloadReadsEveryItemAndEndsWithTheAck)
+  it("downloads nothing from an empty vehicle and acknowledges it", anEmptyDownloadIsEmptyAndAcknowledged)
+  it("keeps mission, fence and rally apart", theTypesAreKeptApart)
+  it("turns a refusal into an error that carries the vehicle's result", aRefusalIsAnErrorWithTheVehiclesResult)
+  it("asks again with the count when no request comes", aLostRequestIsAnsweredByTheCountSentAgain)
+  it("waits for the vehicle to ask again when a request is lost, and sends nothing it was not asked for", aLostRequestMidWayIsWaitedForNotAnsweredWithAnythingNew)
+  it("times out after the retries when the vehicle never answers", aVehicleThatNeverAnswersIsATimeoutAfterTheRetries)
+  it("answers a request asked twice by its seq, twice", aRequestAskedTwiceIsAnsweredTwiceBySeq)
+  it("answers a vehicle that asks with MISSION_REQUEST_INT as well as one that asks with MISSION_REQUEST", aVehicleThatAsksWithTheNewRequestIsAnsweredAsWell)
+  it("treats a request beyond the count as a protocol error", aRequestBeyondTheCountIsAProtocolError)
+  it("treats an accept before the last item as a protocol error", anAcceptBeforeTheLastItemIsAProtocolError)
+  it("asks again in a download for what does not come", aDownloadAsksAgainForWhatDoesNotCome)
+  it("refuses a count above the most it takes and asks for no item", aDownloadOfTooManyItemsAsksForNone)
+})
+
+describe("clearing and the other rules", () => {
+  it("sends a clear once and is done when it is acknowledged", aClearIsSentOnceAndAcknowledged)
+  it("never sends a clear again, and says it is not known whether it cleared", aClearThatIsNotAnsweredIsNeverSentAgainAndIsUnknown)
+  it("turns a refused clear into an error with the vehicle's result", aClearTheVehicleRefusesIsAnErrorWithItsResult)
+  it("is busy for a second transfer of the same type and sends nothing for it", aSecondTransferOfTheSameTypeIsBusyAndSendsNothing)
+  it("frees the type when a transfer ends in an error", theTypeIsFreeAgainWhenATransferEnds)
+  it("ends on a cancel and sends nothing more", aCancelEndsTheTransferAndSendsNothingMore)
+  it("refuses an item that cannot go on the wire before it sends anything", anItemThatCannotGoIsRefusedBeforeAnythingIsSent)
+  it("refuses a NaN, an infinity or a place off the globe before it sends the count", aNumberNoVehicleShouldGetIsRefusedBeforeTheCountIsSent)
+  it("leaves no reservation behind a refused clear of the type 255", aRefusedClearOfAllLeavesNoReservationBehind)
+  it("sets the current item once and never again when nothing answers", theCurrentItemIsSetOnceAndNeverAgain)
+  it("sets the current item by the command or by the message", theCurrentItemIsSetByTheCommandOrByTheMessage)
+  it("reports the current and the reached item until it is stopped", theProgressSaysWhichItemTheVehicleIsOnAndWhichItReached)
+  it("compares items by what travels, not by the current flag", () => {
+    const a = waypoint(52.0, 21.0)
+    const b = waypoint(52.0, 21.0)
+    b.current = 1
+    expect(sameItem(a, b)).toBe(true)
+    b.z = 21.0
+    expect(sameItem(a, b)).toBe(false)
+    const nan = waypoint(52.0, 21.0)
+    nan.param2 = 0.0 / 0.0
+    const nan2 = waypoint(52.0, 21.0)
+    nan2.param2 = 0.0 / 0.0
+    expect(sameItem(nan, nan2)).toBe(true)
+    expect(firstDifference([a, a], [a])).toBe(1)
+    expect(firstDifference([a, a], [a, waypoint(52.0, 21.0)])).toBe(-1)
+  })
+})
