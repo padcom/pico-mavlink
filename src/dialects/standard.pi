@@ -226,7 +226,7 @@ export class GlobalPositionInt extends MavLinkData {
     m.vy = readI16(payload, 22)
     m.vz = readI16(payload, 24)
     m.hdg = readU16(payload, 26)
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -242,7 +242,7 @@ export class GlobalPositionInt extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    GlobalPositionInt.INFO
+    return GlobalPositionInt.INFO
   }
 }
 
@@ -339,7 +339,7 @@ export class AutopilotVersion extends MavLinkData {
     for (let i = 0; i < 18; i++) {
       m.uid2.push(readU8(payload, 60 + i * 1))
     }
-    m
+    return m
   }
 
   public override encode(into: Uint8Array, at: int): void {
@@ -366,7 +366,7 @@ export class AutopilotVersion extends MavLinkData {
   }
 
   public override info(): MessageInfo {
-    AutopilotVersion.INFO
+    return AutopilotVersion.INFO
   }
 }
 

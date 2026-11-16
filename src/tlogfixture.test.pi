@@ -43,7 +43,7 @@ async function readFixture(chunk: int): Promise<Found> throws Error {
     }
     out.records.push(r!)
   }
-  out
+  return out
 }
 
 async function readsTheRecordingMavproxyWrote(): Promise<void> throws Error {
@@ -152,7 +152,7 @@ const TEXTS: string[] = [
 /// Whether a position (degrees) is "no position" (0, 0: the receiver has no fix yet) or within a degree of SITL's default home
 /// (-35.36, 149.16, near Canberra): a position anywhere else would be where somebody really was.
 function isSitlHomeOrNone(lat: f64, lon: f64): bool {
-  (lat == 0.0 && lon == 0.0) || (lat > -36.36 && lat < -34.36 && lon > 148.16 && lon < 150.16)
+  return (lat == 0.0 && lon == 0.0) || (lat > -36.36 && lat < -34.36 && lon > 148.16 && lon < 150.16)
 }
 
 /// The position (degrees E7: latitude, longitude) a record carries, or an empty list for a message that carries none. Every message of the
@@ -192,7 +192,7 @@ function positionOf(r: TlogRecord): int[] {
     const g = HomePosition.decode(p)
     return [g.latitude, g.longitude]
   }
-  []
+  return []
 }
 
 async function containsNothingThatIdentifiesAnybody(): Promise<void> throws Error {

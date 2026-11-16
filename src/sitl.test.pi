@@ -73,7 +73,7 @@ async function findBinary(): Promise<string?> throws Error {
       return `${dir}/arducopter`
     }
   }
-  null
+  return null
 }
 
 /// The default parameter files of the quad (`--defaults a,b`), if the build ships them. Builds such as Copter-4.7.2 carry no
@@ -93,7 +93,7 @@ async function defaultsFor(binary: string): Promise<string[]> throws Error {
       return [`${dir}/copter.parm`]
     }
   }
-  []
+  return []
 }
 
 /// Starts SITL and waits for its first heartbeat; null, with a line printed, when there is no SITL binary to start.
@@ -207,7 +207,7 @@ function agree(file: TypedParamValue, list: TypedParamValue): bool {
 /// Parameters the vehicle keeps up to date itself while it runs (the barometer's ground reference, its flight statistics): two
 /// downloads a moment apart can differ in them, whichever way they come.
 function movesByItself(id: string): bool {
-  id.indexOf("GND_PRESS") >= 0 || id.indexOf("GND_TEMP") >= 0 || id.startsWith("STAT_")
+  return id.indexOf("GND_PRESS") >= 0 || id.indexOf("GND_TEMP") >= 0 || id.startsWith("STAT_")
 }
 
 async function ftpGivesTheListFastAndTheSame(): Promise<void> throws Error {
@@ -285,7 +285,7 @@ async function disabledFtpFallsBackToTheList(): Promise<void> throws Error {
 
 /// One entry as a line: "name (dir|file, size, time)".
 function showEntry(e: FtpEntry): string {
-  `${e.name} (${if (e.directory) "dir" else "file"}, ${e.size}, ${if (e.time == null) "no time" else `${e.time!}`})`
+  return `${e.name} (${if (e.directory) "dir" else "file"}, ${e.size}, ${if (e.time == null) "no time" else `${e.time!}`})`
 }
 
 async function listsTheFileSystem(): Promise<void> throws Error {
@@ -341,7 +341,7 @@ class CollectSink implements FileSink, LogSink {
       }
       at += part.length
     }
-    out
+    return out
   }
 }
 
@@ -461,7 +461,7 @@ function watchFlight(s: Sitl): Flight {
       f.texts.push(m.text)
     }
   })
-  f
+  return f
 }
 
 /// The listing of a directory as one line, or why it failed.
@@ -655,7 +655,7 @@ function describeTlog(r: TlogReader): string {
   for (const id of p.byId.keys()) {
     ids.push(`${id}x${p.byId.get(id)}`)
   }
-  `${p.records} records (v1 ${p.v1}, v2 ${p.v2}, signed ${p.signed}), ids ${ids.join(" ")}, crc failures ${p.crcFailures}, unknown ${p.unknown}, ` +
+  return `${p.records} records (v1 ${p.v1}, v2 ${p.v2}, signed ${p.signed}), ids ${ids.join(" ")}, crc failures ${p.crcFailures}, unknown ${p.unknown}, ` +
     `skipped ${p.bytesSkipped} bytes, segments ${p.segments}, dated ${p.dated}, cutEnd ${p.cutEnd}`
 }
 
@@ -675,7 +675,7 @@ async function readTlogFile(path: string): Promise<TlogReader> throws Error {
     }
   }
   reader.finish()
-  reader
+  return reader
 }
 
 /// The link is recorded as a ground station would (a timestamp and the frame as it came), written to a file and read back: every
@@ -794,7 +794,7 @@ function calibrationTestsRun(): bool {
     println("SITL calibration test skipped: set SITL_FLIGHT=1 to run it")
     return false
   }
-  true
+  return true
 }
 
 /// Waits until the vehicle can calibrate, and returns what it says from then on (see `watchFlight`). SITL starts to boot when the link
@@ -806,7 +806,7 @@ async function afterBoot(s: Sitl, deadline: int): Promise<Flight> throws Error {
   const f = watchFlight(s)
   const up = await until(() => f.texts.indexOf("AHRS: EKF3 active") >= 0, 30, deadline)
   expect(up).toBe(true)
-  f
+  return f
 }
 
 /// Where SITL says its vehicle is turned (SIMSTATE, radians), kept up to date by the link.
@@ -825,7 +825,7 @@ function quaternionOf(roll: f64, pitch: f64, yaw: f64): f64[] {
   const sp = Math.sin(pitch / 2.0)
   const cy = Math.cos(yaw / 2.0)
   const sy = Math.sin(yaw / 2.0)
-  [cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy]
+  return [cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy]
 }
 
 /// Whether two quaternions are one turn (q and -q are).
@@ -836,7 +836,7 @@ function sameTurn(a: f64[], b: f64[]): bool {
     plus = Math.max(plus, Math.abs(a[i] - b[i]))
     minus = Math.max(minus, Math.abs(a[i] + b[i]))
   }
-  plus <= 0.01 || minus <= 0.01
+  return plus <= 0.01 || minus <= 0.01
 }
 
 /// The turn of the vehicle for each position the accelerometer calibration asks for, and the pulse widths that give it to SITL: SITL
@@ -855,7 +855,7 @@ function poseOf(position: int): f64[] {
 }
 
 function pulseOf(angle: f64): f64 {
-  1500.0 + Math.round(angle * 500.0 / Math.PI)
+  return 1500.0 + Math.round(angle * 500.0 / Math.PI)
 }
 
 /// Keeps SITL's turn (SIMSTATE, at 10 Hz) up to date in the pose it returns.
@@ -872,7 +872,7 @@ async function watchPose(s: Sitl): Promise<SimPose> throws Error {
   })
   const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
   expect(await cmd.setMessageInterval(SimState.MSG_ID, 100_000)).toBe(MavResult.ACCEPTED)
-  pose
+  return pose
 }
 
 /// Turns SITL's vehicle to `position` and waits until SIMSTATE says it has turned (five reports in a row).
@@ -1020,7 +1020,7 @@ function turnIsSpent(t: MagTurn, p: CompassProgress): bool {
   for (let i = 0; i < 8; i++) {
     anyMoving = anyMoving || (t.pct[i] >= 0 && !t.done[i] && !t.stuck[i])
   }
-  !anyMoving
+  return !anyMoving
 }
 
 /// Reads the vehicle's events and turns SITL's vehicle as they ask, until every compass that calibrates has a report (the reports are put in
@@ -1084,7 +1084,7 @@ async function turnThenAccept(s: Sitl, cal: CompassCalibration, cmd: CommandCall
   let top = 0
   await driveCompass(cal, cmd, pose, reports, 540, (p: CompassProgress) => {
     top = if (p.completionPct > top) p.completionPct else top
-    true
+    return true
   })
   println(`SITL compass calibration: ${reports.map((r) => `${r.compassId}:${CompassStatus.nameOf(r.status) ?? "?"} fitness ${r.fitness} ofs ${r.offsets.join(",")}`).join("; ")}; most complete ${top} %`)
   expect(reports.length > 0).toBe(true)
@@ -1134,7 +1134,7 @@ async function leaveAfterTwoProgress(cal: CompassCalibration, cmd: CommandCall, 
   const reports: CompassReport[] = []
   await driveCompass(cal, cmd, pose, reports, 120, (_p: CompassProgress) => {
     seen += 1
-    seen < 2
+    return seen < 2
   })
   expect(seen).toBe(2)
   expect(reports.length).toBe(0)
@@ -1241,7 +1241,7 @@ function motorTestsRun(): bool {
     println("SITL motor test skipped: set SITL_FLIGHT=1 to run it")
     return false
   }
-  true
+  return true
 }
 
 /// Waits until output `output` of the main port is above (`above`) or at most (`!above`) `pulse` µs, up to `seconds`.
@@ -1253,7 +1253,7 @@ async function outputIs(monitor: ServoMonitor, output: int, pulse: int, above: b
     }
     await delay(50)
   }
-  false
+  return false
 }
 
 /// The outputs (1 to 4, as digits in order, "" for none) of the main port that are more than 50 µs above `rest`.
@@ -1265,7 +1265,7 @@ async function spinning(monitor: ServoMonitor, rest: int): Promise<string> throw
       out = `${out}${output}`
     }
   }
-  out
+  return out
 }
 
 /// Waits (up to `seconds`) until exactly the outputs `which` spin, as `spinning` says.
@@ -1276,7 +1276,7 @@ async function spinsOnly(monitor: ServoMonitor, rest: int, which: string, second
     }
     await delay(50)
   }
-  false
+  return false
 }
 
 /// The motor test in ArduPilot itself: a motor spins at the throttle asked and shows in SERVO_OUTPUT_RAW, a stop (timeout 0) ends it at once,

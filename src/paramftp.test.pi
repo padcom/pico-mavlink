@@ -43,15 +43,15 @@ function many(count: int): SimParam[] {
     const p: SimParam = { id: `P${i % 90}_V${i}`, value }
     list.push(p)
   }
-  list
+  return list
 }
 
 function shown(p: Param): string {
-  `${p.index} ${p.id} ${showParam(p.value)}`
+  return `${p.index} ${p.id} ${showParam(p.value)}`
 }
 
 function ftpRequests(r: Rig): int {
-  r.sim.ftpLog.length
+  return r.sim.ftpLog.length
 }
 
 async function sameAsTheList(): Promise<void> throws Error {

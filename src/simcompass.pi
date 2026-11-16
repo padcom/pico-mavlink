@@ -76,7 +76,7 @@ export class SimCompass {
 
   /// Whether the compass `id` has its result kept (accepted, or saved by itself).
   public saved(id: int): bool {
-    id >= 0 && id < states.length && states[id].saved
+    return id >= 0 && id < states.length && states[id].saved
   }
 
   /// The status of compass `id` (`CompassStatus`).
@@ -86,7 +86,7 @@ export class SimCompass {
 
   /// The offsets the report of compass `id` gives (they are the same every time).
   public offsetsOf(id: int): f64[] {
-    [(id + 1) as f64 * 10.0, -5.0, 2.5]
+    return [(id + 1) as f64 * 10.0, -5.0, 2.5]
   }
 
   /// Handles one message; whether it was one of the compass calibration's.
@@ -112,7 +112,7 @@ export class SimCompass {
     } else {
       cancel(mask)
     }
-    true
+    return true
   }
 
   ack(command: int, result: int): void {
@@ -135,7 +135,7 @@ export class SimCompass {
 
   /// The compasses a mask names: 0 is all.
   names(mask: int, id: int): bool {
-    id < compasses && (mask == 0 || ((mask >> id) & 1) != 0)
+    return id < compasses && (mask == 0 || ((mask >> id) & 1) != 0)
   }
 
   begin(m: CommandLong, mask: int): void {
@@ -188,7 +188,7 @@ export class SimCompass {
         mask = mask | (1 << id)
       }
     }
-    mask
+    return mask
   }
 
   /// One step: each running compass reports its progress and moves on, each finished one is reported (until it is accepted).
@@ -240,7 +240,7 @@ export class SimCompass {
       }
       bytes.push(v as u8)
     }
-    bytes
+    return bytes
   }
 
   sendReport(id: int, s: SimCompassState): void {

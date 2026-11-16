@@ -64,7 +64,7 @@ function listIsAllZeroButParam1(p: f64[]): bool {
       ok = false
     }
   }
-  ok
+  return ok
 }
 
 function buildersSendMagicOnlyForTheEmergencyStop(): void {

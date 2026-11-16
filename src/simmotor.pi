@@ -64,7 +64,7 @@ export class SimMotors {
     if (motor != 0 && (Date.now() as int) >= endsAt) {
       motor = 0
     }
-    motor != 0
+    return motor != 0
   }
 
   /// The pulse (µs) of each of the 8 outputs of the main port: the first four are the motors.
@@ -73,7 +73,7 @@ export class SimMotors {
     if (running() && motor <= 4) {
       out[motor - 1] = 1000 + Math.round(throttle * 10.0) as int
     }
-    out
+    return out
   }
 
   /// Handles one message; whether it was a motor test.
@@ -85,7 +85,7 @@ export class SimMotors {
     if (mine(m.targetSystem as int, m.targetComponent as int)) {
       test(m)
     }
-    true
+    return true
   }
 
   say(text: string): void {
@@ -133,7 +133,7 @@ export class SimMotors {
     if (!landed) {
       return "Motor Test: vehicle not landed"
     }
-    ""
+    return ""
   }
 
   test(m: CommandLong): void {

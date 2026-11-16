@@ -109,7 +109,7 @@ export class SimLogs {
       }
     }
     out.sort()
-    out
+    return out
   }
 
   isArmed(): bool {
@@ -124,11 +124,11 @@ export class SimLogs {
 
   random(n: int): int {
     seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-    (seed >> 8) % n
+    return (seed >> 8) % n
   }
 
   lost(): bool {
-    loss > 0 && random(100) < loss
+    return loss > 0 && random(100) < loss
   }
 
   /// Whether a request is to be ignored: it is not for this vehicle, it is not enabled, silent, armed, or there is no heartbeat.
@@ -136,7 +136,7 @@ export class SimLogs {
     if (!enabled || silent || isArmed()) {
       return true
     }
-    heartbeatRule && (Date.now() as int) - lastHeartbeat > 3000
+    return heartbeatRule && (Date.now() as int) - lastHeartbeat > 3000
   }
 
   /// Handles one message; whether it was one of the log protocol's.
@@ -173,7 +173,7 @@ export class SimLogs {
       }
       return true
     }
-    false
+    return false
   }
 
   /// A listing: one LOG_ENTRY for each log from `start` to `end` (clamped as ArduPilot does), or the one entry of no logs.

@@ -71,7 +71,7 @@ export abstract class MavLinkProtocol {
 
   /// The signature of `frame`, if it's a signed MAVLink 2 frame.
   public virtual signature(frame: Uint8Array, header: MavLinkPacketHeader): MavLinkPacketSignature? {
-    null
+    return null
   }
 
   /// The message in `payload`, as `info` describes it.
@@ -84,7 +84,7 @@ export abstract class MavLinkProtocol {
   protected finish(frame: Uint8Array, magic: int): Uint8Array {
     const at = frame.length - CHECKSUM_LENGTH
     writeUint(frame, at, 2, x25crc(frame, 1, at, magic))
-    frame
+    return frame
   }
 }
 
@@ -101,15 +101,15 @@ export class MavLinkProtocolV1 extends MavLinkProtocol {
   }
 
   public override name(): string {
-    MavLinkProtocolV1.NAME
+    return MavLinkProtocolV1.NAME
   }
 
   public override startByte(): int {
-    MavLinkProtocolV1.START_BYTE
+    return MavLinkProtocolV1.START_BYTE
   }
 
   public override payloadOffset(): int {
-    MavLinkProtocolV1.PAYLOAD_OFFSET
+    return MavLinkProtocolV1.PAYLOAD_OFFSET
   }
 
   /// A v1 frame carries the base payload: extension fields are MAVLink 2 only (the MAVLink spec;
@@ -147,7 +147,7 @@ export class MavLinkProtocolV1 extends MavLinkProtocol {
     h.sysid = frame[3]
     h.compid = frame[4]
     h.msgid = frame[5]
-    h
+    return h
   }
 }
 
@@ -175,15 +175,15 @@ export class MavLinkProtocolV2 extends MavLinkProtocol {
   }
 
   public override name(): string {
-    MavLinkProtocolV2.NAME
+    return MavLinkProtocolV2.NAME
   }
 
   public override startByte(): int {
-    MavLinkProtocolV2.START_BYTE
+    return MavLinkProtocolV2.START_BYTE
   }
 
   public override payloadOffset(): int {
-    MavLinkProtocolV2.PAYLOAD_OFFSET
+    return MavLinkProtocolV2.PAYLOAD_OFFSET
   }
 
   public override serialize(message: MavLinkData, seq: int): Uint8Array throws MavLinkError {
@@ -219,7 +219,7 @@ export class MavLinkProtocolV2 extends MavLinkProtocol {
     s.setLinkId(linkId)
     s.setTimestamp((timestamp - MavLinkProtocolV2.SIGNATURE_START_TIME) * 100)
     s.setSignature(s.calculate(key))
-    signed
+    return signed
   }
 
   public override header(frame: Uint8Array, timestamp: int? = null): MavLinkPacketHeader throws MavLinkError {
@@ -236,7 +236,7 @@ export class MavLinkProtocolV2 extends MavLinkProtocol {
     h.sysid = frame[5]
     h.compid = frame[6]
     h.msgid = readUint(frame, 7, 3)
-    h
+    return h
   }
 
   public override signature(frame: Uint8Array, header: MavLinkPacketHeader): MavLinkPacketSignature? {
@@ -260,11 +260,11 @@ export class MavLinkPacketSignature {
   }
 
   get at(): int {
-    frame.length - SIGNATURE_LENGTH
+    return frame.length - SIGNATURE_LENGTH
   }
 
   public get linkId(): int {
-    frame[at]
+    return frame[at]
   }
 
   public setLinkId(value: int): void {
@@ -300,11 +300,11 @@ export class MavLinkPacketSignature {
 
   /// Whether the frame's signature is the one `key` makes.
   public matches(key: Uint8Array): bool {
-    hex(calculate(key)) == signature
+    return hex(calculate(key)) == signature
   }
 
   public toString(): string {
-    `linkid: ${linkId}, timestamp ${timestamp}, signature ${signature}`
+    return `linkid: ${linkId}, timestamp ${timestamp}, signature ${signature}`
   }
 }
 
@@ -314,7 +314,7 @@ function hex(b: Uint8Array): string {
   for (let i = 0; i < b.length; i++) {
     s += `${digits[b[i] >> 4]}${digits[b[i] & 0xF]}`
   }
-  s
+  return s
 }
 
 /// A parsed frame.
@@ -343,7 +343,7 @@ export class MavLinkPacket {
     crcBytes.set(1, crc)
     const crcHex = "0x" + hex(crcBytes)
     const sig = if (signature == null) "" else `, ${signature!.toString()}`
-    `Packet (proto: ${protocol.name()}, sysid: ${header.sysid}, compid: ${header.compid}, msgid: ${header.msgid}, seq: ${header.seq}, plen: ${header.payloadLength}, crc: ${crcHex}${sig})`
+    return `Packet (proto: ${protocol.name()}, sysid: ${header.sysid}, compid: ${header.compid}, msgid: ${header.msgid}, seq: ${header.seq}, plen: ${header.payloadLength}, crc: ${crcHex}${sig})`
   }
 }
 
@@ -355,7 +355,7 @@ export function protocolOf(startByte: int): MavLinkProtocol? {
   if (startByte == MavLinkProtocolV2.START_BYTE) {
     return new MavLinkProtocolV2()
   }
-  null
+  return null
 }
 
 /// node-mavlink's MavLinkPacketParser: a whole frame (as the splitter gives them) as a packet.

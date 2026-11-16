@@ -16,7 +16,7 @@ function heartbeat(): Heartbeat {
   const h = new Heartbeat()
   h.type = MavType.QUADROTOR as u8
   h.mavlinkVersion = 3
-  h
+  return h
 }
 
 /// The bytes of a list of numbers.
@@ -25,7 +25,7 @@ function bytesOf(list: int[]): Uint8Array {
   for (let i = 0; i < list.length; i++) {
     out.set(i, list[i])
   }
-  out
+  return out
 }
 
 /// What a reader found of a file fed in chunks.
@@ -63,7 +63,7 @@ function readAll(bytes: Uint8Array, chunk: int): Read {
     }
     out.records.push(r!)
   }
-  out
+  return out
 }
 
 /// The 8 bytes of a timestamp, then `rest`.
@@ -77,13 +77,13 @@ function stamped(timeUs: int, rest: int[]): Uint8Array {
   for (let i = 0; i < rest.length; i++) {
     out.set(8 + i, rest[i])
   }
-  out
+  return out
 }
 
 /// Every byte fed is in a record, in a skipped unknown frame, skipped as no record, or cut off at the end.
 function accounted(r: TlogReader): bool {
   const p = r.report
-  p.bytesFed == p.bytesInRecords + p.bytesUnknown + p.bytesSkipped + p.bytesCut + r.waiting
+  return p.bytesFed == p.bytesInRecords + p.bytesUnknown + p.bytesSkipped + p.bytesCut + r.waiting
 }
 
 /// A recording of three messages a second apart, as MAVLink 2 and then MAVLink 1.
@@ -92,7 +92,7 @@ function smallRecording(): TlogWriter {
   w.addMessage(T0, heartbeat(), 1, true, 1, 1)
   w.addMessage(T0 + SECOND, new SysStatus(), 2, true, 1, 1)
   w.addMessage(T0 + 2 * SECOND, new ParamValue(), 3, false, 1, 1)
-  w
+  return w
 }
 
 function roundTripsAtAnyChunkSize(): void {

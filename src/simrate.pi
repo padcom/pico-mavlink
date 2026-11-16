@@ -38,5 +38,5 @@ export function actualRate(ms: int): f64 {
   const wd = NATURAL_RAD_S * Math.sqrt(1.0 - DAMPING * DAMPING)
   const decay = Math.exp(-DAMPING * NATURAL_RAD_S * seconds)
   const step = 1.0 - decay * (Math.cos(wd * seconds) + (DAMPING / Math.sqrt(1.0 - DAMPING * DAMPING)) * Math.sin(wd * seconds))
-  before + (now - before) * step
+  return before + (now - before) * step
 }

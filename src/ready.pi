@@ -22,7 +22,7 @@ function saysUp(r: Received, target: Target, minUptimeMs: int): bool {
   if (m instanceof Attitude) {
     return m.timeBootMs as int >= minUptimeMs
   }
-  false
+  return false
 }
 
 /// Waits until the vehicle can be calibrated: true when it said it is up (or has been up for `minUptimeMs`), false when it did not in
@@ -31,5 +31,5 @@ function saysUp(r: Received, target: Target, minUptimeMs: int): bool {
 export async function waitUntilUp(conn: MavLinkConnection, vehicle: Target, timeoutMs: int = 30_000, signal: AbortSignal? = null,
   minUptimeMs: int = UP_AFTER_MS): Promise<bool> throws Error {
   const r = await conn.waitFor((r: Received) => saysUp(r, vehicle, minUptimeMs), timeoutMs, signal)
-  r != null
+  return r != null
 }

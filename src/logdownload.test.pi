@@ -59,7 +59,7 @@ class MemorySink implements FileSink {
         at += 1
       }
     }
-    out
+    return out
   }
 }
 
@@ -71,7 +71,7 @@ function content(n: int): Uint8Array {
     x = (x * 1103515245 + 12345) & 0x7FFFFFFF
     out.set(i, (x >> 16) & 0xFF)
   }
-  out
+  return out
 }
 
 function same(a: Uint8Array, b: Uint8Array): bool {
@@ -83,14 +83,14 @@ function same(a: Uint8Array, b: Uint8Array): bool {
       return false
     }
   }
-  true
+  return true
 }
 
 /// A vehicle with a log of `n` bytes.
 function withLog(n: int): Rig {
   const r = rig()
   r.sim.fsFiles.set(LOG, content(n))
-  r
+  return r
 }
 
 function crcMatchesTheBitByBitDefinition(): void {

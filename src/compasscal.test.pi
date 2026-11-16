@@ -43,7 +43,7 @@ function seeing(seen: Seen): (p: CompassProgress) => bool {
     seen.percents.push(p.completionPct)
     const lit = sectionsLit(p.completionMask)
     seen.lit = if (lit > seen.lit) lit else seen.lit
-    seen.stopAfter == 0 || seen.percents.length < seen.stopAfter
+    return seen.stopAfter == 0 || seen.percents.length < seen.stopAfter
   }
 }
 
@@ -160,7 +160,7 @@ async function saysSoWhenTheLinkIsGone(): Promise<void> throws Error {
       rig.sim.compass.mute = true
     }
     seen.percents.push(p.completionPct)
-    true
+    return true
   }, 60)
   rig.close()
   expect(run.reason).toBe("silent")

@@ -11,7 +11,7 @@ async function counts(chunk: int): Promise<string> throws Error {
   for (let i = 0; i < bytes.length; i += chunk) {
     packets += s.push(bytes.slice(i, if (i + chunk < bytes.length) i + chunk else bytes.length)).length
   }
-  `${packets} ${s.valid}/${s.invalid}/${s.unknown}`
+  return `${packets} ${s.valid}/${s.invalid}/${s.unknown}`
 }
 
 async function splitsTheCapture(): Promise<void> throws Error {

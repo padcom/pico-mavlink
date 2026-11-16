@@ -50,12 +50,12 @@ export const MAX_TAKEOFF_M: f64 = 1000.0
 
 /// The parameters of an arm (`arm` true) or a disarm: param2 is 0 (the pre-arm checks run, a flying vehicle refuses to disarm).
 export function armParams(arm: bool): f64[] {
-  [if (arm) 1.0 else 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  return [if (arm) 1.0 else 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 
 /// The parameters of the emergency stop: a disarm with the magic number that works in flight. The only list that has one.
 export function emergencyStopParams(): f64[] {
-  [0.0, MAGIC_FORCE_DISARM, 0.0, 0.0, 0.0, 0.0, 0.0]
+  return [0.0, MAGIC_FORCE_DISARM, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 
 /// The parameters of DO_SET_MODE to the Copter mode `mode`: base mode 1 (custom mode enabled).
@@ -63,17 +63,17 @@ export function modeParams(mode: int): f64[] throws MavLinkError {
   if (mode < 0 || mode > MAX_MODE) {
     throw new MavLinkError("INVALID_VALUE", `mode ${mode} is not 0 to ${MAX_MODE}`)
   }
-  [1.0, mode as f64, 0.0, 0.0, 0.0, 0.0, 0.0]
+  return [1.0, mode as f64, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 
 /// The parameters of DO_PAUSE_CONTINUE: 0 pauses, 1 continues.
 export function pauseParams(resume: bool): f64[] {
-  [if (resume) 1.0 else 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  return [if (resume) 1.0 else 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 
 /// The parameters of RUN_PREARM_CHECKS: none.
 export function prearmParams(): f64[] {
-  [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 
 /// The parameters of NAV_TAKEOFF to `altitude` metres above home: param3 0 (horizontal navigation required), param7 the altitude, no
@@ -82,7 +82,7 @@ export function takeoffParams(altitude: f64): f64[] throws MavLinkError {
   if (!(altitude > 0.0) || altitude > MAX_TAKEOFF_M) {
     throw new MavLinkError("INVALID_VALUE", `a takeoff altitude is above 0 and at most ${MAX_TAKEOFF_M} m, not ${altitude}`)
   }
-  [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, altitude]
+  return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, altitude]
 }
 
 /// What the vehicle said to a command.
@@ -102,19 +102,19 @@ export function resultName(result: int): string {
   if (result < 0) {
     return "UNACKNOWLEDGED"
   }
-  MavResult.nameOf(result) ?? `${result}`
+  return MavResult.nameOf(result) ?? `${result}`
 }
 
 /// The result of a command the vehicle answered with `result`.
 export function controlResult(result: int): ControlResult {
   const out: ControlResult = { acknowledged: true, result: result, accepted: result == MavResult.ACCEPTED, name: resultName(result) }
-  out
+  return out
 }
 
 /// The result of a command nothing acknowledged.
 export function unacknowledged(): ControlResult {
   const out: ControlResult = { acknowledged: false, result: -1, accepted: false, name: "UNACKNOWLEDGED" }
-  out
+  return out
 }
 
 /// Arming, modes and pause of a vehicle. `conn.run()` must be running. Every command is sent ONCE.

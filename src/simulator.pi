@@ -57,7 +57,7 @@ function slice(file: Uint8Array, at: int, n: int): Uint8Array {
   for (let i = 0; i < out.length; i++) {
     out.set(i, file[at + i])
   }
-  out
+  return out
 }
 
 /// How many parameters a packed parameter file says it holds (its header's `num_params`).
@@ -75,7 +75,7 @@ function parseNumber(text: string): int {
     }
     n = n * 10 + digit
   }
-  n
+  return n
 }
 
 /// One parameter of the simulated vehicle.
@@ -106,7 +106,7 @@ class FtpSession {
 export function defaultSimParams(): SimParam[] {
   const i32 = MavParamType.INT32
   const r32 = MavParamType.REAL32
-  [
+  return [
     { id: "ARMING_CHECK", value: TypedParamValue.Int(1, i32) },
     { id: "BATT_CAPACITY", value: TypedParamValue.Int(5200, i32) },
     { id: "BATT_LOW_VOLT", value: TypedParamValue.Real(10.5, r32) },
@@ -243,7 +243,7 @@ export class SimulatedAutopilot {
 
   /// Whether a request with this target is for this vehicle.
   forMe(system: int, component: int): bool {
-    (system == 0 || system == sysid) && (component == 0 || component == compid)
+    return (system == 0 || system == sysid) && (component == 0 || component == compid)
   }
 
   /// Starts answering and sending telemetry every `intervalMs`.
@@ -545,22 +545,22 @@ export class SimulatedAutopilot {
 
   /// How many FTP sessions are open.
   public openFtpSessions(): int {
-    ftpSessions.size
+    return ftpSessions.size
   }
 
   /// The next number of a seeded sequence (the same loss on every run).
   ftpRandom(n: int): int {
     ftpSeed = (ftpSeed * 1103515245 + 12345) & 0x7FFFFFFF
-    (ftpSeed >> 8) % n
+    return (ftpSeed >> 8) % n
   }
 
   /// Whether the next FTP packet is lost on its way out.
   ftpLost(): bool {
-    ftpLoss > 0 && ftpRandom(100) < ftpLoss
+    return ftpLoss > 0 && ftpRandom(100) < ftpLoss
   }
 
   ftpCacheKey(to: Target, session: int): string {
-    `${to.system}:${to.component}:${session}`
+    return `${to.system}:${to.component}:${session}`
   }
 
   forgetFtpReply(key: string): void {
@@ -911,7 +911,7 @@ export class SimulatedAutopilot {
       ftpNack(ask, FtpNack.FAIL_ERRNO, 22)
       return null
     }
-    s
+    return s
   }
 
   /// ReadFile: `size` bytes at `offset`. A size of 0 is a Nack EndOfFile (the vehicle reads nothing and says the file ended).
@@ -1031,7 +1031,7 @@ export class SimulatedAutopilot {
     if (ftpMode == "corrupt") {
       file.set(0, 0x00)
     }
-    file
+    return file
   }
 
   rounded(id: string, v: TypedParamValue): TypedParamValue {
@@ -1047,7 +1047,7 @@ export class SimulatedAutopilot {
         return i
       }
     }
-    -1
+    return -1
   }
 
   send(i: int): void {

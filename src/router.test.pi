@@ -191,7 +191,7 @@ async function pipe(from: ByteStream, to: ByteStream[]): Promise<void> throws Er
 }
 
 function paramsOfB(): SimParam[] {
-  [
+  return [
     { id: "FS_THR_ENABLE", value: TypedParamValue.Int(2, MavParamType.INT8) },
     { id: "RTL_ALT", value: TypedParamValue.Int(3000, MavParamType.INT32) },
     { id: "WPNAV_SPEED", value: TypedParamValue.Real(500.0, MavParamType.REAL32) },
@@ -288,7 +288,7 @@ function unique(seqs: int[]): bool {
       return false
     }
   }
-  true
+  return true
 }
 
 function heartbeatFrame(system: int, seq: int): Uint8Array {

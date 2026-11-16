@@ -54,7 +54,7 @@ class MemorySink implements LogSink {
 }
 
 function logOf(r: Rig, id: int): Uint8Array {
-  r.sim.fsFiles.get(`/logs/0000000${id}.BIN`) ?? new Uint8Array(0)
+  return r.sim.fsFiles.get(`/logs/0000000${id}.BIN`) ?? new Uint8Array(0)
 }
 
 function same(a: Uint8Array, b: Uint8Array): bool {
@@ -66,7 +66,7 @@ function same(a: Uint8Array, b: Uint8Array): bool {
       return false
     }
   }
-  true
+  return true
 }
 
 function client(r: Rig, options: LogProtocolOptions = FAST): LogProtocolClient {
@@ -80,7 +80,7 @@ async function listFails(c: LogProtocolClient): Promise<string> {
   } catch (e: LogProtocolError) {
     return e.code
   }
-  ""
+  return ""
 }
 
 async function downloadFails(c: LogProtocolClient, id: int, sink: LogSink, size: int): Promise<string> {
@@ -89,7 +89,7 @@ async function downloadFails(c: LogProtocolClient, id: int, sink: LogSink, size:
   } catch (e: LogProtocolError) {
     return e.code
   }
-  ""
+  return ""
 }
 
 async function eraseFails(c: LogProtocolClient): Promise<string> {
@@ -98,7 +98,7 @@ async function eraseFails(c: LogProtocolClient): Promise<string> {
   } catch (e: LogProtocolError) {
     return e.code
   }
-  ""
+  return ""
 }
 
 async function listsTheLogsWithTheirSizesAndTimes(): Promise<void> throws Error {
@@ -347,7 +347,7 @@ function logData(id: int, ofs: int, count: int): LogData {
   for (let i = 0; i < 90; i++) {
     p.data.push((i + 1) as u8)
   }
-  p
+  return p
 }
 
 /// Starts a download of log 1 from a vehicle that says nothing itself, sends what `packets` are, and gives the code it ends with.
@@ -427,7 +427,7 @@ async function anEraseThatIsVetoedSendsNothing(): Promise<void> throws Error {
   try {
     await client(r).erase((logs: LogInfo[]) => {
       seen[0] = logs.length
-      true
+      return true
     })
   } catch (e: LogProtocolError) {
     code = e.code

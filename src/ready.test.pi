@@ -10,7 +10,7 @@ import { StatusText } from "./dialects/common"
 function text(words: string): StatusText {
   const s = new StatusText()
   s.text = words
-  s
+  return s
 }
 
 async function endsWhenAhrsIsActive(): Promise<void> throws Error {

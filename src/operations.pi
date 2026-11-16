@@ -16,7 +16,7 @@ export struct Target {
 }
 
 function from(r: Received, t: Target): bool {
-  r.packet.header.sysid == t.system && (t.component == 0 || r.packet.header.compid == t.component)
+  return r.packet.header.sysid == t.system && (t.component == 0 || r.packet.header.compid == t.component)
 }
 
 /// Sends HEARTBEAT every `intervalMs` (1 s by default) as a ground station, so autopilots know
@@ -149,7 +149,7 @@ function checkAborted(signal: AbortSignal?, what: string): void throws MavLinkEr
 
 function paramOf(m: ParamValue, encoding: ParamEncoding): Param {
   const p: Param = { id: m.paramId, index: m.paramIndex as int, value: decodeParam(m.paramValue, m.paramType as int, encoding) }
-  p
+  return p
 }
 
 /// Downloads the whole parameter list: PARAM_REQUEST_LIST, then PARAM_REQUEST_READ by index for
@@ -199,7 +199,7 @@ export class ParamList {
     }
     const gone = missing()
     const result: ParamListResult = { params, count: if (count < 0) 0 else count, missing: gone, complete: count >= 0 && gone.length == 0 }
-    result
+    return result
   }
 
   /// The request for the list, and the requests for what did not arrive, a few rounds.
@@ -264,7 +264,7 @@ export class ParamList {
         out.push(i)
       }
     }
-    out
+    return out
   }
 
   /// Until nothing arrived for `quietMs`, or everything has.
@@ -328,7 +328,7 @@ function isValueOf(r: Received, target: Target, id: string): bool {
   if (m instanceof ParamValue) {
     return from(r, target) && m.paramId == id
   }
-  false
+  return false
 }
 
 /// What a PARAM_SET came back as.
@@ -437,13 +437,13 @@ export class AutopilotVersionRead {
       }
     }
     checkAborted(signal, "AUTOPILOT_VERSION")
-    null
+    return null
   }
 }
 
 function isVersionFrom(r: Received, target: Target): bool {
   const m = r.message
-  (m instanceof AutopilotVersion) && from(r, target)
+  return (m instanceof AutopilotVersion) && from(r, target)
 }
 
 /// Sends a COMMAND_LONG and waits for its COMMAND_ACK, asking again (with the confirmation number
@@ -510,7 +510,7 @@ export class CommandCall {
 
 function inProgress(r: Received): bool {
   const m = r.message
-  m instanceof CommandAck && m.result as int == MavResult.IN_PROGRESS
+  return m instanceof CommandAck && m.result as int == MavResult.IN_PROGRESS
 }
 
 function isAckOf(r: Received, target: Target, command: int): bool {
@@ -518,5 +518,5 @@ function isAckOf(r: Received, target: Target, command: int): bool {
   if (m instanceof CommandAck) {
     return from(r, target) && m.command as int == command
   }
-  false
+  return false
 }
