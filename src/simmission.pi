@@ -23,7 +23,7 @@
 // `running`, `setCurrents` (how many DO_SET_MISSION_CURRENT commands came: to check that none was sent twice). Faults: `refuse` (a count is answered
 // with this MAV_MISSION_RESULT), `deaf` (nothing is answered), `swallowAcks` (a number of the next acks, of an upload or a clear, are not sent).
 import { MavLinkConnection, Received } from "./connection"
-import { MissionItem } from "./mission"
+import { MissionEntry } from "./mission"
 import {
   CommandAck,
   CommandLong,
@@ -60,7 +60,7 @@ export class SimMissions {
   readonly homeLon: () => int
   readonly homeAmsl: () => f64
   /// What the vehicle holds, by type: the items after home for the MISSION type (home is added when it is read), all of them for the others.
-  readonly stored: Map<int, MissionItem[]> = new Map<int, MissionItem[]>()
+  readonly stored: Map<int, MissionEntry[]> = new Map<int, MissionEntry[]>()
   /// The most items of each type it takes (what SITL says), the home of a mission included.
   public maxMission: int = 650
   public maxFence: int = 70
@@ -116,12 +116,12 @@ export class SimMissions {
   }
 
   /// The items of `type` as the vehicle has them: for the MISSION type home first (the vehicle's own), then what was uploaded.
-  public held(type: int): MissionItem[] {
+  public held(type: int): MissionEntry[] {
     const own = stored.get(type) ?? []
     if (type != MavMissionType.MISSION) {
       return own
     }
-    const out: MissionItem[] = [homeItem()]
+    const out: MissionEntry[] = [homeItem()]
     for (const item of own) {
       out.push(item)
     }
@@ -129,16 +129,16 @@ export class SimMissions {
   }
 
   /// Puts `items` (home not among them) in the vehicle as the `type`, as if they had been uploaded (a test's starting point).
-  public put(type: int, items: MissionItem[]): void {
+  public put(type: int, items: MissionEntry[]): void {
     stored.set(type, items)
   }
 
   /// The home item: where the vehicle's home is, above sea level.
-  public homeItem(): MissionItem {
+  public homeItem(): MissionEntry {
     const lat = homeLat
     const lon = homeLon
     const amsl = homeAmsl
-    const item = new MissionItem(MavCmd.NAV_WAYPOINT, MavFrame.GLOBAL, lat(), lon(), amsl() as f32)
+    const item = new MissionEntry(MavCmd.NAV_WAYPOINT, MavFrame.GLOBAL, lat(), lon(), amsl() as f32)
     item.autocontinue = 1
     return item
   }
@@ -254,7 +254,7 @@ export class SimMissions {
     const own = stored.get(type) ?? []
     const keep = if (type == MavMissionType.MISSION) (if (n > 0) n - 1 else 0) else n
     if (keep < own.length) {
-      const kept: MissionItem[] = []
+      const kept: MissionEntry[] = []
       for (let i = 0; i < keep; i++) {
         kept.push(own[i])
       }
@@ -321,8 +321,8 @@ export class SimMissions {
   }
 
   /// The item as the vehicle writes it: the fence's and the rally's lose their `autocontinue`.
-  itemFrom(m: MissionItemInt, type: int): MissionItem {
-    const it = new MissionItem(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
+  itemFrom(m: MissionItemInt, type: int): MissionEntry {
+    const it = new MissionEntry(m.command as int, m.frame as int, m.x as int, m.y as int, m.z)
     it.param1 = m.param1
     it.param2 = m.param2
     it.param3 = m.param3

@@ -61,7 +61,7 @@ Status: **in development (MV1).**
   has no answer for 255)
   with MISSION_COUNT / MISSION_REQUEST_INT / MISSION_ITEM_INT / MISSION_ACK only, `setCurrent` (`MAV_CMD_DO_SET_MISSION_CURRENT`) and `setCurrentMessage` (both SENT ONCE: a
   vehicle in AUTO flies to that item, so a resend after a lost ack would send it back; no answer is a `TIMEOUT`, not known), and
-  `MissionProgress` reports MISSION_CURRENT and MISSION_ITEM_REACHED. Items are what is on the wire (`MissionItem`; for the MISSION type item 0 is the home position
+  `MissionProgress` reports MISSION_CURRENT and MISSION_ITEM_REACHED. Items are what is on the wire (`MissionEntry`; for the MISSION type item 0 is the home position
   and counts: nothing adds or strips it); `sameItem`/`firstDifference` compare what travels (every field but `current`). A request is answered by its seq; an upload that
   goes quiet sends its count again (before the first request only, then it waits: the vehicle asks again by itself); **a clear is sent ONCE, never again**, and
   without an answer the error says that it is not known whether it cleared. One transfer at a time per type (`BUSY`), a cancel (`AbortSignal`), a bounded wait

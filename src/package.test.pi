@@ -1,12 +1,15 @@
 // The package's entry point exports what an application needs, dialects included.
 import { describe, it, expect } from "std/test"
-import { ArdupilotmegaSimState, Heartbeat, MavLinkProtocolV2, MavType, SimState, commonRegistry } from "../index"
+import { ArdupilotmegaSimState, Heartbeat, MavLinkProtocolV2, MavType, MissionEntry, MissionItem, SimState, commonRegistry } from "../index"
 
 function exportsEverything(): void {
   expect(new MavLinkProtocolV2().serialize(new Heartbeat(), 0)[0]).toBe(0xFD)
   expect(MavType.nameOf(MavType.QUADROTOR) ?? "?").toBe("QUADROTOR")
   expect(`${SimState.MSG_NAME} ${ArdupilotmegaSimState.MSG_NAME}`).toBe("SIM_STATE SIMSTATE")
   expect(commonRegistry.get(22)!.name).toBe("PARAM_VALUE")
+  // the mission client's item is its own class with its own constructor; `MissionItem` is the dialect's MISSION_ITEM message, as the name says
+  expect(new MissionEntry(16, 3, 1, 2, 3.0).command).toBe(16)
+  expect(MissionItem.MSG_NAME).toBe("MISSION_ITEM")
 }
 
 describe("index.pi", () => {

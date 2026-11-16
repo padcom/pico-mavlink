@@ -5,7 +5,7 @@ import { delay } from "std/timers"
 import { MavLinkConnection, Received } from "./connection"
 import { MemoryStream } from "./stream"
 import { SimulatedAutopilot } from "./simulator"
-import { MissionClient, MissionError, MissionItem, MissionProgress, firstDifference } from "./mission"
+import { MissionClient, MissionError, MissionEntry, MissionProgress, firstDifference } from "./mission"
 import { MavLinkProtocolV2 } from "./protocol"
 import { MavFrame, MavMissionResult, MavMissionType, MavResult, MissionAck, MissionClearAll, MissionCount, MissionItemInt, MissionRequest, MissionRequestInt } from "./dialects/common"
 
@@ -39,13 +39,13 @@ class Rig {
   }
 }
 
-function waypoint(lat: f64, lon: f64, alt: f32): MissionItem {
-  return new MissionItem(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, alt)
+function waypoint(lat: f64, lon: f64, alt: f32): MissionEntry {
+  return new MissionEntry(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, alt)
 }
 
 /// Home (what is sent for item 0 is replaced by the vehicle's own), a takeoff and two waypoints.
-function fourItems(): MissionItem[] {
-  return [waypoint(0.0, 0.0, 0.0), new MissionItem(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), waypoint(52.23, 21.01, 20.0), waypoint(52.24, 21.02, 25.0)]
+function fourItems(): MissionEntry[] {
+  return [waypoint(0.0, 0.0, 0.0), new MissionEntry(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), waypoint(52.23, 21.01, 20.0), waypoint(52.24, 21.02, 25.0)]
 }
 
 async function codeOf(work: Promise<void, Error>): Promise<string> {
@@ -88,14 +88,14 @@ async function anUploadIsAskedForWithTheOldRequestAndItsFirstItemBecomesHome(): 
 async function aFenceAndARallyPointKeepTheirOwnTypeAndLoseTheirAutocontinue(): Promise<void> throws Error {
   const rig = new Rig()
   const polygon = [
-    new MissionItem(5001, MavFrame.GLOBAL, 521000000, 211000000, 0.0),
-    new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211000000, 0.0),
-    new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211010000, 0.0),
+    new MissionEntry(5001, MavFrame.GLOBAL, 521000000, 211000000, 0.0),
+    new MissionEntry(5001, MavFrame.GLOBAL, 521010000, 211000000, 0.0),
+    new MissionEntry(5001, MavFrame.GLOBAL, 521010000, 211010000, 0.0),
   ]
   for (const v of polygon) {
     v.param1 = 3.0
   }
-  const rally = [new MissionItem(5100, MavFrame.GLOBAL_RELATIVE_ALT_INT, 521000000, 211000000, 30.0)]
+  const rally = [new MissionEntry(5100, MavFrame.GLOBAL_RELATIVE_ALT_INT, 521000000, 211000000, 30.0)]
   await rig.client.upload(polygon, MavMissionType.FENCE)
   await rig.client.upload(rally, MavMissionType.RALLY)
   const fence = await rig.client.download(MavMissionType.FENCE)
@@ -290,7 +290,7 @@ async function anItemWithCurrent2Or3IsAnOrderToTheVehicleAndNeverStored(): Promi
 }
 
 /// The MISSION_ITEM_INT of `item` as `seq` with the given `current`.
-function itemOf(item: MissionItem, seq: int, current: int): MissionItemInt {
+function itemOf(item: MissionEntry, seq: int, current: int): MissionItemInt {
   const m = new MissionItemInt()
   m.targetSystem = 1
   m.targetComponent = 1
