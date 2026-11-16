@@ -15,7 +15,8 @@ import { MavLinkConnection, Received } from "./connection"
 import { TcpStream } from "./stream"
 import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
 import { Heartbeat } from "./dialects/minimal"
-import { MavCmd, MavParamType, MavResult, RequestDataStream, StatusText } from "./dialects/common"
+import { MavCmd, MavFrame, MavMissionType, MavParamType, MavResult, MissionAck, MissionCount, MissionItemInt, MissionRequest, MissionRequestInt, RequestDataStream, StatusText } from "./dialects/common"
+import { MissionClient, MissionError, MissionItem, firstDifference, missionResultName } from "./mission"
 import { AccelCalKind, AccelPosition, Calibration } from "./accelcal"
 import { CompassCalibration, CompassProgress, CompassReport, CompassStatus } from "./compasscal"
 import { MotorTest } from "./motortest"
@@ -1466,7 +1467,207 @@ async function guidedControlMovesTheRealVehicle(): Promise<void> throws Error {
   }
 }
 
+/// What the vehicle answers to a MISSION_COUNT of `n` items of `type`, as one word: `REQUEST 0` (it takes the count), or the result of its
+/// MISSION_ACK (`NO_SPACE` ...), or `SILENT`. A count that was taken is ended with a count of 0 (which clears the type again).
+async function whatACountDraws(s: Sitl, n: int, type: int): Promise<string> throws Error {
+  const reply = s.conn.waitFor((r: Received) => r.packet.header.sysid == s.target.system && (r.message instanceof MissionRequest || r.message instanceof MissionRequestInt || r.message instanceof MissionAck), 2000)
+  const m = new MissionCount()
+  m.targetSystem = s.target.system as u8
+  m.targetComponent = s.target.component as u8
+  m.count = n as u16
+  m.missionType = type as u8
+  await s.conn.send(m)
+  const r = await reply
+  let word = "SILENT"
+  if (r != null) {
+    const got = r!.message
+    if (got instanceof MissionRequest) {
+      word = `REQUEST ${got.seq}`
+    } else if (got instanceof MissionRequestInt) {
+      word = `REQUEST_INT ${got.seq}`
+    } else if (got instanceof MissionAck) {
+      word = missionResultName(got.type as int)
+    }
+  }
+  if (word.startsWith("REQUEST")) {
+    const end = new MissionCount()
+    end.targetSystem = s.target.system as u8
+    end.targetComponent = s.target.component as u8
+    end.count = 0
+    end.missionType = type as u8
+    const ended = s.conn.waitFor((r2: Received) => r2.packet.header.sysid == s.target.system && r2.message instanceof MissionAck, 2000)
+    await s.conn.send(end)
+    await ended
+  }
+  return word
+}
+
+/// The most items of `type` the vehicle takes: the greatest count it does not answer with NO_SPACE (the least, which it takes, is 1).
+async function mostItemsTaken(s: Sitl, type: int): Promise<int> throws Error {
+  let low = 1
+  let high = 65535
+  if ((await whatACountDraws(s, high, type)).startsWith("REQUEST")) {
+    return high
+  }
+  while (high - low > 1) {
+    const mid = (low + high) / 2
+    if ((await whatACountDraws(s, mid, type)).startsWith("REQUEST")) {
+      low = mid
+    } else {
+      high = mid
+    }
+  }
+  return low
+}
+
+/// Whether `r` is the vehicle asking for item `seq` (the old MISSION_REQUEST).
+function isRequestFor(r: Received, seq: int): bool {
+  const m = r.message
+  if (m instanceof MissionRequest) {
+    return m.seq as int == seq
+  }
+  return false
+}
+
+/// The result of a MISSION_ACK, in a word.
+function ackWord(r: Received?): string {
+  if (r == null) {
+    return "no answer"
+  }
+  const m = r!.message
+  if (m instanceof MissionAck) {
+    return missionResultName(m.type as int)
+  }
+  return "not an ack"
+}
+
+/// `item` as the MISSION_ITEM_INT of `seq` for the vehicle.
+function aMissionItemOf(s: Sitl, item: MissionItem, seq: int): MissionItemInt {
+  const m = new MissionItemInt()
+  m.targetSystem = s.target.system as u8
+  m.targetComponent = s.target.component as u8
+  m.seq = seq as u16
+  m.frame = item.frame as u8
+  m.command = item.command as u16
+  m.autocontinue = item.autocontinue as u8
+  m.x = item.x as i32
+  m.y = item.y as i32
+  m.z = item.z
+  m.missionType = 0
+  return m
+}
+
+/// A waypoint at (lat, lon) degrees, `alt` m above home.
+function aWaypoint(lat: f64, lon: f64, alt: f32): MissionItem {
+  return new MissionItem(16, MavFrame.GLOBAL_RELATIVE_ALT_INT, (lat * 10000000.0) as int, (lon * 10000000.0) as int, alt)
+}
+
+/// THE SPIKE of the mission protocol (a test, not a feature; no flight needed): what ArduCopter does with an upload, a download, a clear,
+/// a transfer started during another, and how many items it takes. What it finds is printed and the facts the library relies on are
+/// asserted. The vehicle is on the ground and disarmed.
+async function missionProtocolOnTheRealVehicle(): Promise<void> throws Error {
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  try {
+    const client = new MissionClient(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    const f = watchFlight(s)
+    // (a vehicle that has only just started has no storage for a mission yet: it answers every count with NO_SPACE and "Only 0 items are
+    // supported" until it is ready, about 15 s in)
+    await delay(20000)
+    println(`SPIKE mission before any upload: ${(await client.download()).length} items`)
+    for (const n of [1, 3, 10, 100, 700]) {
+      println(`SPIKE a count of ${n} draws: ${await whatACountDraws(s, n, MavMissionType.MISSION)}`)
+    }
+    println(`SPIKE vehicle says: ${f.texts.join(" | ")}`)
+    // item 0 is the home position: what comes back for it?
+    const sent = [aWaypoint(52.1, 21.1, 0.0), new MissionItem(22, MavFrame.GLOBAL_RELATIVE_ALT_INT, 0, 0, 10.0), aWaypoint(52.2, 21.2, 20.0)]
+    sent[2].param1 = 3.0
+    await client.upload(sent)
+    const back = await client.download()
+    println(`SPIKE mission uploaded 3, downloaded ${back.length}; first difference at ${firstDifference(sent, back)}`)
+    for (let i = 0; i < back.length; i++) {
+      const b = back[i]
+      println(`SPIKE item ${i}: cmd ${b.command} frame ${b.frame} p1 ${b.param1} x ${b.x} y ${b.y} z ${b.z} autocontinue ${b.autocontinue} current ${b.current}`)
+    }
+    expect(back.length).toBe(3)
+    println(`SPIKE most mission items taken: ${await mostItemsTaken(s, MavMissionType.MISSION)}`)
+    println(`SPIKE most fence items taken: ${await mostItemsTaken(s, MavMissionType.FENCE)}`)
+    println(`SPIKE most rally items taken: ${await mostItemsTaken(s, MavMissionType.RALLY)}`)
+    // the mission itself was ended by the probe (count 0 clears it): upload again for the next questions
+    await client.upload(sent)
+    // a download during an upload
+    const probe = await whatACountDraws(s, 5, MavMissionType.MISSION)
+    println(`SPIKE count of 5 draws: ${probe}`)
+    const during = new MissionCount()
+    during.targetSystem = s.target.system as u8
+    during.targetComponent = s.target.component as u8
+    during.count = 5
+    during.missionType = 0
+    const first = s.conn.waitFor((r: Received) => r.message instanceof MissionRequest, 2000)
+    await s.conn.send(during)
+    println(`SPIKE upload started: ${(await first) != null}`)
+    let denied = "none"
+    try {
+      const _x = await client.download()
+    } catch (e: MissionError) {
+      denied = `${e.code}`
+    }
+    println(`SPIKE download during an upload: ${denied}`)
+    expect(denied).toBe("DENIED")
+    // the upload again while the first goes: a restart
+    const restarted = s.conn.waitFor((r: Received) => r.message instanceof MissionRequest, 2000)
+    await s.conn.send(during)
+    println(`SPIKE a repeated count is a restart (it asks again): ${(await restarted) != null}`)
+    // an item sent twice: the second is not the one the vehicle asked for
+    const one = s.conn.waitFor((r: Received) => isRequestFor(r, 1), 2000)
+    const dup = aMissionItemOf(s, aWaypoint(52.1, 21.1, 0.0), 0)
+    await s.conn.send(dup)
+    println(`SPIKE after item 0 the vehicle asks for item 1: ${(await one) != null}`)
+    const answered = s.conn.waitFor((r: Received) => r.message instanceof MissionAck, 2000)
+    await s.conn.send(dup)
+    const dupAck = await answered
+    println(`SPIKE item 0 sent again: ${ackWord(dupAck)}`)
+    expect(ackWord(dupAck)).toBe("INVALID_SEQUENCE")
+    const again = s.conn.waitFor((r: Received) => r.message instanceof MissionRequest, 3000)
+    println(`SPIKE the vehicle asks again for the item it wants (within 3 s): ${(await again) != null}`)
+    // ended by the count of 0
+    await client.upload([])
+    // fence and rally
+    // a polygon of three vertices (param1 is the number of vertices)
+    const fence = [
+      new MissionItem(5001, MavFrame.GLOBAL, 521000000, 211000000, 0.0),
+      new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211000000, 0.0),
+      new MissionItem(5001, MavFrame.GLOBAL, 521010000, 211010000, 0.0),
+    ]
+    for (const v of fence) {
+      v.param1 = 3.0
+    }
+    const rally = [new MissionItem(5100, MavFrame.GLOBAL_RELATIVE_ALT_INT, 521000000, 211000000, 30.0)]
+    for (const t of [MavMissionType.FENCE, MavMissionType.RALLY]) {
+      try {
+        await client.upload(if (t == MavMissionType.FENCE) fence else rally, t)
+        const got = await client.download(t)
+        println(`SPIKE type ${t}: uploaded ${if (t == MavMissionType.FENCE) fence.length else rally.length}, downloaded ${got.length}, first difference ${firstDifference(if (t == MavMissionType.FENCE) fence else rally, got)}`)
+        for (const g of got) {
+          println(`SPIKE   type ${t} item: cmd ${g.command} frame ${g.frame} p1 ${g.param1} p2 ${g.param2} x ${g.x} y ${g.y} z ${g.z} autocontinue ${g.autocontinue}`)
+        }
+      } catch (e: MissionError) {
+        println(`SPIKE type ${t}: ${e.code} ${e.message}`)
+      }
+    }
+    // clear, disarmed: accepted
+    await client.clear()
+    println(`SPIKE clear on the ground: mission has ${(await client.download()).length} items`)
+  } finally {
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
+  it("speaks the mission protocol: upload, download, clear, the count it takes, the transfer it denies", missionProtocolOnTheRealVehicle)
   it("flies to a reposition, changes altitude, speed and home, in GUIDED only (SITL_FLIGHT=1 or the file .sitl-guided)", guidedControlMovesTheRealVehicle)
   it("spins a motor, shows it in SERVO_OUTPUT_RAW, and stops it at once and on release (SITL_FLIGHT=1)", spinsAMotorAndStopsItAtOnce)
   it("accepts the motor test while armed: the refusal is the ground station's (SITL_FLIGHT=1)", acceptsTheMotorTestWhileArmed)

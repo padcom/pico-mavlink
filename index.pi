@@ -141,6 +141,18 @@ export {
   MotorTest,
 } from "./src/motortest"
 export {
+  MISSION_DEFAULT_MAX_ITEMS,
+  MISSION_MAX_COUNT,
+  MissionClient,
+  MissionError,
+  MissionItem,
+  MissionOptions,
+  MissionProgress,
+  firstDifference,
+  missionResultName,
+  sameItem,
+} from "./src/mission"
+export {
   ControlResult,
   MAGIC_FORCE_DISARM,
   MAGIC_SKIP_CHECKS,
