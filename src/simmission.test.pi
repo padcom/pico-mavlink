@@ -6,14 +6,15 @@ import { MavLinkConnection, Received } from "./connection"
 import { MemoryStream } from "./stream"
 import { SimulatedAutopilot } from "./simulator"
 import { MissionClient, MissionError, MissionItem, MissionProgress, firstDifference } from "./mission"
-import { MavFrame, MavMissionResult, MavMissionType, MavResult, MissionAck, MissionClearAll, MissionCount, MissionRequest } from "./dialects/common"
+import { MavLinkProtocolV2 } from "./protocol"
+import { MavFrame, MavMissionResult, MavMissionType, MavResult, MissionAck, MissionClearAll, MissionCount, MissionItemInt, MissionRequest, MissionRequestInt } from "./dialects/common"
 
 class Rig {
   public readonly sim: SimulatedAutopilot
   public readonly gcs: MavLinkConnection
   public readonly client: MissionClient
   /// What the vehicle sent the ground station, as "REQUEST 1" (the old request) and "ACK 14" (a MISSION_ACK's result).
-  public readonly heard: string[] = []
+  public heard: string[] = []
 
   constructor() {
     const ends = MemoryStream.pair()
@@ -75,7 +76,7 @@ async function anUploadIsAskedForWithTheOldRequestAndItsFirstItemBecomesHome(): 
   await rig.client.upload(fourItems())
   const got = await rig.client.download()
   rig.close()
-  expect(rig.heard.filter((h: string) => h.startsWith("REQUEST")).join(",")).toBe("REQUEST 1,REQUEST 2,REQUEST 3")
+  expect(rig.heard.filter((h: string) => h.startsWith("REQUEST")).join(",")).toBe("REQUEST 0,REQUEST 1,REQUEST 2,REQUEST 3")
   expect(got.length).toBe(4)
   // the vehicle's own home, not what was sent for item 0
   expect(got[0].x).toBe(rig.sim.control.homeLat)
@@ -152,9 +153,9 @@ async function aDownloadDuringAnUploadIsDeniedAndTheVehicleAsksAgain(): Promise<
   await rig.gcs.send(count)
   await delay(60)
   const denied = await codeOf(downloadOnly(rig.client))
-  // (no item is sent: the vehicle asks again for item 1 by itself)
+  // (no item is sent: the vehicle asks again for item 0 by itself)
   await delay(300)
-  const asks = rig.heard.filter((h: string) => h == "REQUEST 1").length
+  const asks = rig.heard.filter((h: string) => h == "REQUEST 0").length
   rig.close()
   expect(denied).toBe("DENIED")
   expect(asks >= 2).toBe(true)
@@ -254,6 +255,131 @@ async function theCurrentItemIsSetOnceAndAnItemThatIsNotThereIsFailed(): Promise
   expect(byMessage).toBe(2)
 }
 
+async function anItemWithCurrent2Or3IsAnOrderToTheVehicleAndNeverStored(): Promise<void> throws Error {
+  // the client does not send one at all (it would be taken for an order to a vehicle that flies its mission)
+  const rig = new Rig()
+  const flagged = fourItems()
+  flagged[2].current = 2
+  const refused = await codeOf(rig.client.upload(flagged))
+  const counts = rig.sim.missions.counts
+  // the vehicle: an item of `current` 2 is a go-to (ERROR out of GUIDED), 3 a change of altitude (ACCEPTED); neither is stored, and neither
+  // touches an upload that is under way
+  await rig.client.upload(fourItems())
+  const count = new MissionCount()
+  count.targetSystem = 1
+  count.targetComponent = 1
+  count.count = 3
+  count.missionType = 0
+  await rig.gcs.send(count)
+  await delay(60)
+  await rig.gcs.send(itemOf(waypoint(52.0, 21.0, 30.0), 0, 2))
+  await rig.gcs.send(itemOf(waypoint(52.0, 21.0, 40.0), 0, 3))
+  await delay(100)
+  const heard = rig.heard.slice(rig.heard.length - 2, rig.heard.length).join(",")
+  const missions = rig.sim.missions
+  const stored = missions.held(MavMissionType.MISSION).length
+  rig.close()
+  expect(refused).toBe("INVALID_VALUE")
+  expect(counts).toBe(0)
+  expect(heard).toBe(`ACK ${MavMissionResult.ERROR},ACK ${MavMissionResult.ACCEPTED}`)
+  expect(missions.guidedItems).toBe(1)
+  expect(missions.altitudeItems).toBe(1)
+  // (the upload is still waiting for item 0: nothing was stored by the two)
+  expect(stored).toBe(3)
+  expect(missions.receiving).toBe(0)
+}
+
+/// The MISSION_ITEM_INT of `item` as `seq` with the given `current`.
+function itemOf(item: MissionItem, seq: int, current: int): MissionItemInt {
+  const m = new MissionItemInt()
+  m.targetSystem = 1
+  m.targetComponent = 1
+  m.seq = seq as u16
+  m.frame = item.frame as u8
+  m.command = item.command as u16
+  m.current = current as u8
+  m.autocontinue = 1
+  m.x = item.x as i32
+  m.y = item.y as i32
+  m.z = item.z
+  m.missionType = 0
+  return m
+}
+
+async function aCountOfOneAsksOnceForHome(): Promise<void> throws Error {
+  const rig = new Rig()
+  const count = new MissionCount()
+  count.targetSystem = 1
+  count.targetComponent = 1
+  count.count = 1
+  count.missionType = 0
+  await rig.gcs.send(count)
+  await delay(60)
+  const asked = rig.heard.join(",")
+  await rig.gcs.send(itemOf(waypoint(1.0, 1.0, 1.0), 0, 0))
+  await delay(60)
+  const last = rig.heard[rig.heard.length - 1]
+  const held = rig.sim.missions.held(MavMissionType.MISSION)
+  rig.close()
+  expect(asked).toBe("REQUEST 0")
+  expect(last).toBe(`ACK ${MavMissionResult.ACCEPTED}`)
+  // (what was sent for home is let go)
+  expect(held.length).toBe(1)
+  expect(held[0].x).toBe(rig.sim.control.homeLat)
+}
+
+async function aRequestPastTheEndTeachesTheSizeAndIsInvalidSequence(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  const counts: int[] = []
+  rig.gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof MissionCount) {
+      counts.push(m.count as int)
+    }
+  })
+  rig.heard = []
+  const request = new MissionRequestInt()
+  request.targetSystem = 1
+  request.targetComponent = 1
+  request.seq = 9
+  request.missionType = 0
+  await rig.gcs.send(request)
+  await delay(80)
+  const heard = rig.heard.join(",")
+  rig.close()
+  expect(counts.join(",")).toBe("4")
+  expect(heard).toBe(`ACK ${MavMissionResult.INVALID_SEQUENCE}`)
+}
+
+async function aClearFromAnotherSenderIsDeniedAndDoesNotCancelTheUpload(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  const count = new MissionCount()
+  count.targetSystem = 1
+  count.targetComponent = 1
+  count.count = 3
+  count.missionType = 0
+  await rig.gcs.send(count)
+  await delay(60)
+  rig.heard = []
+  const clear = new MissionClearAll()
+  clear.targetSystem = 1
+  clear.targetComponent = 1
+  clear.missionType = 0
+  // (from system 77: the other sender)
+  await rig.gcs.stream.write(new MavLinkProtocolV2(77, 190).serialize(clear, 0))
+  await delay(80)
+  const heard = rig.heard.join(",")
+  const receiving = rig.sim.missions.receiving
+  const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  rig.close()
+  expect(heard).toBe(`ACK ${MavMissionResult.DENIED},ACK ${MavMissionResult.ERROR}`)
+  expect(receiving).toBe(0)
+  // (the truncation of the upload that is under way, not of the clear)
+  expect(held).toBe(3)
+}
+
 async function aLostAckOfAClearIsNeverAnsweredByASecondClear(): Promise<void> throws Error {
   const rig = new Rig()
   await rig.client.upload(fourItems())
@@ -279,5 +405,9 @@ describe("the simulated autopilot's missions", () => {
   it("refuses a clear while it is armed and flies its mission", aClearWhileTheVehicleFliesItsMissionIsRefused)
   it("flies the mission item by item and says which one it is on", theMissionIsFlownItemByItemAndTheProgressSaysSo)
   it("sets the current item, FAILED for one that is not there", theCurrentItemIsSetOnceAndAnItemThatIsNotThereIsFailed)
+  it("takes an item with current 2 or 3 for an order and never stores it, and the client sends none", anItemWithCurrent2Or3IsAnOrderToTheVehicleAndNeverStored)
+  it("asks once for home when the count is 1, and lets go what is sent for it", aCountOfOneAsksOnceForHome)
+  it("teaches the size and says INVALID_SEQUENCE to a request past the end", aRequestPastTheEndTeachesTheSizeAndIsInvalidSequence)
+  it("denies a clear from another sender and does not cancel the upload", aClearFromAnotherSenderIsDeniedAndDoesNotCancelTheUpload)
   it("clears when the ack of the clear is lost, and the client never sends it again", aLostAckOfAClearIsNeverAnsweredByASecondClear)
 })

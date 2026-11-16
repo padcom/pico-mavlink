@@ -84,11 +84,15 @@ export class SimMissions {
   /// The item the vehicle is on (0: none yet, as before a start), and the last item it reached (-1: none).
   public current: int = 0
   public reached: int = -1
+  /// How many items with `current` 2 (a guided go-to) and 3 (a change of altitude) came, and whether the vehicle is in GUIDED (a go-to is ERROR when not).
+  public guidedItems: int = 0
+  public altitudeItems: int = 0
+  public guided: bool = false
   /// Whether it flies its mission now.
   public running: bool = false
   complete: bool = false
   /// The upload that is under way: its type (-1: none), who sends it, how many items it will have and when the last request went out.
-  receiving: int = -1
+  public receiving: int = -1
   fromSystem: int = 0
   fromComponent: int = 0
   expected: int = 0
@@ -169,7 +173,11 @@ export class SimMissions {
       }
     } else if (m instanceof MissionItemInt) {
       if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
-        item(m, sender, component)
+        if (m.missionType as int == MavMissionType.MISSION && (m.current as int == 2 || m.current as int == 3)) {
+          flagged(m, sender, component)
+        } else {
+          item(m, sender, component)
+        }
       }
     } else if (m instanceof MissionRequestList) {
       if (mine(m.targetSystem as int, m.targetComponent as int) && !deaf) {
@@ -256,16 +264,12 @@ export class SimMissions {
       done(type, sender, component)
       return
     }
-    if (type == MavMissionType.MISSION && n == 1) {
-      // (just home: nothing to ask for)
-      done(type, sender, component)
-      return
-    }
     receiving = type
     fromSystem = sender
     fromComponent = component
     expected = n
-    nextSeq = if (type == MavMissionType.MISSION) 1 else 0
+    // (ArduPilot asks for item 0 first for every type, home's too: it is received and let go, home being its own; a count of 1 asks once)
+    nextSeq = 0
     ask()
   }
 
@@ -274,23 +278,26 @@ export class SimMissions {
     if (receiving < 0 || type != receiving) {
       return
     }
-    if (sender != fromSystem || component != fromComponent) {
-      ack(MavMissionResult.DENIED, type, sender, component)
-      return
-    }
+    // ArduPilot looks at the seq first (INVALID_SEQUENCE), then at who sends (DENIED): MissionItemProtocol.cpp:272-284
     if (m.seq as int != nextSeq) {
       ack(MavMissionResult.INVALID_SEQUENCE, type, sender, component)
       return
     }
-    const own = stored.get(type) ?? []
-    const at = if (type == MavMissionType.MISSION) nextSeq - 1 else nextSeq
-    const written = itemFrom(m, type)
-    if (at < own.length) {
-      own[at] = written
-    } else {
-      own.push(written)
+    if (sender != fromSystem || component != fromComponent) {
+      ack(MavMissionResult.DENIED, type, sender, component)
+      return
     }
-    stored.set(type, own)
+    if (type != MavMissionType.MISSION || nextSeq > 0) {
+      const own = stored.get(type) ?? []
+      const at = if (type == MavMissionType.MISSION) nextSeq - 1 else nextSeq
+      const written = itemFrom(m, type)
+      if (at < own.length) {
+        own[at] = written
+      } else {
+        own.push(written)
+      }
+      stored.set(type, own)
+    }
     nextSeq += 1
     if (nextSeq >= expected) {
       receiving = -1
@@ -298,6 +305,19 @@ export class SimMissions {
       return
     }
     ask()
+  }
+
+  /// An item of the MISSION type whose `current` is 2 or 3 is NOT a part of the protocol (GCS_Common.cpp:987-1012): 2 is a go-to for the guided
+  /// mode, 3 a change of altitude only; the vehicle acts on it (counted in `guidedItems` and `altitudeItems`) and never stores it, and an upload that
+  /// is under way is not touched. A go-to is ERROR out of GUIDED (`guided` says whether it is in it); an altitude change is ACCEPTED.
+  flagged(m: MissionItemInt, sender: int, component: int): void {
+    if (m.current as int == 2) {
+      guidedItems += 1
+      ack(if (guided) MavMissionResult.ACCEPTED else MavMissionResult.ERROR, MavMissionType.MISSION, sender, component)
+      return
+    }
+    altitudeItems += 1
+    ack(MavMissionResult.ACCEPTED, MavMissionType.MISSION, sender, component)
   }
 
   /// The item as the vehicle writes it: the fence's and the rally's lose their `autocontinue`.
@@ -354,8 +374,18 @@ export class SimMissions {
 
   request(seq: int, type: int, sender: int, component: int): void {
     const items = held(type)
-    if (type < 0 || type > 2 || receiving >= 0 || seq >= items.length) {
-      ack(if (receiving >= 0) MavMissionResult.DENIED else MavMissionResult.INVALID_SEQUENCE, type, sender, component)
+    if (type < 0 || type > 2) {
+      ack(MavMissionResult.UNSUPPORTED, type, sender, component)
+      return
+    }
+    if (receiving >= 0) {
+      ack(MavMissionResult.DENIED, type, sender, component)
+      return
+    }
+    if (seq >= items.length) {
+      // ArduPilot teaches the ground station the real size first (MissionItemProtocol.cpp:160-169), then answers INVALID_SEQUENCE
+      list(type, sender, component)
+      ack(MavMissionResult.INVALID_SEQUENCE, type, sender, component)
       return
     }
     const it = items[seq]
@@ -381,6 +411,13 @@ export class SimMissions {
   clear(type: int, sender: int, component: int): void {
     if (type < 0 || type > 2) {
       ack(MavMissionResult.UNSUPPORTED, type, sender, component)
+      return
+    }
+    if (receiving == type && (sender != fromSystem || component != fromComponent)) {
+      // someone else is uploading: the clear does not cancel it. ArduPilot answers DENIED (cancel_upload) and, as the clear then did not
+      // succeed, ERROR as well (MissionItemProtocol.cpp:32-39, 57-67)
+      ack(MavMissionResult.DENIED, type, sender, component)
+      ack(MavMissionResult.ERROR, type, sender, component)
       return
     }
     if (type == MavMissionType.MISSION && isArmed() && running) {

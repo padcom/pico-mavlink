@@ -650,8 +650,13 @@ function checkItems(items: MissionItem[]): void throws MissionError {
     if (it.frame < 0 || it.frame > 255) {
       throw new MissionError("INVALID_VALUE", `item ${i}: frame ${it.frame} is not 0 to 255`)
     }
-    if (it.autocontinue < 0 || it.autocontinue > 255 || it.current < 0 || it.current > 255) {
-      throw new MissionError("INVALID_VALUE", `item ${i}: autocontinue or current is not 0 to 255`)
+    if (it.autocontinue < 0 || it.autocontinue > 255) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: autocontinue is not 0 to 255`)
+    }
+    // ArduPilot does not store an item of the mission whose `current` is 2 or 3 (a guided go-to, a change of altitude: GCS_Common.cpp:987-1012): a
+    // vehicle flying its mission is told to fly there NOW, and the item is dropped from the mission. So `current` is 0 or 1 here.
+    if (it.current < 0 || it.current > 1) {
+      throw new MissionError("INVALID_VALUE", `item ${i}: current ${it.current} is not 0 or 1 (2 and 3 are orders to a flying vehicle, not mission items)`)
     }
     if (it.x < -2147483648 || it.x > 2147483647 || it.y < -2147483648 || it.y > 2147483647) {
       throw new MissionError("INVALID_VALUE", `item ${i}: x or y does not fit 32 bits`)

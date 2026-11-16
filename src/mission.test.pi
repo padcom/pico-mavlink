@@ -634,6 +634,24 @@ async function anItemThatCannotGoIsRefusedBeforeAnythingIsSent(): Promise<void> 
   expect(heard).toBe(0)
 }
 
+async function aCurrentOf2Or3IsRefusedBeforeAnythingIsSent(): Promise<void> throws Error {
+  // ArduPilot takes an item of the mission whose `current` is 2 or 3 for an order to a flying vehicle (a go-to, a change of altitude) and does
+  // not store it: it must never travel as a part of a mission
+  const rig = new Rig()
+  const guided = threeItems()
+  guided[1].current = 2
+  const altitude = threeItems()
+  altitude[2].current = 3
+  const codes = [await codeOf(rig.client.upload(guided)), await codeOf(rig.client.upload(altitude))]
+  const heard = rig.vehicle.heard.length
+  const one = threeItems()
+  one[0].current = 1
+  await rig.client.upload(one)
+  rig.close()
+  expect(codes.join(",")).toBe("INVALID_VALUE,INVALID_VALUE")
+  expect(heard).toBe(0)
+}
+
 async function aNumberNoVehicleShouldGetIsRefusedBeforeTheCountIsSent(): Promise<void> throws Error {
   const rig = new Rig()
   const nan = threeItems()
@@ -801,6 +819,7 @@ describe("clearing and the other rules", () => {
   it("frees the type when a transfer ends in an error", theTypeIsFreeAgainWhenATransferEnds)
   it("ends on a cancel and sends nothing more", aCancelEndsTheTransferAndSendsNothingMore)
   it("refuses an item that cannot go on the wire before it sends anything", anItemThatCannotGoIsRefusedBeforeAnythingIsSent)
+  it("refuses an item whose current is 2 or 3 (an order to a flying vehicle) before it sends anything", aCurrentOf2Or3IsRefusedBeforeAnythingIsSent)
   it("refuses a NaN, an infinity or a place off the globe before it sends the count", aNumberNoVehicleShouldGetIsRefusedBeforeTheCountIsSent)
   it("takes a NaN yaw where ArduPilot does (waypoint, loiter, land, takeoff, arc, VTOL) and refuses any other NaN or infinity", aNanYawIsGoneWhereTheVehicleTakesItAndRefusedWhereItDoesNot)
   it("leaves no reservation behind a refused clear of the type 255", aRefusedClearOfAllLeavesNoReservationBehind)
