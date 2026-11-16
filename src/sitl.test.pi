@@ -19,6 +19,7 @@ import { MavCmd, MavParamType, MavResult, RequestDataStream, StatusText } from "
 import { AccelCalKind, AccelPosition, Calibration } from "./accelcal"
 import { CompassCalibration, CompassProgress, CompassReport, CompassStatus } from "./compasscal"
 import { MotorTest } from "./motortest"
+import { VehicleControl, resultName } from "./arming"
 import { ServoMonitor } from "./servooutputs"
 import { SimState } from "./dialects/ardupilotmega"
 import { GlobalPositionInt } from "./dialects/standard"
@@ -442,6 +443,9 @@ class Flight {
   public armed: bool = false
   public mode: int = -1
   public relAltMm: int = 0
+  /// Where the vehicle says it is (degrees times 1e7).
+  public lat: int = 0
+  public lon: int = 0
   public texts: string[] = []
 }
 
@@ -457,6 +461,8 @@ function watchFlight(s: Sitl): Flight {
       f.mode = m.customMode as int
     } else if (m instanceof GlobalPositionInt) {
       f.relAltMm = m.relativeAlt as int
+      f.lat = m.lat as int
+      f.lon = m.lon as int
     } else if (m instanceof StatusText) {
       f.texts.push(m.text)
     }
@@ -1372,7 +1378,96 @@ async function acceptsTheMotorTestWhileArmed(): Promise<void> throws Error {
   }
 }
 
+/// Whether the guided flight test is asked for: `SITL_FLIGHT=1` (as for the other flights), or a file `.sitl-guided` in the directory the tests run in
+/// (where an environment variable cannot be set: the file is not in the repository, and CI has none).
+async function guidedFlightIsAsked(): Promise<bool> throws Error {
+  const flight = env.get("SITL_FLIGHT")
+  if (flight != null && flight! == "1") {
+    return true
+  }
+  return await exists(".sitl-guided")
+}
+
+/// Guided control of a real ArduCopter SITL (a flight: minutes, so with `SITL_FLIGHT=1`): what DO_REPOSITION, DO_CHANGE_SPEED and DO_SET_HOME do
+/// (arming.pi quotes the ArduPilot source each rule comes from). Out of GUIDED a reposition is DENIED; in GUIDED it is ACCEPTED and the vehicle
+/// goes there (its own GLOBAL_POSITION_INT says so: the answer is not the flight), then a reposition to the same place at another altitude moves it
+/// to that altitude; the speed and home are accepted.
+async function guidedControlMovesTheRealVehicle(): Promise<void> throws Error {
+  if (!(await guidedFlightIsAsked())) {
+    println("SITL guided control test skipped: set SITL_FLIGHT=1, or make a file named .sitl-guided in the directory the tests run in (arms, takes off, flies, lands: minutes)")
+    return
+  }
+  const sitl = await startSitl(1)
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  const deadline = (Date.now() as int) + FLIGHT_BUDGET_MS
+  try {
+    const f = watchFlight(s)
+    const cmd = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 3 })
+    const control = new VehicleControl(s.conn, s.target, { timeoutMs: 2000 })
+    let armed = false
+    for (let i = 0; i < 90 && !armed && (Date.now() as int) < deadline; i++) {
+      const mode = await cmd.run(MavCmd.DO_SET_MODE, [1.0, 4.0])
+      const res = if (mode == MavResult.ACCEPTED) await cmd.run(MavCmd.COMPONENT_ARM_DISARM, [1.0]) else mode
+      armed = res == MavResult.ACCEPTED && await until(() => f.armed, 3, deadline)
+      if (!armed) {
+        await delay(1000)
+      }
+    }
+    expect(armed).toBe(true)
+    println(`SPIKE position interval: ${await cmd.setMessageInterval(33, 200_000)}`)
+    const takeoff = await control.takeoff(10.0)
+    expect(takeoff.accepted).toBe(true)
+    expect(await until(() => f.relAltMm > 8000, 60, deadline)).toBe(true)
+    const lat0 = f.lat
+    const lon0 = f.lon
+    // out of GUIDED (LOITER) a reposition is DENIED, and it changes no mode
+    const loiter = await control.setMode(5)
+    expect(loiter.accepted).toBe(true)
+    const denied = await control.reposition(lat0 as f64 / 10000000.0 + 0.0003, lon0 as f64 / 10000000.0, 20.0)
+    println(`SPIKE reposition in LOITER: ${denied.name}, mode ${f.mode}`)
+    expect(denied.name).toBe("DENIED")
+    expect(f.mode).toBe(5)
+    const back = await control.setMode(4)
+    expect(back.accepted).toBe(true)
+    expect(await until(() => f.mode == 4, 10, deadline)).toBe(true)
+    // in GUIDED: accepted, and the vehicle goes north (about 33 m) and up to 20 m
+    const speed = await control.setSpeed(5.0)
+    println(`SPIKE speed: ${speed.name}`)
+    expect(speed.accepted).toBe(true)
+    const go = await control.reposition(lat0 as f64 / 10000000.0 + 0.0003, lon0 as f64 / 10000000.0, 20.0)
+    println(`SPIKE reposition in GUIDED: ${go.name}`)
+    expect(go.accepted).toBe(true)
+    expect(await until(() => f.lat > lat0 + 2500 && f.relAltMm > 18000, 60, deadline)).toBe(true)
+    // another altitude where it is
+    const here = await control.changeAltitude(f.lat as f64 / 10000000.0, f.lon as f64 / 10000000.0, 12.0)
+    println(`SPIKE change altitude: ${here.name}`)
+    expect(here.accepted).toBe(true)
+    expect(await until(() => f.relAltMm < 14000, 30, deadline)).toBe(true)
+    // what the real vehicle DENIES (the library would not send these: they go raw, once): 0, 0 is "here" and an altitude of 0 above home is "the
+    // current altitude" (Location::sanitize), neither a place
+    const raw = new CommandCall(s.conn, s.target, { timeoutMs: 2000, retries: 0 })
+    const zero = await raw.runInt(MavCmd.DO_REPOSITION, 6, [-1.0, 0.0, 0.0, 0.0], 0, 0, 20.0)
+    const level = await raw.runInt(MavCmd.DO_REPOSITION, 6, [-1.0, 0.0, 0.0, 0.0], f.lat, f.lon, 0.0)
+    println(`SPIKE raw reposition to 0,0: ${resultName(zero)}; to altitude 0 above home: ${resultName(level)}`)
+    expect(zero).toBe(MavResult.DENIED)
+    expect(level).toBe(MavResult.DENIED)
+    // home: the vehicle's own place, in the air
+    const home = await control.setHomeHere()
+    println(`SPIKE set home here (in flight): ${home.name} ${f.texts.join(" | ")}`)
+    expect(home.acknowledged).toBe(true)
+    const land = await control.setMode(9)
+    expect(land.accepted).toBe(true)
+    expect(await until(() => !f.armed, 90, deadline)).toBe(true)
+  } finally {
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
+  it("flies to a reposition, changes altitude, speed and home, in GUIDED only (SITL_FLIGHT=1 or the file .sitl-guided)", guidedControlMovesTheRealVehicle)
   it("spins a motor, shows it in SERVO_OUTPUT_RAW, and stops it at once and on release (SITL_FLIGHT=1)", spinsAMotorAndStopsItAtOnce)
   it("accepts the motor test while armed: the refusal is the ground station's (SITL_FLIGHT=1)", acceptsTheMotorTestWhileArmed)
   it("writes a log that FTP can see: where, when, and what it looks like (the spike; SITL_FLIGHT=1)", writesALogWhereFtpCanSeeIt)
