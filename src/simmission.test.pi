@@ -247,7 +247,9 @@ async function theCurrentItemIsSetOnceAndAnItemThatIsNotThereIsFailed(): Promise
   await rig.client.setCurrentMessage(2)
   await delay(100)
   const byMessage = rig.sim.missions.current
+  const messages = rig.sim.missions.setCurrentMessages
   rig.close()
+  expect(messages).toBe(1)
   expect(moved).toBe(MavResult.ACCEPTED)
   expect(current).toBe(3)
   expect(failed).toBe(MavResult.FAILED)
@@ -387,10 +389,32 @@ async function aLostAckOfAClearIsNeverAnsweredByASecondClear(): Promise<void> th
   const code = await codeOf(rig.client.clear())
   await delay(400)
   const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  const clears = rig.sim.missions.clears
   rig.close()
-  // the vehicle cleared, the answer was lost: unknown to the client, and nothing sent again
+  // the vehicle cleared, the answer was lost: unknown to the client, and nothing sent again (ONE MISSION_CLEAR_ALL came)
   expect(code).toBe("TIMEOUT")
   expect(held).toBe(1)
+  expect(clears).toBe(1)
+}
+
+async function aDeafVehicleStillCountsTheClearAndTheSetCurrentThatCame(): Promise<void> throws Error {
+  const rig = new Rig()
+  await rig.client.upload(fourItems())
+  rig.sim.missions.deaf = true
+  const code = await codeOf(rig.client.clear())
+  const unknown = await codeOf(rig.client.setCurrentMessage(2))
+  await delay(400)
+  const clears = rig.sim.missions.clears
+  const messages = rig.sim.missions.setCurrentMessages
+  // (a deaf vehicle does nothing with them)
+  const held = rig.sim.missions.held(MavMissionType.MISSION).length
+  rig.close()
+  // the vehicle heard nothing it answered: the client never gets an answer, and sent the clear ONCE (a resend would make it 2)
+  expect(code).toBe("TIMEOUT")
+  expect(unknown).not.toBe("")
+  expect(clears).toBe(1)
+  expect(messages).toBe(1)
+  expect(held).toBe(4)
 }
 
 describe("the simulated autopilot's missions", () => {
@@ -410,4 +434,5 @@ describe("the simulated autopilot's missions", () => {
   it("teaches the size and says INVALID_SEQUENCE to a request past the end", aRequestPastTheEndTeachesTheSizeAndIsInvalidSequence)
   it("denies a clear from another sender and does not cancel the upload", aClearFromAnotherSenderIsDeniedAndDoesNotCancelTheUpload)
   it("clears when the ack of the clear is lost, and the client never sends it again", aLostAckOfAClearIsNeverAnsweredByASecondClear)
+  it("counts the clear and the set-current that came to a deaf vehicle, which does nothing with them", aDeafVehicleStillCountsTheClearAndTheSetCurrentThatCame)
 })
