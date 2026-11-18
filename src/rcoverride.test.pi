@@ -136,15 +136,18 @@ async function neverSendsFasterThanItsRateAndHoldsTheRateToItsBounds(): Promise<
   const elapsed = (performance.now() as int) - began
   const frames = fast.sim.rcOverride.frames
   const closest = fast.over.closestMs
+  const periodMs = fast.over.periodMs
   fast.close()
   slow.close()
   // 50 a second over the time measured: not less than 0.8 of it (the schedule does not drift), not more than the rate allows
   const expected = 50 * elapsed / 1000
   expect(frames * 100 >= expected * 80).toBe(true)
   expect(frames * 100 <= expected * 105 + 100).toBe(true)
-  // and no two frames closer than the period (20 ms) less the half the schedule gives away to a late timer (the sender's own write times: the
-  // vehicle's reading of the link comes in bursts, which says nothing about the sender)
-  expect(closest >= 9).toBe(true)
+  // and no two frames in a burst: the sender never starts a round sooner than half the period (10 ms) after the one before, to make up
+  // for a late timer, and a clock of whole milliseconds and a timer that fires a millisecond or two early (Windows, whose timer ticks
+  // every 15.6 ms) read that 10 as 8 or 9. A quarter of the period (5 ms) is far from that and still far above what a burst is (the
+  // sender's own write times: the vehicle's reading of the link comes in bursts, which says nothing about the sender)
+  expect(closest >= periodMs / 4).toBe(true)
 }
 
 async function holdsTheSilenceToItsBounds(): Promise<void> throws Error {
