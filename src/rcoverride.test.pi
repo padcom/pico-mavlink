@@ -139,10 +139,12 @@ async function neverSendsFasterThanItsRateAndHoldsTheRateToItsBounds(): Promise<
   const periodMs = fast.over.periodMs
   fast.close()
   slow.close()
-  // 50 a second over the time measured: not less than 0.6 of it, not more than the rate allows. The lower bound says the schedule does
-  // not drift (a sender that waited a whole period after each round would send about 30 a second at the 15.6 ms ticks of a Windows
-  // timer, which is under it); it is 0.6 and not more because a runner that stalls for more than three periods makes the sender start
-  // its schedule again, and a second of a loaded CI machine may lose a few frames that way. A failure says which bound, and the numbers.
+  // 50 a second over the time measured: not less than 0.6 of it, not more than the rate allows. The lower bound catches a sender
+  // that is silent or sends at half the rate (the interval-based sender before the schedule sent about 22 of 50); it does NOT
+  // detect a drift of the period per round, which the schedule's catch-up hides by design (a sender that waited a whole period per
+  // round would still send about 32 a second at the 15.6 ms ticks of a Windows timer and about 47 on fast ones, and pass). It is 0.6
+  // and not more because a runner that stalls for more than three periods makes the sender start its schedule again, and a second of
+  // a loaded CI machine may lose a few frames that way. A failure says which bound, and the numbers.
   const expected = 50 * elapsed / 1000
   expect(within(`frames in ${elapsed} ms`, frames, expected * 60 / 100, expected * 105 / 100 + 1)).toBe("ok")
   // and no two frames in a burst: the sender never starts a round sooner than half the period (10 ms) after the one before, to make up
