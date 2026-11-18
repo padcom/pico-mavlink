@@ -14,9 +14,19 @@ class FlakyStream implements ByteStream {
   public attempts: int = 0
   /// Every write takes this long (ms) before it is made.
   public slowMs: int = 0
+  /// Fails the next writes of a RELEASE frame, and only those (a pulse frame goes through), so that a test can say "the release fails
+  /// twice" however many pulse frames come before it. Counted down.
+  public failReleases: int = 0
 
   constructor(inner: ByteStream) {
     this.inner = inner
+  }
+
+  /// A frame that lets go of channel 3: its pulse is 0 (channels 1 to 8 are released with 0; a pulse is never 0, and "leave it" is 65535)
+  /// as two little endian bytes at payload offset 4, and the payload begins at byte 10 of a v2 frame. (The tests that use it override
+  /// channel 3.)
+  isReleaseOfChannel3(bytes: Uint8Array): bool {
+    return bytes.length > 15 && bytes[14] == 0 && bytes[15] == 0
   }
 
   public read(): Promise<Uint8Array?, Error> {
@@ -31,6 +41,10 @@ class FlakyStream implements ByteStream {
     if (failWrites > 0) {
       failWrites -= 1
       throw new Error("the link is down")
+    }
+    if (failReleases > 0 && isReleaseOfChannel3(bytes)) {
+      failReleases -= 1
+      throw new Error("the link is down for the release")
     }
     await inner.write(bytes)
   }
@@ -194,12 +208,16 @@ async function refusesWhatIsNotAPulseAndSendsNothingForIt(): Promise<void> throw
 /// Keeps the sender fed (`set` again and again) until the vehicle has received its first frame, and no longer. The silence is counted
 /// from the last `set`, and the first round is a period after the start: a runner that stalls for more than the silence of a short test
 /// (100 ms) makes that round late, and the run ends as silent with NOTHING sent, so that there is nothing to release (right, and not
-/// what the test is about). Waiting for the frame, not for a time, takes the stall out. (Bounded: 2 s.)
-async function feedUntilTheVehicleHasAFrame(rig: Rig, pulses: int[]): Promise<void> throws Error {
+/// what the test is about). Waiting for the frame, not for a time, takes the stall out. (Bounded: 2 s.) It says when the LAST `set` was
+/// (ms on the clock of `performance.now()`), for a test that checks how soon the sender lets go after it.
+async function feedUntilTheVehicleHasAFrame(rig: Rig, pulses: int[]): Promise<int> throws Error {
+  let lastSet = performance.now() as int
   for (let i = 0; i < 400 && rig.sim.rcOverride.frames == 0; i++) {
+    lastSet = performance.now() as int
     rig.over.set(pulses)
     await delay(5)
   }
+  return lastSet
 }
 
 /// Waits until the sender has stopped for its silence and its release has been written (bounded: 4 s), in place of a time that a stalled
@@ -213,10 +231,11 @@ async function untilItHasReleasedForSilence(rig: Rig): Promise<void> throws Erro
 async function releasesAndStopsWhenSetIsNotCalledInTime(): Promise<void> throws Error {
   const rig = new Rig(255, 25, 100)
   rig.over.start()
-  await feedUntilTheVehicleHasAFrame(rig, [NO_OVERRIDE, NO_OVERRIDE, 1500])
+  const lastSet = await feedUntilTheVehicleHasAFrame(rig, [NO_OVERRIDE, NO_OVERRIDE, 1500])
   const during = pulsesOf(rig, 3)
   // no set from here: the sender lets go after 100 ms
   await untilItHasReleasedForSilence(rig)
+  const taken = (performance.now() as int) - lastSet
   const framesThen = rig.sim.rcOverride.frames
   await delay(300)
   const framesLater = rig.sim.rcOverride.frames
@@ -231,6 +250,9 @@ async function releasesAndStopsWhenSetIsNotCalledInTime(): Promise<void> throws 
   expect(why).toBe("silent")
   expect(released).toBe(1)
   expect(vehicleReleases).toBe(1)
+  // HOW SOON it lets go is the safety of it: a caller that froze must not hold the sticks until the vehicle's own 3 s (RC_OVERRIDE_TIME)
+  // lapses. The silence is 100 ms; 2 s is far above it (a runner's stall of that length is not the sender's) and well below the 3 s.
+  expect(within("ms from the last set to the release", taken, 0, 2000)).toBe("ok")
   // the radio's own channel again, at once (not after the vehicle's 3 s), and no frame after the release
   expect(after).toBe("1500,1500,1000")
   expect(framesLater).toBe(framesThen)
@@ -523,18 +545,22 @@ async function aSilentEndThatIsRetryingIsWaitedForToo(): Promise<void> throws Er
   const rig = new Rig(255, 25, 100)
   rig.over.start()
   await feedUntilTheVehicleHasAFrame(rig, [NO_OVERRIDE, NO_OVERRIDE, 1500])
-  // the link is down for the release the silence starts: it is retried, a period apart
-  rig.link.failWrites = 2
+  // the link is down for the release the silence starts, twice: it is retried, a period apart. Only RELEASE frames fail (the pulse
+  // frames until the silence go through), so that the two failures are the release's, and not used up by the pulses before it
+  rig.link.failReleases = 2
   // no set from here: the silence begins in 100 ms, and the shutdown comes while its release is being tried (bounded: 4 s)
   for (let i = 0; i < 800 && rig.over.why != "silent"; i++) {
     await delay(5)
   }
   await rig.gcs.shutdown()
+  const failuresLeft = rig.link.failReleases
   const released = rig.over.released
   const why = rig.over.why
   const pulses = pulsesOf(rig, 3)
   rig.sim.stop()
   expect(why).toBe("silent")
+  // both failures were the release's (it WAS retried, and the third try is what got out)
+  expect(failuresLeft).toBe(0)
   expect(released).toBe(1)
   expect(pulses).toBe("1500,1500,1000")
 }
