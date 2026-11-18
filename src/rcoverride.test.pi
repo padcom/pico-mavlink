@@ -191,14 +191,32 @@ async function refusesWhatIsNotAPulseAndSendsNothingForIt(): Promise<void> throw
   expect(pulses).toBe("1500")
 }
 
+/// Keeps the sender fed (`set` again and again) until the vehicle has received its first frame, and no longer. The silence is counted
+/// from the last `set`, and the first round is a period after the start: a runner that stalls for more than the silence of a short test
+/// (100 ms) makes that round late, and the run ends as silent with NOTHING sent, so that there is nothing to release (right, and not
+/// what the test is about). Waiting for the frame, not for a time, takes the stall out. (Bounded: 2 s.)
+async function feedUntilTheVehicleHasAFrame(rig: Rig, pulses: int[]): Promise<void> throws Error {
+  for (let i = 0; i < 400 && rig.sim.rcOverride.frames == 0; i++) {
+    rig.over.set(pulses)
+    await delay(5)
+  }
+}
+
+/// Waits until the sender has stopped for its silence and its release has been written (bounded: 4 s), in place of a time that a stalled
+/// runner can overrun.
+async function untilItHasReleasedForSilence(rig: Rig): Promise<void> throws Error {
+  for (let i = 0; i < 800 && (rig.over.why != "silent" || rig.over.released == 0); i++) {
+    await delay(5)
+  }
+}
+
 async function releasesAndStopsWhenSetIsNotCalledInTime(): Promise<void> throws Error {
   const rig = new Rig(255, 25, 100)
   rig.over.start()
-  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
-  await delay(60)
+  await feedUntilTheVehicleHasAFrame(rig, [NO_OVERRIDE, NO_OVERRIDE, 1500])
   const during = pulsesOf(rig, 3)
   // no set from here: the sender lets go after 100 ms
-  await delay(400)
+  await untilItHasReleasedForSilence(rig)
   const framesThen = rig.sim.rcOverride.frames
   await delay(300)
   const framesLater = rig.sim.rcOverride.frames
@@ -504,11 +522,13 @@ async function aStartWhileTheConnectionIsShuttingDownIsRefused(): Promise<void> 
 async function aSilentEndThatIsRetryingIsWaitedForToo(): Promise<void> throws Error {
   const rig = new Rig(255, 25, 100)
   rig.over.start()
-  rig.over.set([NO_OVERRIDE, NO_OVERRIDE, 1500])
-  await delay(60)
+  await feedUntilTheVehicleHasAFrame(rig, [NO_OVERRIDE, NO_OVERRIDE, 1500])
   // the link is down for the release the silence starts: it is retried, a period apart
   rig.link.failWrites = 2
-  await delay(150)
+  // no set from here: the silence begins in 100 ms, and the shutdown comes while its release is being tried (bounded: 4 s)
+  for (let i = 0; i < 800 && rig.over.why != "silent"; i++) {
+    await delay(5)
+  }
   await rig.gcs.shutdown()
   const released = rig.over.released
   const why = rig.over.why
