@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  PICO_VERSION: 0.4.3
+  PICO_VERSION: 0.5.1
 
 jobs:
   ci:
