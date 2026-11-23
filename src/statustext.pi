@@ -26,23 +26,8 @@ export struct StatusMessage {
 
 /// The bytes of a chunk's text field before its first NUL.
 function chunkText(text: Uint8Array): Uint8Array {
-  let n = 0
-  while (n < text.length && text[n] != 0) {
-    n += 1
-  }
-  text.slice(0, n)
-}
-
-function sameBytes(a: Uint8Array, b: Uint8Array): bool {
-  if (a.length != b.length) {
-    return false
-  }
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] != b[i]) {
-      return false
-    }
-  }
-  return true
+  const n = text.indexOf(0)
+  text.slice(0, if (n < 0) text.length else n)
 }
 
 /// What is remembered of a message that is over, to drop its late and repeated chunks.
@@ -150,14 +135,14 @@ export class StatusTextAssembler {
       // A chunk of a message that is over. A late chunk, or one repeated (a retransmit, a second link),
       // is dropped; only a chunk 0 that differs from the old message's starts a new one.
       const first = over!.first
-      if (chunkSeq != 0 || first == null || sameBytes(first!, part)) {
+      if (chunkSeq != 0 || first == null || first!.equals(part)) {
         return out
       }
       finished.delete(key)
     }
     let found = pending.get(key)
     if (found != null && chunkSeq == 0 && found!.parts.has(0)) {
-      if (sameBytes(found!.parts.get(0)!, part)) {
+      if (found!.parts.get(0)!.equals(part)) {
         // Chunk 0 again, as it was: a repeat, not a new message.
         return out
       }

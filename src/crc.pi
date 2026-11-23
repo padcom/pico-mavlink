@@ -1,20 +1,12 @@
 // MAVLink's checksum: CRC-16/MCRF4XX (polynomial 0x1021 reflected, initial 0xFFFF), the X.25 CRC
-// node-mavlink and mavlink-mappings call x25crc.
+// node-mavlink and mavlink-mappings call x25crc: std/checksum's CRC16_MCRF4XX.
+import { CRC16_MCRF4XX, Crc } from "std/checksum"
 
 /// The CRC of `b[from, to)`, then of the CRC-extra byte `magic` when given.
 export function x25crc(b: Uint8Array, from: int, to: int, magic: int? = null): int {
-  let crc = 0xFFFF
-  for (let i = from; i < to; i++) {
-    crc = step(crc, b[i])
-  }
+  const c = new Crc(CRC16_MCRF4XX).update(b.subarray(from, to))
   if (magic != null) {
-    crc = step(crc, magic!)
+    c.updateByte(magic!)
   }
-  return crc
-}
-
-function step(crc: int, byte: int): int {
-  let tmp = (byte & 0xFF) ^ (crc & 0xFF)
-  tmp = (tmp ^ (tmp << 4)) & 0xFF
-  return ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xFFFF
+  return c.value
 }

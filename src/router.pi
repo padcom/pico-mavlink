@@ -106,18 +106,6 @@ class Seen {
   }
 }
 
-function sameBytes(a: Uint8Array, b: Uint8Array): bool {
-  if (a.length != b.length) {
-    return false
-  }
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] != b[i]) {
-      return false
-    }
-  }
-  return true
-}
-
 /// What a dropped slot of the read queue holds.
 const EMPTY: Uint8Array = new Uint8Array(0)
 
@@ -366,7 +354,7 @@ export class MavLinkRouter implements ByteStream {
     const before = recent.get(key)
     // A duplicate is the same bytes, delivered by another link. The same link repeating a frame is a new
     // message: the sequence number is one byte and goes round in under a second on a busy link.
-    if (before != null && before!.link != link.id && sameBytes(before!.frame, frame)) {
+    if (before != null && before!.link != link.id && before!.frame.equals(frame)) {
       link.duplicates += 1
       return
     }

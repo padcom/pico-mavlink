@@ -1,6 +1,7 @@
 // MAVLink 1 and 2 frames: headers, payloads, checksums, serialization and signing (node-mavlink's
 // MavLinkProtocolV1, MavLinkProtocolV2, MavLinkPacketSignature and MavLinkPacket).
 import { digest } from "std/crypto"
+import { hex } from "std/encoding"
 import { MavLinkData, MessageInfo } from "./data"
 import { readUint, writeUint } from "./bytes"
 import { x25crc } from "./crc"
@@ -281,7 +282,7 @@ export class MavLinkPacketSignature {
 
   /// The 6 signature bytes, as lowercase hex (node-mavlink's form).
   public get signature(): string {
-    hex(frame.slice(at + 7, at + 13))
+    hex.encode(frame.slice(at + 7, at + 13))
   }
 
   public setSignature(value: Uint8Array): void {
@@ -300,21 +301,12 @@ export class MavLinkPacketSignature {
 
   /// Whether the frame's signature is the one `key` makes.
   public matches(key: Uint8Array): bool {
-    return hex(calculate(key)) == signature
+    return hex.encode(calculate(key)) == signature
   }
 
   public toString(): string {
     return `linkid: ${linkId}, timestamp ${timestamp}, signature ${signature}`
   }
-}
-
-function hex(b: Uint8Array): string {
-  const digits = "0123456789abcdef"
-  let s = ""
-  for (let i = 0; i < b.length; i++) {
-    s += `${digits[b[i] >> 4]}${digits[b[i] & 0xF]}`
-  }
-  return s
 }
 
 /// A parsed frame.
@@ -341,7 +333,7 @@ export class MavLinkPacket {
     const crcBytes = new Uint8Array(2)
     crcBytes.set(0, crc >> 8)
     crcBytes.set(1, crc)
-    const crcHex = "0x" + hex(crcBytes)
+    const crcHex = "0x" + hex.encode(crcBytes)
     const sig = if (signature == null) "" else `, ${signature!.toString()}`
     return `Packet (proto: ${protocol.name()}, sysid: ${header.sysid}, compid: ${header.compid}, msgid: ${header.msgid}, seq: ${header.seq}, plen: ${header.payloadLength}, crc: ${crcHex}${sig})`
   }
