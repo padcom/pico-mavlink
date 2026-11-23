@@ -7,8 +7,8 @@ import { AutopilotVersionRead, CommandCall, ParamList, ParamWrite, VehicleDiscov
 import { ParamEncoding as Enc, encodingOf } from "./params"
 import { SimParam, SimulatedAutopilot } from "./simulator"
 import { MavType } from "./dialects/minimal"
-import { Attitude, MavCmd, MavParamType, ParamValue, SysStatus } from "./dialects/common"
-import { MavLinkError } from "./protocol"
+import { Attitude, MavCmd, MavParamType, ParamValue, SysStatus, TimeSync } from "./dialects/common"
+import { MavLinkError, MavLinkProtocolV2 } from "./protocol"
 
 async function looksLikeAVehicle(): Promise<void> throws Error {
   const ends = MemoryStream.pair()
@@ -81,7 +81,43 @@ async function aThousandParameters(): Promise<void> throws Error {
   expect(took < 3000).toBe(true)
 }
 
+/// A TIMESYNC request (`tc1` 0) is answered with `ts1` mirrored and the target the one who asked; an answer, or a request for another
+/// system, is not.
+async function answersTimeSync(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0], { protocol: new MavLinkProtocolV2(255, 191) })
+  const answers: TimeSync[] = []
+  gcs.on((r: Received) => {
+    const m = r.message
+    if (m instanceof TimeSync) {
+      answers.push(m)
+    }
+  })
+  gcs.run()
+  sim.start(1000)
+  const ask = new TimeSync()
+  ask.ts1 = 123456789 as i64
+  ask.targetSystem = 1
+  ask.targetComponent = 1
+  await gcs.send(ask)
+  const elsewhere = new TimeSync()
+  elsewhere.ts1 = 5 as i64
+  elsewhere.targetSystem = 7
+  await gcs.send(elsewhere)
+  const answer = new TimeSync()
+  answer.tc1 = 9 as i64
+  answer.ts1 = 6 as i64
+  await gcs.send(answer)
+  await delay(50)
+  sim.stop()
+  expect(`${answers.length} ${sim.timeSyncs}`).toBe("1 1")
+  const a = answers[0]
+  expect(`${a.ts1} ${a.tc1 > (0 as i64)} ${a.targetSystem}/${a.targetComponent}`).toBe("123456789 true 255/191")
+}
+
 describe("the simulated autopilot", () => {
   it("serves a list of 1200 parameters, downloaded complete in well under 3 s", aThousandParameters)
   it("sends heartbeats and telemetry and answers parameter requests", looksLikeAVehicle)
+  it("answers a TIMESYNC request with its time, the request's mirrored, to the one who asked", answersTimeSync)
 })
