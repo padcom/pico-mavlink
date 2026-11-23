@@ -11,7 +11,7 @@ permissions:
 env:
   # 0.10.0: DataView, std/checksum, std/streams, withTimeout, hex, Uint8Array.equals; lowering that
   # fits in memory (#134).
-  PICO_VERSION: 0.10.0
+  PICO_VERSION: 0.10.1
 
 jobs:
   ci:
