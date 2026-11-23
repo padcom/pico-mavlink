@@ -1,7 +1,7 @@
 // Packets from a byte stream, and a connection that sends and receives messages over one
 // (node-mavlink's createMavLinkStream, send and sendSigned, with the sequence number kept per
 // connection instead of per module).
-import { delay, withTimeout } from "std/timers"
+import { TimeoutError, delay, withTimeout } from "std/timers"
 import { MavLinkData, Registry } from "./data"
 import { MavLinkPacket, MavLinkPacketParser, MavLinkProtocol, MavLinkProtocolV2 } from "./protocol"
 import { MavLinkPacketSplitter, SplitterOptions } from "./splitter"
@@ -236,7 +236,10 @@ export class MavLinkConnection {
         if (left <= 0) {
           break
         }
-        await within(h, left)
+        if (!(await within(h, left))) {
+          // It used up the time left (by the timer's clock: Date.now() may still be a few ms short).
+          break
+        }
       }
       if (hooks.length > 0) {
         // what the hooks wrote has to be READ by the other end before the socket goes: a socket that closes with data of the other
@@ -265,12 +268,16 @@ async function pause(ms: int): Promise<void> {
 }
 
 /// Runs `work` until it ends or `ms` pass, whichever comes first (the work is not stopped: it is just not waited for).
-async function within(hook: () => Promise<void>, ms: int): Promise<void> {
+/// False when the time ran out; a hook that fails counts as ended.
+async function within(hook: () => Promise<void>, ms: int): Promise<bool> {
   try {
     await withTimeout(hook(), ms)
+  } catch (e: TimeoutError) {
+    return false
   } catch (e: Error) {
-    return
+    return true
   }
+  return true
 }
 
 /// One `waitFor`: settles once, by a message or by its timer.
