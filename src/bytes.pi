@@ -8,16 +8,21 @@ export function byteAt(b: Uint8Array, at: int): int {
   if (at < b.length) b[at] as int else 0
 }
 
-/// `n` bytes at `at`, zero-extended past the end of `b`: `b` itself when they're all there.
+/// Where a value cut short by the end of a payload is put together (zeros after the end): one
+/// buffer, so that the many short MAVLink 2 payloads allocate nothing.
+const SCRATCH = new Uint8Array(8)
+const SCRATCH_VIEW = new DataView(SCRATCH)
+
+/// `n` bytes at `at`, zero-extended past the end of `b`: `b` itself when they're all there, else
+/// the scratch buffer (valid until the next short read).
 function span(b: Uint8Array, at: int, n: int): DataView {
   if (at + n <= b.length) {
     return new DataView(b.buffer, b.byteOffset + at, n)
   }
-  const padded = new Uint8Array(n)
-  if (at < b.length) {
-    padded.setAll(b.subarray(at))
+  for (let i = 0; i < n; i++) {
+    SCRATCH.set(i, byteAt(b, at + i))
   }
-  return new DataView(padded)
+  return SCRATCH_VIEW
 }
 
 /// An unsigned little-endian integer of `n` bytes (at most 7) at `at`.
