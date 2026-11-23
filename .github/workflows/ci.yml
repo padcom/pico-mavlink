@@ -9,7 +9,9 @@ permissions:
   contents: read
 
 env:
-  PICO_VERSION: 0.5.1
+  # 0.10.0: DataView, std/checksum, std/streams, withTimeout, hex, Uint8Array.equals; lowering that
+  # fits in memory (#134).
+  PICO_VERSION: 0.10.0
 
 jobs:
   ci:
