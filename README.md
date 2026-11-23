@@ -24,7 +24,8 @@ Status: **in development (MV1).**
   rejected.
 - **Done:** `SimulatedAutopilot`, an ArduPilot Copter-like vehicle on the far end of any byte
   stream. It sends heartbeats and telemetry and answers parameter requests, with deterministic
-  data, for trying an application without hardware or SITL.
+  data, for trying an application without hardware or SITL. It answers TIMESYNC requests as ArduPilot does (its time in `tc1`,
+  `ts1` mirrored), so a ground station can time the link's round trip.
 - **Done:** the MAVLink log protocol (src/logprotocol.pi): `LogProtocolClient` lists the vehicle's logs
   (`LOG_REQUEST_LIST`/`LOG_ENTRY`, re-asking for entries that were lost), downloads one (`LOG_REQUEST_DATA`/`LOG_DATA`) into a
   sink with gaps filled, a stall chased, progress, cancellation and resume from a byte offset, and erases all logs (`LOG_ERASE`).

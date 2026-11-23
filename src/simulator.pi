@@ -25,7 +25,7 @@ import { SimMissions } from "./simmission"
 import { SimControl } from "./simcontrol"
 import { actualRate, desiredRate } from "./simrate"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
-import { Attitude, AttitudeTarget, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime } from "./dialects/common"
+import { Attitude, AttitudeTarget, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime, TimeSync } from "./dialects/common"
 import { AutopilotVersion, GlobalPositionInt, MavProtocolCapability } from "./dialects/standard"
 
 /// An FTP request and who sent it.
@@ -149,6 +149,8 @@ export class SimulatedAutopilot {
   public rateScript: bool = false
   /// How many times SYSTEM_TIME was asked for with MAV_CMD_REQUEST_MESSAGE.
   public systemTimeRequests: int = 0
+  /// How many TIMESYNC requests it has answered.
+  public timeSyncs: int = 0
   /// The intervals it was asked for, by message id: milliseconds between messages, -1 for off. A message
   /// with none comes at each tick.
   public readonly intervals: Map<int, int> = new Map<int, int>()
@@ -570,6 +572,8 @@ export class SimulatedAutopilot {
         const from: Target = { system: r.packet.header.sysid, component: r.packet.header.compid }
         ftpHandle(m, from)
       }
+    } else if (m instanceof TimeSync) {
+      answerTimeSync(m, r)
     } else if (m instanceof ParamSet) {
       const i = indexOf(m.paramId)
       if (forMe(m.targetSystem as int, m.targetComponent as int) && i >= 0) {
@@ -578,6 +582,25 @@ export class SimulatedAutopilot {
         send(i)
       }
     }
+  }
+
+  /// Answers a TIMESYNC request as ArduPilot does (https://mavlink.io/en/services/timesync.html): a request has `tc1` 0, and the
+  /// answer has the vehicle's time in `tc1` (ns since it booted), `ts1` mirrored, and the target the one who asked. An answer (`tc1`
+  /// not 0), or a request for another system, is not answered.
+  answerTimeSync(m: TimeSync, r: Received): void {
+    if (m.tc1 != (0 as i64) || !forMe(m.targetSystem as int, m.targetComponent as int)) {
+      return
+    }
+    timeSyncs += 1
+    const out = new TimeSync()
+    out.tc1 = ((((Date.now() as int) - bootedAt) * 1000000) as i64)
+    if (out.tc1 == (0 as i64)) {
+      out.tc1 = 1 as i64
+    }
+    out.ts1 = m.ts1
+    out.targetSystem = r.packet.header.sysid as u8
+    out.targetComponent = r.packet.header.compid as u8
+    conn.send(out)
   }
 
   // --- MAVLink FTP: the packed parameter file, "@PARAM/param.pck", as ArduPilot serves it ---
