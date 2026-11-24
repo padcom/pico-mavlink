@@ -49,7 +49,21 @@ export {
 export { TlogEntry, TlogFile, TlogPlayer, TlogPlayerOptions, openTlog } from "./src/tlogplayer"
 export { ByteStream, FileStream, MemoryStream, TcpStream, UdpStream } from "./src/stream"
 export { ConnectionOptions, MavLinkConnection, Received, defaultRegistry, packets } from "./src/connection"
-export { Rejection, SigningPolicy, UnsignedPolicy } from "./src/signing"
+export {
+  RADIO_ID,
+  RADIO_STATUS_ID,
+  Rejection,
+  SETUP_SIGNING_ID,
+  SIGNING_KEY_LENGTH,
+  SigningKey,
+  SigningOptions,
+  SigningPolicy,
+  UnsignedPolicy,
+  carriesKey,
+  signingTimestamp,
+} from "./src/signing"
+export { SigningResult, SigningSetup, SigningSetupOptions } from "./src/signingsetup"
+export { SimSigning } from "./src/simsigning"
 export {
   ParamEncoding,
   ParamError,

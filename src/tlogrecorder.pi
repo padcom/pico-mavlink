@@ -14,6 +14,7 @@ import { MavLinkConnection, Received } from "./connection"
 import { MavLinkPacketSplitter } from "./splitter"
 import { ByteStream } from "./stream"
 import { TlogWriter } from "./tlog"
+import { carriesKey } from "./signing"
 
 /// Where a recording goes: its bytes, in order, and the end.
 export interface TlogSink {
@@ -199,7 +200,9 @@ export class TlogRecorder {
   /// What it sends is not seen here: put a `TlogTap` under the connection for that. Returns the function that stops it.
   public attach(conn: MavLinkConnection): () => void {
     const id = conn.on((r: Received) => {
-      this.write(r.packet.buffer)
+      if (!carriesKey(r.packet.buffer)) {
+        this.write(r.packet.buffer)
+      }
     })
     return () => {
       conn.off(id)
@@ -219,7 +222,7 @@ export struct TlogTapOptions {
 /// A byte stream that records the frames that pass through it: put it between a `MavLinkConnection` (or anything else) and the
 /// stream (a link, a `MavLinkRouter`) it would use. Frames are found whole and checked against their CRC in each direction on its
 /// own, so a frame split over several reads is recorded once, when it is whole. The bytes pass unchanged. Closing the tap closes
-/// the stream, not the recorder.
+/// the stream, not the recorder. A SETUP_SIGNING frame, which carries a signing key, is never recorded (nor by `attach`).
 export class TlogTap implements ByteStream {
   public readonly stream: ByteStream
   public readonly recorder: TlogRecorder
@@ -239,7 +242,9 @@ export class TlogTap implements ByteStream {
     const chunk = await stream.read()
     if (chunk != null) {
       for (const raw of incoming.push(chunk!)) {
-        recorder.write(raw.buffer)
+        if (!carriesKey(raw.buffer)) {
+          recorder.write(raw.buffer)
+        }
       }
     }
     return chunk
@@ -250,7 +255,9 @@ export class TlogTap implements ByteStream {
     await stream.write(bytes)
     if (sent) {
       for (const raw of outgoing.push(bytes)) {
-        recorder.write(raw.buffer)
+        if (!carriesKey(raw.buffer)) {
+          recorder.write(raw.buffer)
+        }
       }
     }
   }

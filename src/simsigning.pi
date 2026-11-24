@@ -1,0 +1,112 @@
+// MAVLink 2 signing as the simulated autopilot does it (after ArduPilot's documentation, "MAVLink2 Signing", and the MAVLink
+// signing spec):
+//  - SETUP_SIGNING addressed to it sets the key and moves its signing timestamp up to the message's initial timestamp; the all-zero
+//    key with a zero initial timestamp turns signing off (an all-zero key with a timestamp is taken as a key, as ArduPilot does: checked
+//    against Copter SITL, where a zero key with a timestamp left signing on). It has no answer. A vehicle that signs takes it (as every other message) only signed with the key it holds.
+//  - with a key, everything it sends is signed (link id 0), and a received packet is taken only when its signature matches, its
+//    timestamp is newer than the last of its stream and, for a new stream, not more than a minute behind the vehicle's own.
+//  - unsigned packets are taken only when they are RADIO_STATUS or RADIO (a telemetry radio can't sign), or on a USB link (`usb`),
+//    where ArduPilot takes everything so that a vehicle with an unknown key can still be reached.
+// The key is held as a `SigningKey` (redacted when shown). What a test reads: `enabled`, `setups`, and the rejection counters.
+import { MavLinkConnection, Received } from "./connection"
+import { RADIO_ID, RADIO_STATUS_ID, SigningKey, SigningPolicy, UnsignedPolicy } from "./signing"
+import { SetupSigning } from "./dialects/common"
+
+/// The signing of the simulated autopilot.
+export class SimSigning {
+  readonly conn: MavLinkConnection
+  readonly forMe: (system: int, component: int) => bool
+  key: SigningKey? = null
+  /// The link is the vehicle's USB port: unsigned packets are taken even while it signs.
+  usbLink: bool = false
+  /// How many SETUP_SIGNING messages it took.
+  public setups: int = 0
+  /// Fault: SETUP_SIGNING is ignored (a vehicle without signing).
+  public ignoreSetup: bool = false
+
+  constructor(conn: MavLinkConnection, forMe: (system: int, component: int) => bool) {
+    this.conn = conn
+    this.forMe = forMe
+  }
+
+  /// Whether it holds a key (and so signs and checks).
+  public get enabled(): bool {
+    return key != null
+  }
+
+  /// Whether the link counts as USB.
+  public get usb(): bool {
+    return usbLink
+  }
+
+  /// Makes the link count as USB (unsigned packets taken) or not.
+  public setUsb(value: bool): void {
+    usbLink = value
+    apply(key, 0)
+  }
+
+  /// Sets the key as SETUP_SIGNING would (`SigningKey.none()` with a zero timestamp turns signing off).
+  public setKey(k: SigningKey, initialTimestamp: int = 0): void {
+    apply(if (k.isNone && initialTimestamp == 0) null else k, initialTimestamp)
+  }
+
+  /// Unsigned packets it turned away while signing.
+  public get rejectedUnsigned(): int {
+    const p = conn.signing
+    if (p == null) 0 else p!.rejectedUnsigned
+  }
+
+  /// Signed packets whose signature did not match.
+  public get rejectedSignature(): int {
+    const p = conn.signing
+    if (p == null) 0 else p!.rejectedSignature
+  }
+
+  /// Signed packets that were replays (or too old).
+  public get rejectedReplay(): int {
+    const p = conn.signing
+    if (p == null) 0 else p!.rejectedReplay
+  }
+
+  apply(k: SigningKey?, initialTimestamp: int): void {
+    key = k
+    if (k == null) {
+      conn.useSigning(null)
+      return
+    }
+    const unsigned = if (usbLink) UnsignedPolicy.Accept else UnsignedPolicy.AcceptListed([RADIO_STATUS_ID, RADIO_ID])
+    const before = conn.signing
+    const policy = new SigningPolicy(k!, unsigned, { linkId: 0 })
+    if (before != null) {
+      policy.advanceTo(before!.timestamp)
+    }
+    policy.advanceTo(initialTimestamp)
+    conn.useSigning(policy)
+  }
+
+  public toString(): string {
+    return `SimSigning(${if (key == null) "off" else "on, key redacted"}${if (usbLink) ", usb" else ""}, ${setups} setups)`
+  }
+
+  /// Takes SETUP_SIGNING; true when `r` was one (for it or not).
+  public handle(r: Received): bool {
+    const m = r.message
+    if (m instanceof SetupSigning) {
+      const mine = forMe
+      if (ignoreSetup || !mine(m.targetSystem as int, m.targetComponent as int)) {
+        return true
+      }
+      const bytes = new Uint8Array(m.secretKey.length)
+      for (let i = 0; i < m.secretKey.length; i++) {
+        bytes.set(i, m.secretKey[i] as int)
+      }
+      try {
+        setKey(new SigningKey(bytes), m.initialTimestamp as int)
+        setups += 1
+      } catch (e: Error) {
+      }
+      return true
+    }
+    return false
+  }
+}

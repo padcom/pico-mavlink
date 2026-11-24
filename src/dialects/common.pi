@@ -18646,6 +18646,11 @@ export class SetupSigning extends MavLinkData {
   public override info(): MessageInfo {
     return SetupSigning.INFO
   }
+
+  /// The message with its secret left out (it must never reach a log).
+  public toString(): string {
+    return `SetupSigning (targetSystem = ${this.targetSystem}, targetComponent = ${this.targetComponent}, secretKey = redacted, initialTimestamp = ${this.initialTimestamp})`
+  }
 }
 
 /// Report button state change.

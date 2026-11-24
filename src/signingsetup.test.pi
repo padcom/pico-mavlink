@@ -1,0 +1,294 @@
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { hex } from "std/encoding"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { MavLinkError } from "./protocol"
+import { CommandCall, Target } from "./operations"
+import { SimulatedAutopilot } from "./simulator"
+import { RADIO_STATUS_ID, SigningKey, SigningPolicy, UnsignedPolicy } from "./signing"
+import { SigningResult, SigningSetup } from "./signingsetup"
+import { TlogRecorder, TlogSink, TlogTap } from "./tlogrecorder"
+import { Heartbeat } from "./dialects/minimal"
+import { MavCmd, RadioStatus } from "./dialects/common"
+
+const VEHICLE: Target = { system: 1, component: 1 }
+
+/// A recording in memory.
+class Sink implements TlogSink {
+  public readonly writes: Uint8Array[] = []
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    writes.push(bytes)
+  }
+
+  public async close(): Promise<void> throws Error {
+  }
+
+  public all(): Uint8Array {
+    let n = 0
+    for (const w of writes) {
+      n += w.length
+    }
+    const out = new Uint8Array(n)
+    let at = 0
+    for (const w of writes) {
+      out.setAll(w, at)
+      at += w.length
+    }
+    return out
+  }
+}
+
+/// A simulated vehicle and a ground station on the far end of it (through a tlog tap), both running.
+class Link {
+  public readonly sim: SimulatedAutopilot
+  public readonly gcs: MavLinkConnection
+  public readonly sink: Sink = new Sink()
+  public readonly recorder: TlogRecorder
+
+  constructor() {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.recorder = new TlogRecorder(this.sink)
+    this.gcs = new MavLinkConnection(new TlogTap(ends[0], this.recorder))
+    this.gcs.run()
+    this.sim.start(10)
+  }
+
+  public setup(retries: int = 2): SigningSetup {
+    new SigningSetup(gcs, VEHICLE, { timeoutMs: 100, retries: retries })
+  }
+
+  /// The MAV_RESULT of a command the vehicle answers, or "no answer".
+  public async command(): Promise<string> {
+    try {
+      const r = await new CommandCall(gcs, VEHICLE, { timeoutMs: 60, retries: 1 }).run(MavCmd.REQUEST_MESSAGE, [148.0])
+      return `${r}`
+    } catch (e: Error) {
+      return "no answer"
+    }
+  }
+
+  /// Whether the vehicle's next heartbeat comes signed.
+  public async heartbeatSigned(): Promise<bool> throws Error {
+    const r = await gcs.waitFor((x: Received) => x.message instanceof Heartbeat, 200)
+    return r != null && r!.packet.signature != null
+  }
+
+  public async stop(): Promise<void> throws Error {
+    sim.stop()
+    gcs.close()
+    await recorder.close()
+  }
+}
+
+function policy(key: SigningKey): SigningPolicy {
+  new SigningPolicy(key, UnsignedPolicy.AcceptListed([RADIO_STATUS_ID]))
+}
+
+async function provisionsAndSignedTrafficWorks(): Promise<void> throws Error {
+  const link = new Link()
+  try {
+    expect(await link.command()).toBe("0")
+    expect(await link.heartbeatSigned()).toBe(false)
+    const key = SigningKey.random()
+    const p = policy(key)
+    const result = await link.setup().provision(p)
+    expect(`${result.confirmed} ${result.attempts} ${result.result ?? -1}`).toBe("true 1 0")
+    expect(link.sim.signing.enabled).toBe(true)
+    expect(link.sim.signing.setups).toBe(1)
+    expect(link.gcs.signing == p).toBe(true)
+    // Both ways signed: the vehicle's telemetry, and a command answered.
+    expect(await link.heartbeatSigned()).toBe(true)
+    expect(await link.command()).toBe("0")
+    expect(p.rejectedSignature + p.rejectedReplay).toBe(0)
+  } finally {
+    await link.stop()
+  }
+}
+
+async function unsignedIsTreatedByPolicy(): Promise<void> throws Error {
+  const link = new Link()
+  try {
+    const key = SigningKey.fromPassphrase("correct horse")
+    expect((await link.setup().provision(policy(key))).confirmed).toBe(true)
+    // An unsigned command: the vehicle drops it (ArduPilot: not a USB link).
+    link.gcs.useSigning(null)
+    const before = link.sim.signing.rejectedUnsigned
+    expect(await link.command()).toBe("no answer")
+    expect(link.sim.signing.rejectedUnsigned > before).toBe(true)
+    // RADIO_STATUS is taken unsigned (a radio can't sign).
+    const rejected = link.sim.signing.rejectedUnsigned
+    await link.gcs.send(new RadioStatus())
+    await delay(10)
+    expect(link.sim.signing.rejectedUnsigned).toBe(rejected)
+    // Signed with another key: dropped as forged.
+    link.gcs.useSigning(policy(SigningKey.fromPassphrase("wrong")))
+    expect(await link.command()).toBe("no answer")
+    expect(link.sim.signing.rejectedSignature > 0).toBe(true)
+    // On the vehicle's USB port, unsigned is taken.
+    link.sim.signing.setUsb(true)
+    link.gcs.useSigning(null)
+    expect(await link.command()).toBe("0")
+    // The ground station's side: unsigned frames from the vehicle are dropped unless listed.
+    link.sim.signing.setKey(SigningKey.none())
+    const strict = new SigningPolicy(key)
+    link.gcs.useSigning(strict)
+    expect(await link.command()).toBe("no answer")
+    expect(strict.rejectedUnsigned > 0).toBe(true)
+    link.gcs.useSigning(new SigningPolicy(key, UnsignedPolicy.Accept))
+    expect(await link.command()).toBe("0")
+  } finally {
+    await link.stop()
+  }
+}
+
+async function changesTheKeyAndDisables(): Promise<void> throws Error {
+  const link = new Link()
+  try {
+    expect((await link.setup().provision(policy(SigningKey.fromPassphrase("one")))).confirmed).toBe(true)
+    // A new key goes signed with the old one.
+    const two = policy(SigningKey.fromPassphrase("two"))
+    expect((await link.setup().provision(two)).confirmed).toBe(true)
+    expect(link.sim.signing.setups).toBe(2)
+    expect(await link.command()).toBe("0")
+    // An all-zero key WITH a timestamp is a key, as on ArduPilot: signing stays on.
+    link.sim.signing.setKey(SigningKey.none(), 1)
+    expect(link.sim.signing.enabled).toBe(true)
+    link.sim.signing.setKey(SigningKey.fromPassphrase("two"))
+    // Disabled: the all-zero key and a zero timestamp, sent signed; then unsigned both ways.
+    const off = await link.setup().disable()
+    expect(`${off.confirmed} ${off.attempts}`).toBe("true 1")
+    expect(link.sim.signing.enabled).toBe(false)
+    expect(link.gcs.signing == null).toBe(true)
+    expect(await link.heartbeatSigned()).toBe(false)
+    expect(await link.command()).toBe("0")
+  } finally {
+    await link.stop()
+  }
+}
+
+async function notConfirmedLeavesTheLinkAsItWas(): Promise<void> throws Error {
+  const link = new Link()
+  try {
+    // A vehicle that does not take the key: tried 1 + retries times, and the link is left unsigned.
+    link.sim.signing.ignoreSetup = true
+    const r = await link.setup(1).provision(policy(SigningKey.random()))
+    expect(`${r.confirmed} ${r.attempts}`).toBe("false 2")
+    expect(link.gcs.signing == null).toBe(true)
+    expect(await link.command()).toBe("0")
+    // A vehicle that signs, and a ground station without its key: the unsigned SETUP_SIGNING is dropped.
+    link.sim.signing.ignoreSetup = false
+    link.sim.signing.setKey(SigningKey.fromPassphrase("theirs"))
+    const off = await link.setup(1).disable()
+    expect(off.confirmed).toBe(false)
+    expect(link.sim.signing.enabled).toBe(true)
+    const other = await link.setup(1).provision(policy(SigningKey.fromPassphrase("mine")))
+    expect(other.confirmed).toBe(false)
+    expect(link.gcs.signing == null).toBe(true)
+    // The all-zero key is not provisioned: that is disable().
+    let code = ""
+    try {
+      await link.setup().provision(policy(SigningKey.none()))
+    } catch (e: MavLinkError) {
+      code = e.code
+    }
+    expect(code).toBe("INVALID_KEY")
+  } finally {
+    await link.stop()
+  }
+}
+
+async function provisionRecoversALostConfirmation(): Promise<void> throws Error {
+  const link = new Link()
+  try {
+    // The vehicle took the key before (its answer was lost); the next try's unsigned SETUP_SIGNING is dropped, its signed command is not.
+    const key = SigningKey.fromPassphrase("again")
+    link.sim.signing.setKey(key)
+    const r = await link.setup().provision(policy(key))
+    expect(`${r.confirmed} ${r.attempts}`).toBe("true 1")
+    expect(link.sim.signing.setups).toBe(0)
+  } finally {
+    await link.stop()
+  }
+}
+
+/// Whether `text` holds `key` as hex or as a list of its numbers.
+function leaks(text: string, key: Uint8Array): bool {
+  const parts: string[] = []
+  for (let i = 0; i < 8; i++) {
+    parts.push(`${key[i]}`)
+  }
+  return text.toLowerCase().indexOf(hex.encode(key.slice(0, 8))) >= 0 || text.indexOf(parts.join(", ")) >= 0 || text.indexOf(parts.join(",")) >= 0
+}
+
+/// Whether `bytes` holds the first 16 bytes of `key` in a row.
+function holds(bytes: Uint8Array, key: Uint8Array): bool {
+  for (let i = 0; i + 16 <= bytes.length; i++) {
+    let same = true
+    for (let k = 0; k < 16 && same; k++) {
+      same = bytes[i + k] == key[k]
+    }
+    if (same) {
+      return true
+    }
+  }
+  return false
+}
+
+async function theKeyIsNeverShownOrRecorded(): Promise<void> throws Error {
+  const link = new Link()
+  const key = SigningKey.random()
+  const bytes = key.reveal()
+  const shown: string[] = []
+  try {
+    const p = policy(key)
+    const setup = link.setup(0)
+    const r: SigningResult = await setup.provision(p)
+    expect(r.confirmed).toBe(true)
+    shown.push(`${r:?}`, `${p}`, `${p:?}`, `${key}`, `${key:?}`, `${link.sim.signing:?}`, `${setup:?}`)
+    // Errors on the way: a refused key, an aborted setup.
+    try {
+      const never = await setup.provision(policy(SigningKey.none()))
+      shown.push(`${never.confirmed}`)
+    } catch (e: MavLinkError) {
+      shown.push(`${e.code} ${e.message} ${e}`)
+    }
+    const abort = new AbortController()
+    abort.abort()
+    try {
+      const never = await new SigningSetup(link.gcs, VEHICLE, { signal: abort.signal }).provision(p)
+      shown.push(`${never.confirmed}`)
+    } catch (e: MavLinkError) {
+      shown.push(`${e.code} ${e.message} ${e}`)
+    }
+  } finally {
+    await link.stop()
+  }
+  expect(shown.length).toBe(9)
+  for (const s of shown) {
+    expect(leaks(s, bytes)).toBe(false)
+  }
+  // The check would see it: the key's bytes as a list, or as hex, do leak.
+  const numbers: int[] = []
+  for (let i = 0; i < bytes.length; i++) {
+    numbers.push(bytes[i])
+  }
+  expect(leaks(`${numbers:?}`, bytes)).toBe(true)
+  expect(leaks(`key ${hex.encode(bytes)}`, bytes)).toBe(true)
+  // The recording (sent and received) has the signed traffic and no SETUP_SIGNING: never the key.
+  const recorded = link.sink.all()
+  expect(recorded.length > 0).toBe(true)
+  expect(holds(recorded, bytes)).toBe(false)
+  expect(holds(bytes, bytes)).toBe(true)
+}
+
+describe("signing setup", () => {
+  it("provisions a key to the simulated vehicle, and signed traffic then works both ways", provisionsAndSignedTrafficWorks)
+  it("then treats unsigned traffic by policy: dropped, RADIO_STATUS taken, a wrong key dropped, USB takes all", unsignedIsTreatedByPolicy)
+  it("changes the key over the signed link, and disables signing", changesTheKeyAndDisables)
+  it("leaves the link as it was when nothing confirms, and refuses the all-zero key", notConfirmedLeavesTheLinkAsItWas)
+  it("confirms a key the vehicle already took", provisionRecoversALostConfirmation)
+  it("never shows the key in a result, an error or a debug form, and never records it", theKeyIsNeverShownOrRecorded)
+})

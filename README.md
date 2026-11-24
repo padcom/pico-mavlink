@@ -22,6 +22,25 @@ Status: **in development (MV1).**
 - **Done:** a signing policy for received packets: signatures checked, replays rejected per
   system, component and link, and unsigned packets accepted, accepted for listed messages, or
   rejected.
+- **Done:** sending a signing key to a vehicle (src/signingsetup.pi, src/signing.pi, src/simsigning.pi, #15). A key is a `SigningKey` (32 bytes:
+  `fromPassphrase` is its SHA-256 as Mission Planner and MAVProxy make it, `random` comes from the system's secure random source, `none` is all zeros)
+  whose string and debug forms are `SigningKey(redacted)`; `reveal()` is the only way to its bytes. A `SigningPolicy` is a link's signing: given to a
+  connection (`ConnectionOptions.signing`, or `useSigning` on a running one) it signs every frame `send` writes (MAVLink 2; link id `linkId`, 1 by default;
+  timestamps in 10 µs units since 2015 from the clock, never twice the same, never backwards) and checks every frame received: a bad signature is dropped,
+  and so is a replay (a timestamp not newer than the last of its system, component and link, or the first of a stream more than `windowMs`, a minute,
+  behind this end's timestamp). Unsigned frames are dropped (`UnsignedPolicy.Reject`, the default), taken (`Accept`), or taken for listed message ids only
+  (`AcceptListed([RADIO_STATUS_ID])`: a SiK radio can't sign). `SigningSetup(conn, target).provision(policy)` sends SETUP_SIGNING (it has no answer) to
+  one system and component and confirms it by a command signed with the new key and answered signed (MAV_CMD_REQUEST_MESSAGE for AUTOPILOT_VERSION), then
+  keeps the connection on the new policy; `disable()` sends the all-zero key **with a zero initial timestamp** (ArduPilot takes a zero key with a
+  timestamp as a key: checked against SITL) and confirms by an unsigned command answered unsigned. Not confirmed (`confirmed: false` after `retries`), the
+  connection keeps the signing it had. A vehicle that signs takes a new key, or the removal, only signed with the key it holds. **The key never reaches a
+  log:** SETUP_SIGNING's string and debug forms leave it out (the generator redacts a `secret_key` field), `TlogTap` and `TlogRecorder.attach` never record
+  a SETUP_SIGNING frame, and no error says a key's bytes (tests check every form). `SimulatedAutopilot.signing` does the vehicle's side as ArduPilot does:
+  SETUP_SIGNING sets the key (signed output from then on, link id 0) or turns signing off, unsigned frames are taken only for RADIO_STATUS and RADIO, or
+  everything on a USB link (`setUsb`); faults: `ignoreSetup`. **ArduPilot (Copter SITL, `sitl.test.pi`):** the key is taken on SERIAL0 and confirmed, the
+  vehicle then signs everything it sends on every link (telemetry still flows to an unsigned ground station), an unsigned or wrongly signed command on
+  SERIAL1 is not answered, SERIAL0 (treated as USB) answers an unsigned command, and the disable turns it all off. Tests: src/signing.test.pi,
+  src/signingsetup.test.pi.
 - **Done:** `SimulatedAutopilot`, an ArduPilot Copter-like vehicle on the far end of any byte
   stream. It sends heartbeats and telemetry and answers parameter requests, with deterministic
   data, for trying an application without hardware or SITL. It answers TIMESYNC requests as ArduPilot does (its time in `tc1`,

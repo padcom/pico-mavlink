@@ -1,0 +1,141 @@
+// Sending a signing key to a vehicle (SETUP_SIGNING, https://mavlink.io/en/guide/message_signing.html), and
+// taking it away again.
+//
+// SETUP_SIGNING has no acknowledgement. A key is known to have arrived when a command signed with it is
+// answered by the vehicle with a signed COMMAND_ACK (the vehicle signs what it sends once it holds a key);
+// signing is known to be off when an unsigned command is answered unsigned. The command is a harmless
+// MAV_CMD_REQUEST_MESSAGE for AUTOPILOT_VERSION.
+//
+// ArduPilot takes SETUP_SIGNING on any link, but on a link other than USB a vehicle that already signs only
+// takes it signed with the key it holds: to change or remove a key, the connection must be signing with the
+// current one. The key goes to one system and component, never broadcast, and the frame is never recorded
+// (`TlogTap` leaves it out).
+import { MavLinkConnection, Received } from "./connection"
+import { MavLinkError } from "./protocol"
+import { Target } from "./operations"
+import { SigningKey, SigningPolicy } from "./signing"
+import { CommandAck, CommandLong, MavCmd, MavResult, SetupSigning } from "./dialects/common"
+import { AutopilotVersion } from "./dialects/standard"
+
+/// The options of a `SigningSetup`.
+export struct SigningSetupOptions {
+  /// How long to wait for the confirming answer, per try (ms; default 1000).
+  timeoutMs?: int
+  /// How many times to try again when no answer confirms (default 3).
+  retries?: int
+  /// Stops the setup (`ABORTED`).
+  signal?: AbortSignal
+}
+
+/// How a provisioning or a disabling went.
+export struct SigningResult {
+  /// Whether the vehicle answered as it does only when it holds the key (provision) or no key (disable).
+  confirmed: bool
+  /// How many times SETUP_SIGNING was sent.
+  attempts: int
+  /// The vehicle's MAV_RESULT for the confirming command, when it answered.
+  result: int?
+}
+
+/// Sends a signing key to `target` and confirms it, or turns its signing off. `conn.run()` must be running.
+export class SigningSetup {
+  readonly conn: MavLinkConnection
+  readonly target: Target
+  readonly timeoutMs: int
+  readonly retries: int
+  readonly signal: AbortSignal?
+
+  constructor(conn: MavLinkConnection, target: Target, options: SigningSetupOptions = {}) {
+    this.conn = conn
+    this.target = target
+    this.timeoutMs = options.timeoutMs ?? 1000
+    this.retries = options.retries ?? 3
+    this.signal = options.signal
+  }
+
+  /// Sends `policy`'s key to the target with SETUP_SIGNING (initial timestamp: now) and confirms it with a
+  /// signed command answered signed. Once confirmed the connection signs and checks with `policy`; when not,
+  /// it is left with the signing it had (the vehicle may or may not hold the key: try again, or `disable`).
+  public async provision(policy: SigningPolicy): Promise<SigningResult> throws Error {
+    if (policy.signingKey.isNone) {
+      throw new MavLinkError("INVALID_KEY", "the all-zero key turns signing off: use disable()")
+    }
+    await exchange(policy.signingKey, policy, true)
+  }
+
+  /// Sends the all-zero key and a zero initial timestamp with SETUP_SIGNING (signed with the connection's current key, if any) and
+  /// confirms that the target answers an unsigned command unsigned. Once confirmed the connection neither
+  /// signs nor checks; when not, it keeps the signing it had.
+  public async disable(): Promise<SigningResult> throws Error {
+    await exchange(SigningKey.none(), null, false)
+  }
+
+  async exchange(key: SigningKey, next: SigningPolicy?, signed: bool): Promise<SigningResult> throws Error {
+    const before = conn.signing
+    let last: int? = null
+    for (let attempt = 1; attempt <= retries + 1; attempt++) {
+      checkAborted()
+      // SETUP_SIGNING goes with the signing the link has now (the vehicle may only take it signed).
+      conn.useSigning(before)
+      await conn.send(setupMessage(key, next))
+      conn.useSigning(next)
+      const reply = conn.waitFor((r: Received) => isAck(r) && (r.packet.signature != null) == signed, timeoutMs, signal)
+      await conn.send(probe(attempt - 1))
+      const r = await reply
+      if (r != null) {
+        const m = r!.message
+        if (m instanceof CommandAck) {
+          last = m.result as int
+          return { confirmed: true, attempts: attempt, result: last }
+        }
+      }
+    }
+    conn.useSigning(before)
+    checkAborted()
+    return { confirmed: false, attempts: retries + 1, result: last }
+  }
+
+  setupMessage(key: SigningKey, next: SigningPolicy?): SetupSigning {
+    const m = new SetupSigning()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    // Signing is turned off by the all-zero key WITH a zero timestamp (ArduPilot: a zero key with a timestamp is a key).
+    m.initialTimestamp = (if (next != null) next!.timestamp else 0) as u64
+    const bytes = key.reveal()
+    for (let i = 0; i < bytes.length; i++) {
+      m.secretKey.push(bytes[i] as u8)
+    }
+    return m
+  }
+
+  /// The confirming command: ask for AUTOPILOT_VERSION.
+  probe(attempt: int): CommandLong {
+    const c = new CommandLong()
+    c.targetSystem = target.system as u8
+    c.targetComponent = target.component as u8
+    c.command = MavCmd.REQUEST_MESSAGE as u16
+    c.confirmation = attempt as u8
+    c._param1 = AutopilotVersion.MSG_ID as f32
+    return c
+  }
+
+  isAck(r: Received): bool {
+    const m = r.message
+    if (m instanceof CommandAck) {
+      return r.packet.header.sysid == target.system && (target.component == 0 || r.packet.header.compid == target.component)
+        && m.command as int == MavCmd.REQUEST_MESSAGE && m.result as int != MavResult.IN_PROGRESS
+    }
+    return false
+  }
+
+  public toString(): string {
+    return `SigningSetup(${target.system}/${target.component})`
+  }
+
+  checkAborted(): void throws MavLinkError {
+    const s = signal
+    if (s != null && s!.aborted) {
+      throw new MavLinkError("ABORTED", "signing setup aborted")
+    }
+  }
+}

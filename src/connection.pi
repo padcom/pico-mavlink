@@ -44,8 +44,9 @@ export struct ConnectionOptions {
   /// What to send with: its version, system id and component id (default: MAVLink 2 from
   /// system 254, component 1, as node-mavlink).
   protocol?: MavLinkProtocol
-  /// Which received packets to trust (default: all). Untrusted ones are dropped (counted in the
-  /// policy).
+  /// MAVLink 2 signing (default: none): which received packets to trust (untrusted ones are dropped and
+  /// counted in the policy) and, unless the policy says otherwise, the key, link id and timestamps that
+  /// `send` signs with.
   signing?: SigningPolicy
 }
 
@@ -54,7 +55,7 @@ export class MavLinkConnection {
   public readonly stream: ByteStream
   public readonly registry: Registry
   public readonly protocol: MavLinkProtocol
-  public readonly signing: SigningPolicy?
+  signingPolicy: SigningPolicy? = null
   seq: int = 0
   closeHooks: Map<int, () => Promise<void>> = new Map<int, () => Promise<void>>()
   shutting: Promise<void>? = null
@@ -70,7 +71,17 @@ export class MavLinkConnection {
     this.registry = options.registry ?? defaultRegistry()
     const v2: MavLinkProtocol = new MavLinkProtocolV2()
     this.protocol = options.protocol ?? v2
-    this.signing = options.signing
+    this.signingPolicy = options.signing
+  }
+
+  /// The signing in use, if any.
+  public get signing(): SigningPolicy? {
+    return signingPolicy
+  }
+
+  /// Signs and checks with `policy` from now on (null: neither signs nor checks).
+  public useSigning(policy: SigningPolicy?): void {
+    signingPolicy = policy
   }
 
   /// The next sequence number (0 to 255, then around again).
@@ -81,8 +92,17 @@ export class MavLinkConnection {
   }
 
   /// Sends `message`; the count of bytes sent.
+  /// With a signing policy that signs (and MAVLink 2), the frame is signed with its key, link id and next
+  /// timestamp.
   public async send(message: MavLinkData): Promise<int> throws Error {
-    const frame = protocol.serialize(message, nextSeq())
+    const policy = signingPolicy
+    const v2 = protocol
+    const frame = if (policy != null && policy!.signOutgoing && v2 instanceof MavLinkProtocolV2) {
+      const signer = new MavLinkProtocolV2(v2.sysid, v2.compid, v2.incompatibilityFlags | MavLinkProtocolV2.IFLAG_SIGNED, v2.compatibilityFlags)
+      policy!.sign(signer.serialize(message, nextSeq()))
+    } else {
+      protocol.serialize(message, nextSeq())
+    }
     await stream.write(frame)
     return frame.length
   }
@@ -104,7 +124,7 @@ export class MavLinkConnection {
       if ((p.header.incompatibilityFlags & ~MavLinkProtocolV2.IFLAG_SIGNED) != 0) {
         continue
       }
-      const policy = signing
+      const policy = signingPolicy
       if (policy != null && policy!.check(p) != null) {
         continue
       }
