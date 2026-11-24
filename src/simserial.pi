@@ -1,0 +1,189 @@
+// SERIAL_CONTROL in the simulated autopilot (see serialcontrol.pi for the protocol), as the MAVLink specification has it:
+//  - a request for SERIAL_CONTROL_DEV_SHELL goes to a tiny shell: what is typed is echoed back as it comes (a terminal's echo), and a
+//    whole line (ended by "\n" or "\r") is run: `echo <words>` says the words, `ver` says "SimulatedAutopilot", an empty line says
+//    nothing, and anything else says "<name>: command not found"; each line run ends with the prompt "sim> ";
+//  - a request for a serial port (DEV_TELEM1 .. DEV_GPS2, SERIAL0 .. SERIAL9) goes to a loopback plug: what is written comes back;
+//  - other devices are not there: nothing is answered;
+//  - EXCLUSIVE takes the device; a request without it hands it back (counted in `releases`); `baudrate` other than 0 sets its speed;
+//  - RESPOND is answered with ONE reply (REPLY, the device, up to 70 bytes of what the device has; none when it has nothing), and
+//    with MULTI, with replies until what it has is all sent.
+// What a test reads: `requests`, `releases`, `exclusive(device)`, `baudrate(device)`, `biggest` (the most bytes one request carried),
+// `flags` (the flags of every request, in order), `baudChanges`; `feed` makes a device say something by itself. Faults: `silent` (nothing is answered).
+import { MavLinkConnection, Received } from "./connection"
+import { SerialControl, SerialControlDev, SerialControlFlag } from "./dialects/common"
+
+/// The prompt the shell gives after each line.
+export const SIM_SHELL_PROMPT: string = "sim> "
+
+/// A device of the simulated vehicle: what it has to say, and how it is held.
+class SimDevice {
+  public out: int[] = []
+  public held: bool = false
+  public baud: int = 0
+  /// The shell's line being typed (its bytes).
+  public line: int[] = []
+}
+
+/// SERIAL_CONTROL of the simulated autopilot.
+export class SimSerial {
+  readonly conn: MavLinkConnection
+  readonly forMe: (system: int, component: int) => bool
+  readonly devices: Map<int, SimDevice> = new Map<int, SimDevice>()
+  /// How many requests came (for any device that is there), and how many of them handed a device back.
+  public requests: int = 0
+  public releases: int = 0
+  /// The most bytes one request carried.
+  public biggest: int = 0
+  /// The flags of every request, in order.
+  public readonly flags: int[] = []
+  /// How many requests set a speed (`baudrate` other than 0).
+  public baudChanges: int = 0
+  /// Nothing is answered (what is written still arrives).
+  public silent: bool = false
+
+  constructor(conn: MavLinkConnection, forMe: (system: int, component: int) => bool) {
+    this.conn = conn
+    this.forMe = forMe
+  }
+
+  /// Whether SERIAL_CONTROL holds `device` (EXCLUSIVE, not yet handed back).
+  public exclusive(device: int): bool {
+    return devices.get(device)?.held ?? false
+  }
+
+  /// The speed `device` was last set to (0: never set).
+  public baudrate(device: int): int {
+    return devices.get(device)?.baud ?? 0
+  }
+
+  /// `device` says `bytes` by itself (a GPS sending, a shell printing): they wait for the next request with RESPOND.
+  public feed(device: int, bytes: Uint8Array): void {
+    const dev = deviceOf(device)
+    for (let i = 0; i < bytes.length; i++) {
+      dev.out.push(bytes[i] as int)
+    }
+  }
+
+  deviceOf(id: int): SimDevice {
+    const d = devices.get(id)
+    if (d != null) {
+      return d!
+    }
+    const made = new SimDevice()
+    devices.set(id, made)
+    return made
+  }
+
+  /// Handles one message; whether it was a SERIAL_CONTROL.
+  public handle(r: Received): bool {
+    const m = r.message
+    if (!(m instanceof SerialControl)) {
+      return false
+    }
+    const f = forMe
+    if (((m.flags as int) & SerialControlFlag.REPLY) != 0 || !f(m.targetSystem as int, m.targetComponent as int)) {
+      return true
+    }
+    const id = m.device as int
+    const shell = id == SerialControlDev.DEV_SHELL
+    if (!shell && !(id >= SerialControlDev.DEV_TELEM1 && id <= SerialControlDev.DEV_GPS2) && !(id >= SerialControlDev.SERIAL0 && id <= SerialControlDev.SERIAL9)) {
+      return true
+    }
+    requests += 1
+    flags.push(m.flags as int)
+    const dev = deviceOf(id)
+    const exclusive = ((m.flags as int) & SerialControlFlag.EXCLUSIVE) != 0
+    if (dev.held && !exclusive) {
+      releases += 1
+    }
+    dev.held = exclusive
+    if (m.baudrate as int != 0) {
+      dev.baud = m.baudrate as int
+      baudChanges += 1
+    }
+    let n = m.count as int
+    if (n > 70) {
+      n = 70
+    }
+    if (n > biggest) {
+      biggest = n
+    }
+    for (let i = 0; i < n && i < m.data.length; i++) {
+      const b = m.data[i] as int
+      if (shell) {
+        type(dev, b)
+      } else {
+        dev.out.push(b)
+      }
+    }
+    if (((m.flags as int) & SerialControlFlag.RESPOND) != 0 && !silent) {
+      answer(id, dev, ((m.flags as int) & SerialControlFlag.MULTI) != 0)
+    }
+    return true
+  }
+
+  /// One key typed into the shell: echoed, and a whole line run.
+  type(dev: SimDevice, b: int): void {
+    dev.out.push(b)
+    if (b == 10 || b == 13) {
+      const bytes = new Uint8Array(dev.line.length)
+      for (let i = 0; i < dev.line.length; i++) {
+        bytes.set(i, dev.line[i])
+      }
+      dev.line = []
+      let line = ""
+      try {
+        line = new TextDecoder().decode(bytes).trim()
+      } catch (e: TypeError) {
+        line = "?"
+      }
+      if (line != "") {
+        say(dev, run(line))
+      }
+      say(dev, SIM_SHELL_PROMPT)
+    } else {
+      dev.line.push(b)
+    }
+  }
+
+  /// What the shell says to `line`.
+  run(line: string): string {
+    if (line == "echo") {
+      return "\r\n"
+    }
+    if (line.startsWith("echo ")) {
+      return `${line.slice(5)}\r\n`
+    }
+    if (line == "ver") {
+      return "SimulatedAutopilot\r\n"
+    }
+    const space = line.indexOf(" ")
+    return `${if (space < 0) line else line.slice(0, space)}: command not found\r\n`
+  }
+
+  say(dev: SimDevice, text: string): void {
+    const bytes = new TextEncoder().encode(text)
+    for (let i = 0; i < bytes.length; i++) {
+      dev.out.push(bytes[i] as int)
+    }
+  }
+
+  /// Replies with what `dev` has: one reply, or (`multi`) as many as it takes.
+  answer(id: int, dev: SimDevice, multi: bool): void {
+    while (dev.out.length > 0) {
+      const n = if (dev.out.length > 70) 70 else dev.out.length
+      const reply = new SerialControl()
+      reply.device = id as u8
+      reply.flags = SerialControlFlag.REPLY as u8
+      reply.count = n as u8
+      for (let i = 0; i < n; i++) {
+        reply.data.push(dev.out[i] as u8)
+      }
+      dev.out = dev.out.slice(n)
+      conn.send(reply)
+      if (!multi) {
+        return
+      }
+    }
+  }
+}
