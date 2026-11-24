@@ -1,0 +1,291 @@
+// SERIAL_CONTROL as a byte stream: the vehicle's MAVLink shell (SERIAL_CONTROL_DEV_SHELL) or one of its serial ports (a GPS, a
+// telemetry radio: SERIAL_CONTROL_DEV_TELEM1 .. GPS2, SERIAL0 .. SERIAL9), reached over the MAVLink link, as a `ByteStream`.
+//
+// What the MAVLink specification says (SERIAL_CONTROL, SERIAL_CONTROL_DEV, SERIAL_CONTROL_FLAG), and ArduPilot's documentation of
+// the MAVLink shell and of GCS pass-through, which this client is built to:
+//  - a SERIAL_CONTROL carries at most 70 bytes (`count` says how many of `data` are meant) for one `device`; a message with no bytes
+//    is allowed (it changes only the baud rate, or just asks for what the device has);
+//  - `baudrate` 0 changes nothing; anything else sets the port's speed;
+//  - flags: REPLY marks the vehicle's answer; RESPOND asks for one (without it the vehicle answers nothing); EXCLUSIVE takes the port
+//    from whatever uses it (the GPS driver, a MAVLink link) for SERIAL_CONTROL alone, and the port is handed back by a request
+//    WITHOUT it; BLOCKING blocks on writes; MULTI asks for replies until the port is drained;
+//  - `timeout` is how long the vehicle may wait for reply data (ms);
+//  - the vehicle sends only when asked: what a device says is read by asking again and again (here: an empty request every `pollMs`
+//    while the stream is open).
+// So: `write` sends the bytes in SERIAL_CONTROL messages of 70 bytes (RESPOND | EXCLUSIVE, MULTI on the last), `read` gives the
+// bytes of the replies for that device from the target, and `close` (or `release`) sends ONE message without EXCLUSIVE and with no
+// bytes: the port goes back to its driver. Nothing but the release is sent once the stream is closing, and the release goes out
+// after a write that is under way (a chunk that still held EXCLUSIVE after it would take the port again).
+// `conn.run()` must be running: the replies are read from it. When the connection closes (`conn.close()` or `conn.shutdown()`), the
+// stream releases the port and closes too.
+import { delay } from "std/timers"
+import { Channel } from "std/streams"
+import { MavLinkConnection, Received } from "./connection"
+import { Target } from "./operations"
+import { ByteStream } from "./stream"
+import { SerialControl, SerialControlFlag } from "./dialects/common"
+
+/// The most bytes one SERIAL_CONTROL carries.
+export const SERIAL_CONTROL_BYTES: int = 70
+
+/// How often an empty request asks the vehicle for what the device said (ms): the default.
+export const SERIAL_POLL_MS: int = 50
+
+/// How many times the release is tried when it cannot be written (a poll period apart), before `releaseFailed` is set.
+export const SERIAL_RELEASE_TRIES: int = 3
+
+/// What `send` did with a message.
+const SENT: int = 0
+const SKIPPED: int = 1
+const FAILED: int = 2
+
+/// Why a `write` failed: `SERIAL_CLOSED` (the stream is closed, or closed while the bytes were being sent).
+export class SerialControlError extends Error {
+  public readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.code = code
+  }
+}
+
+export struct SerialControlOptions {
+  /// The device: a `SerialControlDev` (`DEV_SHELL` for the MAVLink shell, `SERIAL0` + n for serial port n, ...).
+  device: int
+  /// The port's speed (bits/s), set with the first message; 0 or none leaves it as it is.
+  baudrate?: int
+  /// How long the vehicle may wait for reply data (ms; SERIAL_CONTROL's `timeout`; default 0: it answers with what it has).
+  timeoutMs?: int
+  /// How often an empty request asks for what the device said (ms; default `SERIAL_POLL_MS`, at least 1).
+  pollMs?: int
+}
+
+/// A device of the vehicle (its MAVLink shell, or a serial port) as a `ByteStream`, over SERIAL_CONTROL. It begins at once: the first
+/// request (which sets the baud rate, when one is given) is sent by the constructor, and polling starts with it.
+///
+///   const shell = new SerialControlStream(conn, { system: 1, component: 1 }, { device: SerialControlDev.DEV_SHELL })
+///   await shell.write(new TextEncoder().encode("ver\n"))
+///   const out = await shell.read()
+///   await shell.release()
+export class SerialControlStream implements ByteStream {
+  public readonly conn: MavLinkConnection
+  public readonly target: Target
+  public readonly device: int
+  public readonly baudrate: int
+  public readonly timeoutMs: int
+  public readonly pollMs: int
+  /// How many SERIAL_CONTROL messages were written (polls, chunks of data and releases), how many of them were polls, and how many
+  /// writes failed.
+  public sent: int = 0
+  public polls: int = 0
+  public failed: int = 0
+  /// How many releases were written.
+  public released: int = 0
+  /// Whether the last release could not be written in `SERIAL_RELEASE_TRIES` tries: the vehicle may still hold the port for
+  /// SERIAL_CONTROL. A later `release()` tries again.
+  public releaseFailed: bool = false
+  /// What the last write that failed threw.
+  public lastError: Error? = null
+  /// How many replies for this device came, and how many bytes they carried.
+  public replies: int = 0
+  public received: int = 0
+  readonly incoming: Channel<Uint8Array> = new Channel<Uint8Array>()
+  closed: bool = false
+  /// Whether the baud rate is still to be sent (it goes with the first message only).
+  baudOwed: bool
+  /// A message is being written (the next waits for it: the release must not overtake a chunk).
+  writing: bool = false
+  listener: int = -1
+  timer: int = -1
+  unhook: (() => void)? = null
+  /// The release under way (what a second `release` waits for).
+  releasing: Promise<void>? = null
+
+  constructor(conn: MavLinkConnection, target: Target, options: SerialControlOptions) {
+    this.conn = conn
+    this.target = target
+    this.device = options.device
+    this.baudrate = options.baudrate ?? 0
+    this.timeoutMs = options.timeoutMs ?? 0
+    const poll = options.pollMs ?? SERIAL_POLL_MS
+    this.pollMs = if (poll < 1) 1 else poll
+    this.baudOwed = this.baudrate != 0
+    this.listener = conn.on((r: Received) => this.take(r))
+    this.unhook = conn.onClose(() => this.release())
+    this.poll()
+    this.timer = setInterval(() => this.poll(), this.pollMs)
+  }
+
+  /// Whether the stream was closed (by `close`, `release` or the connection closing).
+  public get isClosed(): bool {
+    return closed
+  }
+
+  /// The next bytes the device sent; null once the stream is closed.
+  public async read(): Promise<Uint8Array?> throws Error {
+    return await incoming.receive()
+  }
+
+  /// Sends `bytes` to the device, 70 bytes to a message, in order with earlier writes. Throws `SERIAL_CLOSED` when the stream is
+  /// closed, or closes before the last message is sent; a message that cannot be written throws what the connection threw.
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    if (closed) {
+      throw new SerialControlError("SERIAL_CLOSED", "the SERIAL_CONTROL stream is closed")
+    }
+    let at = 0
+    while (at < bytes.length) {
+      const n = if (bytes.length - at > SERIAL_CONTROL_BYTES) SERIAL_CONTROL_BYTES else bytes.length - at
+      const last = at + n >= bytes.length
+      const flags = SerialControlFlag.RESPOND | SerialControlFlag.EXCLUSIVE | (if (last) SerialControlFlag.MULTI else 0)
+      const done = await send(message(flags, bytes.slice(at, at + n)), false)
+      if (done == SKIPPED) {
+        throw new SerialControlError("SERIAL_CLOSED", `the SERIAL_CONTROL stream closed after ${at} of ${bytes.length} bytes were sent`)
+      }
+      const error = lastError
+      if (done == FAILED && error != null) {
+        throw error!
+      }
+      at += n
+    }
+  }
+
+  /// Stops polling, ends `read` (null), and starts the release; returns at once (`release` is the one to await).
+  public close(): void {
+    release()
+  }
+
+  /// Closes the stream and hands the port back: ONE message without EXCLUSIVE, after a write that is under way. Safe to call again
+  /// (a release that failed is tried again). It does not throw: `releaseFailed` says whether the release got out.
+  public async release(): Promise<void> {
+    stop()
+    const running = releasing
+    if (running != null) {
+      await running!
+      return
+    }
+    const work = letGo()
+    releasing = work
+    await work
+    releasing = null
+  }
+
+  /// Stops everything but the release: no poll, no chunk, no reply is taken; `read` gives null.
+  stop(): void {
+    if (closed) {
+      return
+    }
+    closed = true
+    clearInterval(timer)
+    timer = -1
+    conn.off(listener)
+    incoming.close()
+  }
+
+  async letGo(): Promise<void> {
+    releaseFailed = false
+    for (let i = 0; i < SERIAL_RELEASE_TRIES; i++) {
+      if (await send(message(0, new Uint8Array(0)), true) == SENT) {
+        released += 1
+        const off = unhook
+        unhook = null
+        if (off != null) {
+          off!()
+        }
+        return
+      }
+      if (i + 1 < SERIAL_RELEASE_TRIES) {
+        await nap(pollMs)
+      }
+    }
+    releaseFailed = true
+  }
+
+  /// An empty request: what has the device said? Skipped while a message is being written (it is asking already).
+  poll(): void {
+    if (closed || writing) {
+      return
+    }
+    polls += 1
+    send(message(SerialControlFlag.RESPOND | SerialControlFlag.EXCLUSIVE | SerialControlFlag.MULTI, new Uint8Array(0)), false)
+  }
+
+  /// Writes `m` once the message before it is written: `SENT`, `SKIPPED` (nothing but a release is written once the stream is closed,
+  /// or the connection is closing) or `FAILED` (the write threw: counted in `failed`, and kept in `lastError`).
+  async send(m: SerialControl, isRelease: bool): Promise<int> {
+    while (writing) {
+      await nap(1)
+    }
+    if (!isRelease && (closed || conn.closing)) {
+      return SKIPPED
+    }
+    writing = true
+    try {
+      await conn.send(m)
+      sent += 1
+      return SENT
+    } catch (e: Error) {
+      failed += 1
+      lastError = e
+      return FAILED
+    } finally {
+      writing = false
+    }
+  }
+
+  /// A SERIAL_CONTROL to the device with `flags` and `bytes` (70 at most); the baud rate goes with the first one.
+  message(flags: int, bytes: Uint8Array): SerialControl {
+    const m = new SerialControl()
+    m.targetSystem = target.system as u8
+    m.targetComponent = target.component as u8
+    m.device = device as u8
+    m.flags = flags as u8
+    m.timeout = timeoutMs as u16
+    if (baudOwed && (flags & SerialControlFlag.EXCLUSIVE) != 0) {
+      m.baudrate = baudrate as u32
+      baudOwed = false
+    }
+    m.count = bytes.length as u8
+    for (let i = 0; i < bytes.length; i++) {
+      m.data.push(bytes[i] as u8)
+    }
+    return m
+  }
+
+  /// Takes a reply: a SERIAL_CONTROL with REPLY, for this device, from the target.
+  take(r: Received): void {
+    const m = r.message
+    const h = r.packet.header
+    if (closed || !(m instanceof SerialControl) || ((m.flags as int) & SerialControlFlag.REPLY) == 0 || m.device as int != device) {
+      return
+    }
+    if (h.sysid != target.system || (target.component != 0 && h.compid != target.component)) {
+      return
+    }
+    replies += 1
+    let n = m.count as int
+    if (n > SERIAL_CONTROL_BYTES) {
+      n = SERIAL_CONTROL_BYTES
+    }
+    if (n > m.data.length) {
+      n = m.data.length
+    }
+    if (n == 0) {
+      return
+    }
+    const bytes = new Uint8Array(n)
+    for (let i = 0; i < n; i++) {
+      bytes.set(i, m.data[i] as int)
+    }
+    received += n
+    incoming.send(bytes)
+  }
+
+  /// Waits `ms`; an aborted wait is the end of it.
+  async nap(ms: int): Promise<void> {
+    try {
+      await delay(ms)
+    } catch (e: Error) {
+      return
+    }
+  }
+}

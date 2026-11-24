@@ -12,7 +12,7 @@ import { connect, listen } from "std/net"
 import { env, Child, Command } from "std/process"
 import { exists, mkdir, readBytes, remove, stat, writeBytes } from "std/fs"
 import { MavLinkConnection, Received } from "./connection"
-import { TcpStream } from "./stream"
+import { ByteStream, TcpStream } from "./stream"
 import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
 import { Heartbeat } from "./dialects/minimal"
 import { MavCmd, MavFrame, MavMissionType, MavParamType, MavResult, MissionAck, MissionCount, MissionItemInt, MissionRequest, MissionRequestInt, RequestDataStream, StatusText } from "./dialects/common"
@@ -37,6 +37,8 @@ import { TLOG_TIMESTAMP_LENGTH, TlogReader, TlogWriter } from "./tlog"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
 import { RADIO_STATUS_ID, SigningKey, SigningPolicy, UnsignedPolicy } from "./signing"
 import { SigningSetup } from "./signingsetup"
+import { SerialControlStream } from "./serialcontrol"
+import { SerialControlDev } from "./dialects/common"
 
 /// A running SITL and the connection to it.
 class Sitl {
@@ -1858,6 +1860,115 @@ async function theRealVehicleObeysAndLetsGoOfTheOverride(): Promise<void> throws
   }
 }
 
+/// Everything a stream gives, read in the background (a read cannot be given up: a second one on a TCP connection fails while the
+/// first waits, so one loop reads, and the test looks at what it has gathered).
+class Gathered {
+  public readonly bytes: int[] = []
+  public ended: bool = false
+
+  constructor(stream: ByteStream) {
+    this.pump(stream)
+  }
+
+  async pump(stream: ByteStream): Promise<void> {
+    try {
+      while (true) {
+        const chunk = await stream.read()
+        if (chunk == null) {
+          break
+        }
+        const c = chunk!
+        for (let i = 0; i < c.length; i++) {
+          bytes.push(c[i] as int)
+        }
+      }
+    } catch (e: Error) {
+    }
+    ended = true
+  }
+
+  /// What came from `from` on, once it holds `until` (when given) or after `ms`.
+  public async since(from: int, ms: int, until: Uint8Array? = null): Promise<int[]> throws Error {
+    const end = (Date.now() as int) + ms
+    while ((Date.now() as int) < end && !ended) {
+      if (until != null && indexOfBytes(bytes.slice(from), until!) >= 0) {
+        break
+      }
+      await delay(20)
+    }
+    return bytes.slice(from)
+  }
+}
+
+/// Where `needle` begins in `hay`; -1 when it is not there.
+function indexOfBytes(hay: int[], needle: Uint8Array): int {
+  for (let i = 0; i + needle.length <= hay.length; i++) {
+    let same = true
+    for (let k = 0; k < needle.length && same; k++) {
+      same = hay[i + k] == needle[k] as int
+    }
+    if (same) {
+      return i
+    }
+  }
+  return -1
+}
+
+/// SERIAL_CONTROL against SITL: the shell (which SITL may not have), and the pass-through to SERIAL1, whose TCP port the test holds
+/// as the "device" at the far end of the serial line: what is written through the stream comes out there, what the device sends comes
+/// back through the stream, and once the port is released ArduPilot speaks MAVLink on it again.
+async function passesBytesThroughASerialPort(): Promise<void> throws Error {
+  const sitl = await startSitl()
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  const device = new TcpStream(await connect(s.port + 2))
+  try {
+    // ArduPilot's MAVLink shell is a board's (ChibiOS) console: SITL may have none, and then says nothing (printed, not required)
+    const shell = new SerialControlStream(s.conn, s.target, { device: SerialControlDev.DEV_SHELL })
+    const said = new Gathered(shell)
+    await shell.write(new TextEncoder().encode("help\n"))
+    await said.since(0, 1500)
+    await shell.release()
+    println(`SITL SERIAL_CONTROL shell: ${said.bytes.length} bytes back (${shell.replies} replies)`)
+
+    // SERIAL1 speaks MAVLink to the device until SERIAL_CONTROL takes it
+    const fromDevice = new Gathered(device)
+    const before = await fromDevice.since(0, 2000)
+    println(`SITL SERIAL1 before: ${before.length} bytes, MAVLink 2 ${before.includes(0xFD)}`)
+    const port = new SerialControlStream(s.conn, s.target, { device: SerialControlDev.SERIAL1, baudrate: 57600 })
+    const fromPort = new Gathered(port)
+    await delay(300)
+    const ping = new Uint8Array(150)
+    for (let i = 0; i < ping.length; i++) {
+      ping.set(i, 65 + i % 26)
+    }
+    const mark = fromDevice.bytes.length
+    await port.write(ping)
+    const out = await fromDevice.since(mark, 3000, ping)
+    println(`SITL SERIAL1 out: ${out.length} bytes, the 150 written at ${indexOfBytes(out, ping)}`)
+    const pong = new TextEncoder().encode("PONG from the device at the far end of SERIAL1")
+    await device.write(pong)
+    const back = await fromPort.since(0, 3000, pong)
+    println(`SITL SERIAL1 back: ${back.length} bytes (${port.replies} replies), the answer at ${indexOfBytes(back, pong)}`)
+    await port.release()
+    await delay(500)
+    const released = fromDevice.bytes.length
+    const after = await fromDevice.since(released, 3000)
+    println(`SITL SERIAL1 after the release: ${after.length} bytes, MAVLink 2 ${after.includes(0xFD)}`)
+    expect(indexOfBytes(out, ping) >= 0).toBe(true)
+    // while SERIAL_CONTROL holds the port, MAVLink is not sent on it (the bytes written are letters: no 0xFD)
+    expect(out.includes(0xFD)).toBe(false)
+    expect(indexOfBytes(back, pong) >= 0).toBe(true)
+    expect(port.releaseFailed).toBe(false)
+    expect(after.includes(0xFD)).toBe(true)
+  } finally {
+    device.close()
+    await s.stop()
+  }
+}
+
 /// What a command on `conn` gets: its MAV_RESULT, or "no answer".
 async function answerOn(conn: MavLinkConnection, target: Target): Promise<string> {
   try {
@@ -1938,4 +2049,5 @@ describe("ArduCopter SITL", () => {
   it("refuses to calibrate while armed (SITL_FLIGHT=1)", refusesToCalibrateWhileArmed)
   it("calibrates the compass, and keeps the result only when it is accepted (SITL_FLIGHT=1)", calibratesTheCompassAndKeepsItOnlyWhenAccepted)
   it("cancels the compass calibration when the work is left (SITL_FLIGHT=1)", cancelsTheCompassWhenTheWorkIsLeft)
+  it("passes bytes through SERIAL1 by SERIAL_CONTROL, both ways, and gives the port back", passesBytesThroughASerialPort)
 })

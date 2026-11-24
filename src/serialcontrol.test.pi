@@ -1,0 +1,376 @@
+import { describe, it, expect } from "std/test"
+import { delay, withTimeout } from "std/timers"
+import { MavLinkConnection } from "./connection"
+import { ByteStream, MemoryStream } from "./stream"
+import { SimulatedAutopilot } from "./simulator"
+import { SIM_SHELL_PROMPT } from "./simserial"
+import { SERIAL_CONTROL_BYTES, SERIAL_RELEASE_TRIES, SerialControlError, SerialControlStream } from "./serialcontrol"
+import { SerialControlDev, SerialControlFlag } from "./dialects/common"
+
+/// The ground station's end of the link, whose writes can be made to fail.
+class FlakyStream implements ByteStream {
+  readonly inner: ByteStream
+  /// How many of the next writes fail (counted down); -1: all of them.
+  public failWrites: int = 0
+
+  constructor(inner: ByteStream) {
+    this.inner = inner
+  }
+
+  public read(): Promise<Uint8Array?, Error> {
+    return inner.read()
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    if (failWrites != 0) {
+      if (failWrites > 0) {
+        failWrites -= 1
+      }
+      throw new Error("the link is down")
+    }
+    await inner.write(bytes)
+  }
+
+  public close(): void {
+    inner.close()
+  }
+}
+
+/// A ground station and a simulated vehicle (system 1, component 1) on a link that can fail.
+class Rig {
+  public readonly sim: SimulatedAutopilot
+  public readonly link: FlakyStream
+  public readonly gcs: MavLinkConnection
+
+  constructor() {
+    const ends = MemoryStream.pair()
+    this.sim = new SimulatedAutopilot(ends[1])
+    this.link = new FlakyStream(ends[0])
+    this.gcs = new MavLinkConnection(this.link)
+    this.gcs.run()
+    this.sim.start(1000)
+  }
+
+  public open(device: int, baudrate: int = 0, pollMs: int = 20): SerialControlStream {
+    new SerialControlStream(gcs, { system: 1, component: 1 }, { device: device, baudrate: baudrate, pollMs: pollMs })
+  }
+
+  public close(): void {
+    sim.stop()
+    gcs.close()
+  }
+}
+
+/// What `stream` gives until `count` bytes have come or nothing comes for `quietMs`.
+async function readBytes(stream: ByteStream, count: int, quietMs: int = 500): Promise<int[]> throws Error {
+  const got: int[] = []
+  while (got.length < count) {
+    let chunk: Uint8Array? = null
+    try {
+      chunk = await withTimeout(stream.read(), quietMs)
+    } catch (e: Error) {
+      return got
+    }
+    if (chunk == null) {
+      return got
+    }
+    const c = chunk!
+    for (let i = 0; i < c.length; i++) {
+      got.push(c[i] as int)
+    }
+  }
+  return got
+}
+
+/// What `stream` gives as text, until it holds `until` or nothing comes for `quietMs`.
+async function readText(stream: ByteStream, until: string, quietMs: int = 500): Promise<string> throws Error {
+  let text = ""
+  while (!text.includes(until)) {
+    let chunk: Uint8Array? = null
+    try {
+      chunk = await withTimeout(stream.read(), quietMs)
+    } catch (e: Error) {
+      return text
+    }
+    if (chunk == null) {
+      return text
+    }
+    text += new TextDecoder().decode(chunk!)
+  }
+  return text
+}
+
+function pattern(n: int): Uint8Array {
+  const out = new Uint8Array(n)
+  for (let i = 0; i < n; i++) {
+    out.set(i, (i * 7 + 3) & 0xFF)
+  }
+  return out
+}
+
+async function echoesThroughTheShell(): Promise<void> throws Error {
+  const rig = new Rig()
+  const shell = rig.open(SerialControlDev.DEV_SHELL)
+  await shell.write(new TextEncoder().encode("echo hello pico\n"))
+  const out = await readText(shell, `hello pico\r\n${SIM_SHELL_PROMPT}`)
+  await shell.release()
+  rig.close()
+  expect(out).toBe(`echo hello pico\nhello pico\r\n${SIM_SHELL_PROMPT}`)
+}
+
+async function runsCommandsOneAfterTheOther(): Promise<void> throws Error {
+  const rig = new Rig()
+  const shell = rig.open(SerialControlDev.DEV_SHELL)
+  await shell.write(new TextEncoder().encode("ver\n"))
+  const first = await readText(shell, SIM_SHELL_PROMPT)
+  await shell.write(new TextEncoder().encode("reboot now\n"))
+  const second = await readText(shell, SIM_SHELL_PROMPT)
+  await shell.release()
+  rig.close()
+  expect(first).toBe(`ver\nSimulatedAutopilot\r\n${SIM_SHELL_PROMPT}`)
+  expect(second).toBe(`reboot now\nreboot: command not found\r\n${SIM_SHELL_PROMPT}`)
+}
+
+async function sendsALongLineInMessagesOf70(): Promise<void> throws Error {
+  const rig = new Rig()
+  const shell = rig.open(SerialControlDev.DEV_SHELL)
+  // 5 + 150 + 1 = 156 bytes: three messages (70, 70, 16), and the answer is longer than one too
+  const words = "x".repeat(150)
+  await shell.write(new TextEncoder().encode(`echo ${words}\n`))
+  const out = await readText(shell, `${words}\r\n${SIM_SHELL_PROMPT}`)
+  await shell.release()
+  rig.close()
+  expect(out).toBe(`echo ${words}\n${words}\r\n${SIM_SHELL_PROMPT}`)
+  expect(rig.sim.serial.biggest).toBe(SERIAL_CONTROL_BYTES)
+}
+
+async function echoesMoreThanOneMessageThroughALoopback(): Promise<void> throws Error {
+  const rig = new Rig()
+  const port = rig.open(SerialControlDev.SERIAL2)
+  const data = pattern(500)
+  await port.write(data)
+  const back = await readBytes(port, data.length)
+  await port.release()
+  rig.close()
+  expect(back.length).toBe(500)
+  let same = true
+  for (let i = 0; i < data.length; i++) {
+    if (back[i] != data[i] as int) {
+      same = false
+    }
+  }
+  expect(same).toBe(true)
+  expect(rig.sim.serial.biggest).toBe(SERIAL_CONTROL_BYTES)
+  expect(port.received).toBe(500)
+}
+
+async function flagsEveryMessageAsTheSpecificationSays(): Promise<void> throws Error {
+  const rig = new Rig()
+  // no polls in the way (a poll every 10 s): what is seen is the first poll, the chunks and the release
+  const port = new SerialControlStream(rig.gcs, { system: 1, component: 1 }, { device: SerialControlDev.SERIAL1, pollMs: 10_000 })
+  await port.write(pattern(150))
+  await port.release()
+  await delay(50)
+  rig.close()
+  const R = SerialControlFlag.RESPOND
+  const E = SerialControlFlag.EXCLUSIVE
+  const M = SerialControlFlag.MULTI
+  expect(rig.sim.serial.flags.map((f: int) => `${f}`).join(",")).toBe(`${R | E | M},${R | E},${R | E},${R | E | M},0`)
+  expect(rig.sim.serial.releases).toBe(1)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL1)).toBe(false)
+}
+
+async function pollsForWhatTheDeviceSaysByItself(): Promise<void> throws Error {
+  const rig = new Rig()
+  const gps = rig.open(SerialControlDev.DEV_GPS1, 0, 20)
+  await delay(60)
+  rig.sim.serial.feed(SerialControlDev.DEV_GPS1, pattern(100))
+  const got = await readBytes(gps, 100)
+  await gps.release()
+  rig.close()
+  expect(got.length).toBe(100)
+  expect(gps.polls > 1).toBe(true)
+  expect(rig.sim.serial.exclusive(SerialControlDev.DEV_GPS1)).toBe(false)
+}
+
+async function setsTheBaudRateOnceWhenGiven(): Promise<void> throws Error {
+  const rig = new Rig()
+  const port = rig.open(SerialControlDev.SERIAL3, 57600)
+  await port.write(pattern(10))
+  await readBytes(port, 10)
+  await port.release()
+  const other = rig.open(SerialControlDev.SERIAL4)
+  await other.write(pattern(10))
+  await readBytes(other, 10)
+  await other.release()
+  rig.close()
+  expect(rig.sim.serial.baudrate(SerialControlDev.SERIAL3)).toBe(57600)
+  expect(rig.sim.serial.baudrate(SerialControlDev.SERIAL4)).toBe(0)
+  expect(rig.sim.serial.baudChanges).toBe(1)
+}
+
+async function keepsTheDevicesApart(): Promise<void> throws Error {
+  const rig = new Rig()
+  const shell = rig.open(SerialControlDev.DEV_SHELL)
+  const port = rig.open(SerialControlDev.SERIAL2)
+  await port.write(new TextEncoder().encode("PORT"))
+  await shell.write(new TextEncoder().encode("echo SHELL\n"))
+  const fromShell = await readText(shell, SIM_SHELL_PROMPT)
+  const fromPort = await readText(port, "PORT")
+  await shell.release()
+  await port.release()
+  rig.close()
+  expect(fromShell).toBe(`echo SHELL\nSHELL\r\n${SIM_SHELL_PROMPT}`)
+  expect(fromPort).toBe("PORT")
+}
+
+async function closeReleasesAndEndsTheStream(): Promise<void> throws Error {
+  const rig = new Rig()
+  const port = rig.open(SerialControlDev.SERIAL2)
+  await port.write(pattern(5))
+  await readBytes(port, 5)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL2)).toBe(true)
+  const waiting = port.read()
+  port.close()
+  expect(await waiting).toBe(null)
+  expect(await port.read()).toBe(null)
+  await delay(100)
+  const requests = rig.sim.serial.requests
+  await delay(100)
+  let code = ""
+  try {
+    await port.write(pattern(3))
+  } catch (e: SerialControlError) {
+    code = e.code
+  }
+  // a second release is safe, and sends another
+  await port.release()
+  rig.close()
+  expect(port.isClosed).toBe(true)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL2)).toBe(false)
+  expect(rig.sim.serial.releases).toBe(1)
+  expect(port.released).toBe(2)
+  // nothing but the release after the close: no poll
+  expect(rig.sim.serial.requests).toBe(requests + 1)
+  expect(rig.sim.serial.flags[rig.sim.serial.flags.length - 1]).toBe(0)
+  expect(code).toBe("SERIAL_CLOSED")
+}
+
+async function releasesAfterAWriteFailed(): Promise<void> throws Error {
+  const rig = new Rig()
+  const port = rig.open(SerialControlDev.SERIAL2, 0, 10_000)
+  await delay(20)
+  rig.link.failWrites = 1
+  let failed = ""
+  try {
+    await port.write(pattern(80))
+  } catch (e: SerialControlError) {
+    failed = e.code
+  } catch (e: Error) {
+    failed = e.message
+  }
+  // the link is back: the release goes out
+  await port.release()
+  rig.close()
+  expect(failed).toBe("the link is down")
+  expect(port.failed).toBe(1)
+  expect(port.releaseFailed).toBe(false)
+  expect(rig.sim.serial.releases).toBe(1)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL2)).toBe(false)
+}
+
+async function triesTheReleaseAgainAndSaysWhenItNeverGotOut(): Promise<void> throws Error {
+  const rig = new Rig()
+  const port = rig.open(SerialControlDev.SERIAL2)
+  await port.write(pattern(4))
+  await readBytes(port, 4)
+  // the first try fails, the second gets out
+  rig.link.failWrites = 1
+  await port.release()
+  expect(port.releaseFailed).toBe(false)
+  expect(port.released).toBe(1)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL2)).toBe(false)
+
+  const other = rig.open(SerialControlDev.SERIAL3)
+  await other.write(pattern(4))
+  await readBytes(other, 4)
+  rig.link.failWrites = -1
+  await other.release()
+  expect(other.releaseFailed).toBe(true)
+  expect(other.failed).toBe(SERIAL_RELEASE_TRIES)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL3)).toBe(true)
+  // a later release tries again
+  rig.link.failWrites = 0
+  await other.release()
+  rig.close()
+  expect(other.releaseFailed).toBe(false)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL3)).toBe(false)
+}
+
+async function theReleaseComesAfterAWriteUnderWay(): Promise<void> throws Error {
+  const rig = new Rig()
+  const port = rig.open(SerialControlDev.SERIAL2, 0, 10_000)
+  const writing = port.write(pattern(700))
+  port.close()
+  let code = ""
+  try {
+    await writing
+  } catch (e: SerialControlError) {
+    code = e.code
+  }
+  await port.release()
+  await delay(50)
+  rig.close()
+  expect(code).toBe("SERIAL_CLOSED")
+  // whatever chunks went out before the close, the release is the last message, and the port is free
+  expect(rig.sim.serial.flags[rig.sim.serial.flags.length - 1]).toBe(0)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL2)).toBe(false)
+  expect(rig.sim.serial.releases).toBe(1)
+}
+
+async function theConnectionShuttingDownReleases(): Promise<void> throws Error {
+  const rig = new Rig()
+  const port = rig.open(SerialControlDev.SERIAL2)
+  await port.write(pattern(4))
+  await readBytes(port, 4)
+  await rig.gcs.shutdown()
+  await delay(20)
+  rig.sim.stop()
+  expect(port.isClosed).toBe(true)
+  expect(port.released).toBe(1)
+  expect(rig.sim.serial.releases).toBe(1)
+  expect(rig.sim.serial.exclusive(SerialControlDev.SERIAL2)).toBe(false)
+}
+
+async function ignoresRepliesOfAnotherVehicle(): Promise<void> throws Error {
+  const rig = new Rig()
+  // system 2 is not there: the vehicle (system 1) answers nothing it is not sent, and the stream takes nothing of system 1
+  const port = new SerialControlStream(rig.gcs, { system: 2, component: 1 }, { device: SerialControlDev.SERIAL2, pollMs: 20 })
+  const mine = rig.open(SerialControlDev.SERIAL2)
+  await mine.write(pattern(30))
+  const got = await readBytes(mine, 30)
+  const none = await readBytes(port, 1, 150)
+  await port.release()
+  await mine.release()
+  rig.close()
+  expect(got.length).toBe(30)
+  expect(none.length).toBe(0)
+  expect(port.replies).toBe(0)
+}
+
+describe("SerialControlStream", () => {
+  it("echoes through the shell", echoesThroughTheShell)
+  it("runs commands one after the other", runsCommandsOneAfterTheOther)
+  it("sends a long line in messages of 70 bytes, and reads an answer longer than one", sendsALongLineInMessagesOf70)
+  it("echoes 500 bytes through a loopback plug", echoesMoreThanOneMessageThroughALoopback)
+  it("flags each message: RESPOND | EXCLUSIVE, MULTI on a poll and on the last chunk, nothing on the release", flagsEveryMessageAsTheSpecificationSays)
+  it("polls for what the device says by itself", pollsForWhatTheDeviceSaysByItself)
+  it("sets the baud rate once, and only when given", setsTheBaudRateOnceWhenGiven)
+  it("keeps two devices apart", keepsTheDevicesApart)
+  it("close releases the port, ends reads, refuses writes, and sends nothing more", closeReleasesAndEndsTheStream)
+  it("releases after a write failed", releasesAfterAWriteFailed)
+  it("tries the release again, and says when it never got out", triesTheReleaseAgainAndSaysWhenItNeverGotOut)
+  it("sends the release after a write that is under way", theReleaseComesAfterAWriteUnderWay)
+  it("releases when the connection shuts down", theConnectionShuttingDownReleases)
+  it("takes no reply of another vehicle", ignoresRepliesOfAnotherVehicle)
+})

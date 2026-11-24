@@ -152,6 +152,15 @@ Status: **in development (MV1).**
   out, once; the last one out gives the base back (no base: the vehicle's own rate again). It does not throw when the vehicle is gone. `SimulatedAutopilot.rateScript` gives the simulator a roll rate to measure: ATTITUDE's `rollspeed` (actual) and
   ATTITUDE_TARGET's `bodyRollRate` (desired; sent only when asked for with `SET_MESSAGE_INTERVAL`, as ArduPilot sends it in no stream), a square wave of 1 rad/s
   every 2 s that the actual rate follows with a second-order response (damping 0.5, 15 rad/s: 16 % overshoot, 10 to 90 % in about 0.11 s; src/simrate.pi).
+- **Done:** `SERIAL_CONTROL` as a byte stream (src/serialcontrol.pi). `SerialControlStream(conn, target, { device, baudrate?, timeoutMs?, pollMs? })`
+  is a `ByteStream` to the vehicle's MAVLink shell (`SerialControlDev.DEV_SHELL`) or one of its serial ports (`SERIAL0` + n, `DEV_TELEM1` ..
+  `DEV_GPS2`): `write` sends 70 bytes to a message with `RESPOND | EXCLUSIVE` (and `MULTI` on the last), `read` gives the bytes of the vehicle's
+  replies for that device, and while it is open an empty request every `pollMs` (50 ms) asks for what the device said (the vehicle answers only
+  when asked). The baud rate, when given, goes with the first message. `close()` (or `await release()`) sends ONE message without `EXCLUSIVE`,
+  which hands the port back: after a write that is under way, after a write that failed, tried again when it cannot be written
+  (`releaseFailed` says it never got out), and also when the connection closes. The simulator answers it (src/simserial.pi): a tiny shell
+  (echo as typed, `echo`, `ver`) and a loopback plug on every serial port. Against ArduPilot SITL it passes bytes both ways through SERIAL1
+  and gives the port back to MAVLink; SITL has no MAVLink shell (it answers nothing for `DEV_SHELL`).
 - **Next:** ArduPilot SITL over UDP/TCP (MV2).
 
 ```pico

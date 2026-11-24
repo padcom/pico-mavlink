@@ -24,6 +24,7 @@ import { SimRc } from "./simrc"
 import { SimMissions } from "./simmission"
 import { SimControl } from "./simcontrol"
 import { SimSigning } from "./simsigning"
+import { SimSerial } from "./simserial"
 import { actualRate, desiredRate } from "./simrate"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
 import { Attitude, AttitudeTarget, CommandAck, CommandLong, FileTransferProtocol, MavCmd, MavDataStream, MavParamType, MavResult, ParamRequestList, ParamRequestRead, ParamSet, ParamValue, RcChannels, RequestDataStream, ServoOutputRaw, SysStatus, SystemTime, TimeSync } from "./dialects/common"
@@ -227,6 +228,8 @@ export class SimulatedAutopilot {
   /// Arming, flight modes, pause and the pre-arm checks (COMPONENT_ARM_DISARM, DO_SET_MODE, DO_PAUSE_CONTINUE, RUN_PREARM_CHECKS): see
   /// simcontrol.pi. By itself the vehicle arms at its third tick; a `prearm` text makes an arm FAILED with "PreArm: <text>".
   public readonly control: SimControl
+  /// SERIAL_CONTROL: a tiny shell (DEV_SHELL) and a loopback plug on every serial port: see simserial.pi.
+  public readonly serial: SimSerial
   /// Whether GLOBAL_POSITION_INT (where the simulated vehicle is, `control.lat`, `control.lon`, `control.height`) is sent at each tick (off: nothing).
   public positionStream: bool = false
   /// MAVLink 2 signing: SETUP_SIGNING, signed telemetry, and the packets it takes (src/simsigning.pi).
@@ -255,6 +258,7 @@ export class SimulatedAutopilot {
       () => this.control.homeLon,
       () => this.control.homeAmsl,
     )
+    this.serial = new SimSerial(conn, (system: int, component: int) => this.forMe(system, component))
     conn.on((r: Received) => this.handle(r))
   }
 
@@ -496,7 +500,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (signing.handle(r) || logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || rcOverride.handle(r) || missions.handle(r) || control.handle(r)) {
+    if (signing.handle(r) || logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || rcOverride.handle(r) || missions.handle(r) || control.handle(r) || serial.handle(r)) {
       return
     }
     const m = r.message
