@@ -1,0 +1,377 @@
+// A `.tlog` file read back: `TlogFile` indexes the records of a file once (with `TlogReader`, so it skips what is no record and
+// stops at the last whole record of a file that was cut) and then reads them in order or from anywhere (`seek`); `TlogPlayer`
+// gives them with the timing they were recorded with, at a chosen speed.
+//
+// The time of a recording is not always straight (see `TlogReader`): a timestamp may step back a little (jitter), or step back or
+// jump forward far (a new segment: a clock that was set, a recording appended to another). Playback has its own time line, the
+// POSITION: microseconds from the first record, which never goes back. Within a segment it grows with the timestamps (a step back
+// is no time at all); a new segment follows the one before it at once. `duration` is the position of the last record, and `seek`
+// takes a position.
+import { File, open } from "std/fs"
+import { delay } from "std/timers"
+import { ByteStream } from "./stream"
+import { TLOG_TIMESTAMP_LENGTH, TlogOptions, TlogReader, TlogReport } from "./tlog"
+
+/// How much of the file is read at a time (bytes).
+const BLOCK: int = 65536
+
+/// The longest a player sleeps before it looks again at its speed and position (ms).
+const NAP_MS: int = 100
+
+/// A record of a file: where it is in the recording and its frame.
+export class TlogEntry {
+  /// Its place in the file: 0 for the first record.
+  public readonly index: int
+  /// Microseconds since 1970, as recorded.
+  public readonly timeUs: int
+  /// Microseconds from the first record on the playback time line (see the top of this file).
+  public readonly positionUs: int
+  /// The segment of the recording it is in (`TlogRecord.segment`).
+  public readonly segment: int
+  /// The frame, as it was on the wire.
+  public readonly frame: Uint8Array
+
+  constructor(index: int, timeUs: int, positionUs: int, segment: int, frame: Uint8Array) {
+    this.index = index
+    this.timeUs = timeUs
+    this.positionUs = positionUs
+    this.segment = segment
+    this.frame = frame
+  }
+}
+
+/// Opens the recording at `path` and indexes it (reads it through once). Close it when done.
+export async function openTlog(path: string, options: TlogOptions = {}): Promise<TlogFile> throws Error {
+  const file = await open(path)
+  const index = new TlogFile(path, file, new TlogReader(options))
+  try {
+    await index.scan()
+  } catch (e: Error) {
+    await file.close()
+    throw e
+  }
+  return index
+}
+
+/// A recording in a file, indexed: what `TlogReader` found in it, read from anywhere.
+export class TlogFile {
+  public readonly path: string
+  readonly file: File
+  readonly reader: TlogReader
+  readonly times: int[] = []
+  readonly positions: int[] = []
+  readonly segments: int[] = []
+  readonly offsets: int[] = []
+  readonly lengths: int[] = []
+  /// The next record `next` gives, and one more at every seek (a read under way when it moved does not move it on).
+  cursor: int = 0
+  seeks: int = 0
+  /// The bytes of the file from `blockAt` on, as last read.
+  block: Uint8Array = new Uint8Array(0)
+  blockAt: int = 0
+
+  constructor(path: string, file: File, reader: TlogReader) {
+    this.path = path
+    this.file = file
+    this.reader = reader
+  }
+
+  /// What the reader found: records, bytes skipped, `cutEnd` for a file that ends in the middle of a record, and so on.
+  public get report(): TlogReport {
+    return reader.report
+  }
+
+  /// The records.
+  public get count(): int {
+    return times.length
+  }
+
+  /// The position of the last record (microseconds from the first); 0 for a file with one record or none.
+  public get duration(): int {
+    if (positions.length == 0) 0 else positions[positions.length - 1]
+  }
+
+  /// The index of the record `next` gives (`count` at the end).
+  public get index(): int {
+    return cursor
+  }
+
+  /// The time (microseconds since 1970) and the position of record `i`.
+  public timeAt(i: int): int {
+    return times[i]
+  }
+
+  public positionAt(i: int): int {
+    return positions[i]
+  }
+
+  /// Where record `i` (its timestamp) begins in the file.
+  public offsetOf(i: int): int {
+    return offsets[i]
+  }
+
+  /// Reads the file through and indexes its records (`openTlog` does this, once).
+  public async scan(): Promise<void> throws Error {
+    let latest = 0
+    while (true) {
+      const chunk = await file.read(BLOCK)
+      if (chunk == null) {
+        break
+      }
+      reader.push(chunk!)
+      latest = take(latest)
+    }
+    reader.finish()
+    take(latest)
+  }
+
+  /// Indexes the records the reader has whole; `latest` is the latest time of the segment so far, and what it is after.
+  take(latestBefore: int): int {
+    let latest = latestBefore
+    while (true) {
+      const r = reader.next()
+      if (r == null) {
+        break
+      }
+      const rec = r!
+      let position = 0
+      const n = times.length
+      if (n > 0) {
+        position = positions[n - 1]
+        if (rec.segment != segments[n - 1]) {
+          latest = rec.timeUs
+        } else if (rec.timeUs > latest) {
+          position += rec.timeUs - latest
+          latest = rec.timeUs
+        }
+      } else {
+        latest = rec.timeUs
+      }
+      times.push(rec.timeUs)
+      positions.push(position)
+      segments.push(rec.segment)
+      offsets.push(rec.offset)
+      lengths.push(rec.frame.length)
+    }
+    return latest
+  }
+
+  /// The first record at or after `positionUs` (`count` when there is none).
+  public indexAt(positionUs: int): int {
+    let lo = 0
+    let hi = positions.length
+    while (lo < hi) {
+      const mid = (lo + hi) / 2
+      if (positions[mid] < positionUs) {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    return lo
+  }
+
+  /// Makes `next` give the first record at or after `positionUs` (microseconds from the first record); its index.
+  public seek(positionUs: int): int {
+    cursor = indexAt(positionUs)
+    seeks += 1
+    return cursor
+  }
+
+  /// Makes `next` give record `i` (0 to `count`).
+  public seekIndex(i: int): void {
+    cursor = if (i < 0) 0 else if (i > times.length) times.length else i
+    seeks += 1
+  }
+
+  /// Record `i` (0 to `count - 1`), read from the file.
+  public async entry(i: int): Promise<TlogEntry> throws Error {
+    const from = offsets[i] + TLOG_TIMESTAMP_LENGTH
+    const frame = await bytesAt(from, lengths[i])
+    return new TlogEntry(i, times[i], positions[i], segments[i], frame)
+  }
+
+  /// The next record, or null at the end.
+  public async next(): Promise<TlogEntry?> throws Error {
+    if (cursor >= times.length) {
+      return null
+    }
+    const at = cursor
+    const before = seeks
+    const e = await entry(at)
+    if (seeks == before) {
+      cursor = at + 1
+    }
+    return e
+  }
+
+  /// `n` bytes of the file at `from`, from the block that holds them (read again when it does not).
+  async bytesAt(from: int, n: int): Promise<Uint8Array> throws Error {
+    if (from < blockAt || from + n > blockAt + block.length) {
+      await file.seek(from)
+      const read = new Uint8Array(if (n > BLOCK) n else BLOCK)
+      let got = 0
+      while (got < read.length) {
+        const chunk = await file.read(read.length - got)
+        if (chunk == null) {
+          break
+        }
+        read.setAll(chunk!, got)
+        got += chunk!.length
+      }
+      if (got < n) {
+        throw new Error(`${path}: the file is shorter than when it was indexed (byte ${from + n})`)
+      }
+      block = read.slice(0, got)
+      blockAt = from
+    }
+    return block.slice(from - blockAt, from - blockAt + n)
+  }
+
+  /// Closes the file (twice is fine).
+  public async close(): Promise<void> throws Error {
+    await file.close()
+  }
+}
+
+/// The options of a player.
+export struct TlogPlayerOptions {
+  /// How fast: 1.0 as recorded, 2.0 twice as fast, 0.5 half (default 1.0; more than 0).
+  speed?: f64
+  /// Milliseconds on a monotonic clock (default `performance.now()`), and a sleep of `ms` milliseconds that an abort cuts short
+  /// (default `delay`): both replaceable, for tests.
+  clock?: () => f64
+  sleep?: (ms: int, signal: AbortSignal?) => Promise<void, Error>
+}
+
+/// Gives the records of a file with the timing they were recorded with, `speed` times as fast. The first record goes at once, each
+/// other one when its position is reached; a player that falls behind (a slow receiver) catches up by giving what is late at once,
+/// it does not drift. Speed and position can be changed while it plays.
+export class TlogPlayer {
+  public readonly file: TlogFile
+  readonly clock: () => f64
+  readonly sleep: (ms: int, signal: AbortSignal?) => Promise<void, Error>
+  rate: f64 = 1.0
+  /// The playback position `anchorPos` was at the clock's `anchorMs`.
+  anchorMs: f64 = 0.0
+  anchorPos: int = 0
+  /// One more at every `seek`: a record fetched before it is not given.
+  moves: int = 0
+  /// Records given.
+  public played: int = 0
+
+  constructor(file: TlogFile, options: TlogPlayerOptions = {}) {
+    this.file = file
+    this.clock = options.clock ?? (() => performance.now())
+    this.sleep = options.sleep ?? ((ms: int, signal: AbortSignal?) => delay(ms, signal))
+    const s = options.speed ?? 1.0
+    this.rate = if (s > 0.0) s else 1.0
+  }
+
+  /// The time on the clock (ms).
+  now(): f64 {
+    const c = clock
+    return c()
+  }
+
+  /// The speed: 1.0 is as recorded.
+  public get speed(): f64 {
+    return rate
+  }
+
+  /// Changes the speed from now on (the position reached so far stays); false, and nothing changes, unless `s` is more than 0.
+  public setSpeed(s: f64): bool {
+    if (!(s > 0.0)) {
+      return false
+    }
+    const at = now()
+    anchorPos = positionAt(at)
+    anchorMs = at
+    rate = s
+    return true
+  }
+
+  /// The playback position at `at` on the clock (microseconds from the first record).
+  positionAt(at: f64): int {
+    return anchorPos + ((at - anchorMs) * 1000.0 * rate) as int
+  }
+
+  /// Goes on from the first record at or after `positionUs`, now; its index.
+  public seek(positionUs: int): int {
+    const i = file.seek(positionUs)
+    moves += 1
+    anchorPos = if (i < file.count) file.positionAt(i) else file.duration
+    anchorMs = now()
+    return i
+  }
+
+  /// The records from the file's position on, each when it is due, until the end or until `signal` aborts.
+  public async* entries(signal: AbortSignal? = null): AsyncIterator<TlogEntry> throws Error {
+    const first = file.index
+    anchorPos = if (first < file.count) file.positionAt(first) else file.duration
+    anchorMs = now()
+    while (true) {
+      if (signal != null && signal!.aborted) {
+        return
+      }
+      const before = moves
+      const e = await file.next()
+      if (e == null) {
+        return
+      }
+      const entry = e!
+      let moved = false
+      while (true) {
+        if (moves != before) {
+          moved = true
+          break
+        }
+        const wait = ((entry.positionUs - positionAt(now())) as f64) / 1000.0 / rate
+        if (wait <= 0.0) {
+          break
+        }
+        const ms = if (wait > (NAP_MS as f64)) NAP_MS else (wait as int) + 1
+        if (!(await nap(ms, signal))) {
+          return
+        }
+      }
+      if (moved) {
+        continue
+      }
+      played += 1
+      yield entry
+    }
+  }
+
+  /// Sleeps; false when `signal` aborted.
+  async nap(ms: int, signal: AbortSignal?): Promise<bool> {
+    try {
+      const s = sleep
+      await s(ms, signal)
+    } catch (e: Error) {
+      return false
+    }
+    return signal == null || !signal!.aborted
+  }
+
+  /// Calls `deliver` with every record when it is due (see `entries`); the count given.
+  public async play(deliver: (e: TlogEntry) => void, signal: AbortSignal? = null): Promise<int> throws Error {
+    let n = 0
+    for await (const e of entries(signal)) {
+      deliver(e)
+      n += 1
+    }
+    return n
+  }
+
+  /// Writes every frame to `stream` when it is due (a `MemoryStream` with a `MavLinkConnection` on its other end replays the
+  /// recording to an application); the count written. The stream is not closed.
+  public async playTo(stream: ByteStream, signal: AbortSignal? = null): Promise<int> throws Error {
+    let n = 0
+    for await (const e of entries(signal)) {
+      await stream.write(e.frame)
+      n += 1
+    }
+    return n
+  }
+}
