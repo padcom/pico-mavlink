@@ -10,7 +10,7 @@ import { describe, it, expect } from "std/test"
 import { delay } from "std/timers"
 import { connect, listen } from "std/net"
 import { env, Child, Command } from "std/process"
-import { exists, mkdir, readBytes, remove, writeBytes } from "std/fs"
+import { exists, mkdir, readBytes, remove, stat, writeBytes } from "std/fs"
 import { MavLinkConnection, Received } from "./connection"
 import { ByteStream, TcpStream } from "./stream"
 import { AutopilotVersionRead, CommandCall, ParamList, ParamRead, ParamWrite, Target, VehicleDiscovery } from "./operations"
@@ -35,6 +35,8 @@ import { LogProtocolClient, LogSink } from "./logprotocol"
 import { DfDecoder } from "./dataflash"
 import { TLOG_TIMESTAMP_LENGTH, TlogReader, TlogWriter } from "./tlog"
 import { ParamEncoding, TypedParamValue, encodingOf, showParam } from "./params"
+import { RADIO_STATUS_ID, SigningKey, SigningPolicy, UnsignedPolicy } from "./signing"
+import { SigningSetup } from "./signingsetup"
 import { SerialControlStream } from "./serialcontrol"
 import { SerialControlDev } from "./dialects/common"
 
@@ -69,18 +71,33 @@ class Sitl {
   }
 }
 
-/// The SITL executable: `SITL_BINARY`, else `arducopter` on the PATH; null when there is none.
+/// The SITL executable: `SITL_BINARY`, else `arducopter` on the PATH; null when there is none. A link whose target is gone is no
+/// executable (`exists` sees the link itself: a dangling `arducopter` link on the PATH made every test wait 60 s for a SITL that
+/// never started, "SITL did not listen on 5790").
 async function findBinary(): Promise<string?> throws Error {
   const given = env.get("SITL_BINARY")
   if (given != null && given! != "") {
+    if (!(await isFile(given!))) {
+      throw new Error(`SITL_BINARY is ${given!}, and there is no file there`)
+    }
     return given
   }
   for (const dir of (env.get("PATH") ?? "").split(":")) {
-    if (dir != "" && await exists(`${dir}/arducopter`)) {
+    if (dir != "" && await isFile(`${dir}/arducopter`)) {
       return `${dir}/arducopter`
     }
   }
   return null
+}
+
+/// Whether `path` is a file, through any links.
+async function isFile(path: string): Promise<bool> {
+  try {
+    const info = await stat(path)
+    return !info.isDirectory
+  } catch (e: Error) {
+    return false
+  }
 }
 
 /// The default parameter files of the quad (`--defaults a,b`), if the build ships them. Builds such as Copter-4.7.2 carry no
@@ -1952,7 +1969,69 @@ async function passesBytesThroughASerialPort(): Promise<void> throws Error {
   }
 }
 
+/// What a command on `conn` gets: its MAV_RESULT, or "no answer".
+async function answerOn(conn: MavLinkConnection, target: Target): Promise<string> {
+  try {
+    const r = await new CommandCall(conn, target, { timeoutMs: 500, retries: 1 }).run(MavCmd.REQUEST_MESSAGE, [148.0])
+    return `${r}`
+  } catch (e: Error) {
+    return "no answer"
+  }
+}
+
+/// Whether the next heartbeat of `target` on `conn` comes signed ("none" when none comes).
+async function heartbeatOn(conn: MavLinkConnection, target: Target): Promise<string> throws Error {
+  const r = await conn.waitFor((x: Received) => x.message instanceof Heartbeat && x.packet.header.sysid == target.system, 3000)
+  if (r == null) "none" else if (r!.packet.signature != null) "signed" else "unsigned"
+}
+
+async function provisionsSigningAndDisablesIt(): Promise<void> throws Error {
+  const sitl = await startSitl()
+  if (sitl == null) {
+    return
+  }
+  const s = sitl!
+  // SERIAL1: a second link to the same vehicle, to see what an unsigned (or wrongly signed) ground station gets there.
+  const other = new MavLinkConnection(new TcpStream(await connect(s.port + 2)))
+  other.run()
+  try {
+    expect(await answerOn(other, s.target)).toBe("0")
+    const key = SigningKey.random()
+    const policy = new SigningPolicy(key, UnsignedPolicy.AcceptListed([RADIO_STATUS_ID]))
+    const result = await new SigningSetup(s.conn, s.target, { timeoutMs: 1000, retries: 3 }).provision(policy)
+    println(`ArduCopter SITL: key provisioned, confirmed ${result.confirmed} after ${result.attempts} tries (result ${result.result ?? -1})`)
+    expect(result.confirmed).toBe(true)
+    expect(await heartbeatOn(s.conn, s.target)).toBe("signed")
+    expect(await answerOn(s.conn, s.target)).toBe("0")
+    // SERIAL0 is SITL's first port, which ArduPilot treats as USB: an unsigned command is answered there (signed) all the same.
+    s.conn.useSigning(null)
+    expect(await answerOn(s.conn, s.target)).toBe("0")
+    s.conn.useSigning(policy)
+    // Unsigned, on the other link: telemetry still comes (signed), a command is not answered.
+    println(`  SERIAL1 unsigned: heartbeat ${await heartbeatOn(other, s.target)}`)
+    expect(await answerOn(other, s.target)).toBe("no answer")
+    // Signed with another key: not answered either; with the key: answered.
+    other.useSigning(new SigningPolicy(SigningKey.random(), UnsignedPolicy.Accept))
+    expect(await answerOn(other, s.target)).toBe("no answer")
+    other.useSigning(new SigningPolicy(key, UnsignedPolicy.AcceptListed([RADIO_STATUS_ID]), { linkId: 2 }))
+    expect(await answerOn(other, s.target)).toBe("0")
+    // The ground station's policy: the vehicle's own frames are all signed, so a strict policy keeps them all.
+    expect(policy.rejectedSignature + policy.rejectedReplay).toBe(0)
+    // Disabled: unsigned both ways again, on both links.
+    const off = await new SigningSetup(s.conn, s.target, { timeoutMs: 1000, retries: 3 }).disable()
+    println(`  disabled, confirmed ${off.confirmed} after ${off.attempts} tries`)
+    expect(off.confirmed).toBe(true)
+    expect(await heartbeatOn(s.conn, s.target)).toBe("unsigned")
+    other.useSigning(null)
+    expect(await answerOn(other, s.target)).toBe("0")
+  } finally {
+    other.close()
+    await s.stop()
+  }
+}
+
 describe("ArduCopter SITL", () => {
+  it("takes a signing key: signed traffic works, unsigned and wrongly signed commands are not answered, and signing turns off", provisionsSigningAndDisablesIt)
   it("is overridden by the RC override as its radio, and lets go of it: after the silence, a NO_OVERRIDE, a close; not from id 254 (SITL_FLIGHT=1 or the file .sitl-rc)", theRealVehicleObeysAndLetsGoOfTheOverride)
   it("speaks the mission protocol: upload, download, clear, the count it takes, the transfer it denies (SITL_FLIGHT=1 or the file .sitl-mission)", missionProtocolOnTheRealVehicle)
   it("flies to a reposition, changes altitude, speed and home, in GUIDED only (SITL_FLIGHT=1 or the file .sitl-guided)", guidedControlMovesTheRealVehicle)

@@ -101,6 +101,9 @@ export function layout(fields) {
   return placed
 }
 
+// A field that holds a secret (SETUP_SIGNING's key).
+const isSecret = f => f.source.name === 'secret_key'
+
 function messageCode(m) {
   const name = FIXED_MESSAGE_NAMES[m.id] ?? m.name
   const placed = layout(m.fields)
@@ -145,6 +148,15 @@ function messageCode(m) {
   lines.push(`  public override info(): MessageInfo {`)
   lines.push(`    return ${name}.INFO`)
   lines.push('  }')
+  // A message that carries a secret (SETUP_SIGNING's key) never shows it: its string and debug forms leave it out.
+  if (m.fields.some(isSecret)) {
+    const shown = m.fields.map(f => isSecret(f) ? `${fieldName(f.name)} = redacted` : `${fieldName(f.name)} = \${this.${fieldName(f.name)}}`)
+    lines.push('')
+    lines.push('  /// The message with its secret left out (it must never reach a log).')
+    lines.push('  public toString(): string {')
+    lines.push(`    return \`${name} (${shown.join(', ')})\``)
+    lines.push('  }')
+  }
   lines.push('}')
   return { name, lines }
 }

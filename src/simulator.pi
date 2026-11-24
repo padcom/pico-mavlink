@@ -23,6 +23,7 @@ import { SimMotors } from "./simmotor"
 import { SimRc } from "./simrc"
 import { SimMissions } from "./simmission"
 import { SimControl } from "./simcontrol"
+import { SimSigning } from "./simsigning"
 import { SimSerial } from "./simserial"
 import { actualRate, desiredRate } from "./simrate"
 import { Heartbeat, MavAutopilot, MavModeFlag, MavState, MavType } from "./dialects/minimal"
@@ -231,6 +232,8 @@ export class SimulatedAutopilot {
   public readonly serial: SimSerial
   /// Whether GLOBAL_POSITION_INT (where the simulated vehicle is, `control.lat`, `control.lon`, `control.height`) is sent at each tick (off: nothing).
   public positionStream: bool = false
+  /// MAVLink 2 signing: SETUP_SIGNING, signed telemetry, and the packets it takes (src/simsigning.pi).
+  public readonly signing: SimSigning
   /// The time between ticks (ms), as `start` was given it: the vehicle moves by that much at each.
   tickMs: int = 1000
 
@@ -245,6 +248,7 @@ export class SimulatedAutopilot {
     this.calibration = new SimCalibration(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
     this.compass = new SimCompass(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
     this.motors = new SimMotors(conn, () => this.control.isArmed(), (system: int, component: int) => this.forMe(system, component))
+    this.signing = new SimSigning(conn, (system: int, component: int) => this.forMe(system, component))
     this.rcOverride = new SimRc((system: int, component: int) => this.forMe(system, component), () => this.rc)
     this.missions = new SimMissions(
       conn,
@@ -496,7 +500,7 @@ export class SimulatedAutopilot {
     if (down) {
       return
     }
-    if (logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || rcOverride.handle(r) || missions.handle(r) || control.handle(r) || serial.handle(r)) {
+    if (signing.handle(r) || logs.handle(r) || calibration.handle(r) || compass.handle(r) || motors.handle(r) || rcOverride.handle(r) || missions.handle(r) || control.handle(r) || serial.handle(r)) {
       return
     }
     const m = r.message

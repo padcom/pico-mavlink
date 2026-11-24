@@ -1,9 +1,97 @@
-// Which received packets to trust: MAVLink 2 signing (https://mavlink.io/en/guide/message_signing.html).
-// A signed packet counts when its signature matches the key and its timestamp is newer than the
-// last one accepted from the same system, component and link (replays are rejected). Unsigned
-// packets are accepted, accepted only for listed messages (RADIO_STATUS from a radio that can't
-// sign, for example), or rejected.
-import { MavLinkPacket } from "./protocol"
+// MAVLink 2 signing (https://mavlink.io/en/guide/message_signing.html): the key, which received packets to
+// trust, and the timestamps of what is sent.
+//
+// A signed packet counts when its signature matches the key, its timestamp is newer than the last one
+// accepted from the same system, component and link (replays are rejected) and, for a stream not heard
+// before, not more than a minute behind this end's own timestamp. Unsigned packets are accepted, accepted
+// only for listed messages (RADIO_STATUS from a radio that can't sign, for example), or rejected.
+//
+// The key is a `SigningKey`: its string and debug forms are redacted, and nothing in this library puts its
+// bytes in a message, an error or a log.
+import { digest, randomBytes } from "std/crypto"
+import { MavLinkError, MavLinkPacket, MavLinkPacketSignature, MavLinkProtocolV2, SIGNATURE_LENGTH } from "./protocol"
+import { readUint } from "./bytes"
+
+/// The length of a signing key (bytes).
+export const SIGNING_KEY_LENGTH: int = 32
+
+/// The message id of SETUP_SIGNING: a frame of it carries a key, and is never recorded.
+export const SETUP_SIGNING_ID: int = 256
+
+/// RADIO_STATUS: what a telemetry radio that can't sign injects into the link.
+export const RADIO_STATUS_ID: int = 109
+
+/// ArduPilot's RADIO, the older form of RADIO_STATUS.
+export const RADIO_ID: int = 166
+
+/// A secret signing key: 32 bytes. Its string and debug forms are `SigningKey(redacted)`, so it can be
+/// printed, interpolated or put in an error without the bytes going with it; `reveal()` is the only way
+/// to the bytes.
+export class SigningKey {
+  readonly bytes: Uint8Array
+
+  /// A key of these 32 bytes (copied). Anything else is an `INVALID_KEY` MavLinkError (that says the
+  /// length, never the bytes).
+  constructor(bytes: Uint8Array) throws MavLinkError {
+    if (bytes.length != SIGNING_KEY_LENGTH) {
+      throw new MavLinkError("INVALID_KEY", `a signing key is ${SIGNING_KEY_LENGTH} bytes, not ${bytes.length}`)
+    }
+    this.bytes = bytes.slice(0, SIGNING_KEY_LENGTH)
+  }
+
+  /// A key from a passphrase: its SHA-256, as Mission Planner and MAVProxy make them.
+  public static fromPassphrase(passphrase: string): SigningKey {
+    exactly(digest("SHA-256", passphrase))
+  }
+
+  /// A new key from the system's secure random source.
+  public static random(): SigningKey {
+    exactly(randomBytes(SIGNING_KEY_LENGTH))
+  }
+
+  /// The all-zero key: sent with SETUP_SIGNING it turns signing off.
+  public static none(): SigningKey {
+    exactly(new Uint8Array(SIGNING_KEY_LENGTH))
+  }
+
+  /// Whether this is the all-zero key (signing off).
+  public get isNone(): bool {
+    for (let i = 0; i < SIGNING_KEY_LENGTH; i++) {
+      if (bytes[i] != 0) {
+        return false
+      }
+    }
+    return true
+  }
+
+  /// A copy of the key's bytes. Keep them out of logs and messages.
+  public reveal(): Uint8Array {
+    bytes.slice(0, SIGNING_KEY_LENGTH)
+  }
+
+  /// Whether `other` is the same key (compared in constant time).
+  public equals(other: SigningKey): bool {
+    let diff = 0
+    const theirs = other.reveal()
+    for (let i = 0; i < SIGNING_KEY_LENGTH; i++) {
+      diff = diff | (bytes[i] ^ theirs[i])
+    }
+    return diff == 0
+  }
+
+  public toString(): string {
+    return "SigningKey(redacted)"
+  }
+}
+
+/// A key of 32 bytes the caller has made itself.
+function exactly(bytes: Uint8Array): SigningKey {
+  try {
+    return new SigningKey(bytes)
+  } catch (e: MavLinkError) {
+    panic("a signing key of the wrong length")
+  }
+}
 
 /// What happens to unsigned packets.
 export enum UnsignedPolicy {
@@ -17,22 +105,98 @@ export enum UnsignedPolicy {
 export enum Rejection {
   Unsigned,
   BadSignature,
-  /// Its timestamp isn't newer than the last accepted from the same system, component and link.
+  /// Its timestamp isn't newer than the last accepted from the same system, component and link, or (the
+  /// first of a stream) is more than the window behind this end's timestamp.
   Replay,
 }
 
+/// The options of a signing policy.
+export struct SigningOptions {
+  /// The link id this end signs with (default 1).
+  linkId?: int
+  /// How far behind this end's timestamp the first signed packet of a stream may be, in ms (default 60 000,
+  /// the spec's minute; 0 turns the check off).
+  windowMs?: int
+  /// Whether a connection with this policy signs what it sends (default true; MAVLink 2 only).
+  signOutgoing?: bool
+  /// Now, in ms since 1970 (default `Date.now()`; for tests).
+  clock?: () => int
+}
+
+/// A time (ms since 1970) in the signature's units: 10 µs since 2015-01-01.
+export function signingTimestamp(ms: int): int {
+  return (ms - MavLinkProtocolV2.SIGNATURE_START_TIME) * 100
+}
+
+/// Whether `frame` (a whole MAVLink frame) is a SETUP_SIGNING, which carries a key: such frames are never
+/// recorded.
+export function carriesKey(frame: Uint8Array): bool {
+  return frame.length >= MavLinkProtocolV2.PAYLOAD_OFFSET && frame[0] == MavLinkProtocolV2.START_BYTE
+    && readUint(frame, 7, 3) == SETUP_SIGNING_ID
+}
+
+/// A link's signing: the key, which received packets to trust, and the timestamps of what is signed. Give it
+/// to a connection (`ConnectionOptions.signing`, or `useSigning` on a running one).
 export class SigningPolicy {
-  readonly key: Uint8Array
-  readonly unsigned: UnsignedPolicy
+  readonly key: SigningKey
+  readonly secret: Uint8Array
+  public readonly unsigned: UnsignedPolicy
+  public readonly linkId: int
+  public readonly signOutgoing: bool
+  readonly window: int
+  readonly clock: () => int
   /// The last timestamp accepted per system, component and link.
   readonly last: Map<int, int> = new Map<int, int>()
+  /// This end's timestamp (10 µs units since 2015): the greatest of its clock, what it signed last, and
+  /// what it accepted.
+  public timestamp: int = 0
   public rejectedUnsigned: int = 0
   public rejectedSignature: int = 0
   public rejectedReplay: int = 0
 
-  constructor(key: Uint8Array, unsigned: UnsignedPolicy = UnsignedPolicy.Reject) {
+  constructor(key: SigningKey, unsigned: UnsignedPolicy = UnsignedPolicy.Reject, options: SigningOptions = {}) {
     this.key = key
+    this.secret = key.reveal()
     this.unsigned = unsigned
+    this.linkId = (options.linkId ?? 1) & 0xFF
+    this.signOutgoing = options.signOutgoing ?? true
+    this.window = (options.windowMs ?? 60_000) * 100
+    const clock = options.clock ?? (() => Date.now() as int)
+    this.clock = clock
+    this.timestamp = signingTimestamp(clock())
+  }
+
+  /// The key (redacted when shown).
+  public get signingKey(): SigningKey {
+    return key
+  }
+
+  /// Moves this end's timestamp up to `units` (10 µs since 2015) if it's behind (SETUP_SIGNING's initial
+  /// timestamp, say).
+  public advanceTo(units: int): void {
+    if (units > timestamp) {
+      timestamp = units
+    }
+  }
+
+  /// The timestamp for the next packet signed: this end's clock, and always at least one more than the last.
+  public nextTimestamp(): int {
+    const c = clock
+    const now = signingTimestamp(c())
+    timestamp = if (now > timestamp) now else timestamp + 1
+    return timestamp
+  }
+
+  /// `frame` (serialized with the IFLAG_SIGNED flag set) signed with this policy's key and link id, at the
+  /// next timestamp.
+  public sign(frame: Uint8Array): Uint8Array {
+    const signed = new Uint8Array(frame.length + SIGNATURE_LENGTH)
+    signed.setAll(frame, 0)
+    const s = new MavLinkPacketSignature(signed)
+    s.setLinkId(linkId)
+    s.setTimestamp(nextTimestamp())
+    s.setSignature(s.calculate(secret))
+    return signed
   }
 
   /// Null when `p` is to be trusted; otherwise why not (and the matching counter goes up).
@@ -51,17 +215,27 @@ export class SigningPolicy {
       return Rejection.Unsigned
     }
     const sig = s!
-    if (!sig.matches(key)) {
+    if (!sig.matches(secret)) {
       rejectedSignature += 1
       return Rejection.BadSignature
     }
     const stream = (p.header.sysid << 16) | (p.header.compid << 8) | sig.linkId
     const before = last.get(stream)
-    if (before != null && sig.timestamp <= before!) {
+    const ts = sig.timestamp
+    if (before != null && ts <= before!) {
       rejectedReplay += 1
       return Rejection.Replay
     }
-    last.set(stream, sig.timestamp)
+    if (before == null && window > 0 && ts + window < timestamp) {
+      rejectedReplay += 1
+      return Rejection.Replay
+    }
+    last.set(stream, ts)
+    advanceTo(ts)
     return null
+  }
+
+  public toString(): string {
+    return `SigningPolicy(link ${linkId}, key redacted)`
   }
 }
