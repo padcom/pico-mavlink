@@ -7,7 +7,7 @@ import { AutopilotVersionRead, CommandCall, ParamList, ParamWrite, VehicleDiscov
 import { ParamEncoding as Enc, encodingOf } from "./params"
 import { SimParam, SimulatedAutopilot } from "./simulator"
 import { MavType } from "./dialects/minimal"
-import { Attitude, MavCmd, MavParamType, ParamValue, SysStatus, TimeSync } from "./dialects/common"
+import { Attitude, CommandLong, MavCmd, MavParamType, ParamValue, SysStatus, TimeSync } from "./dialects/common"
 import { MavLinkError, MavLinkProtocolV2 } from "./protocol"
 
 async function looksLikeAVehicle(): Promise<void> throws Error {
@@ -116,7 +116,59 @@ async function answersTimeSync(): Promise<void> throws Error {
   expect(`${a.ts1} ${a.tc1 > (0 as i64)} ${a.targetSystem}/${a.targetComponent}`).toBe("123456789 true 255/191")
 }
 
+/// A write keeps the parameter's firmware default (its first value, when it had none of its own), and the default is dropped once
+/// the value is back at it: the packed parameter file carries a default only where it differs.
+async function keepsTheDefaultsAcrossWrites(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const params: SimParam[] = [
+    { id: "PLAIN", value: TypedParamValue.Int(5, MavParamType.INT32) },
+    { id: "MOVED", value: TypedParamValue.Int(7, MavParamType.INT32), firmwareDefault: TypedParamValue.Int(3, MavParamType.INT32) },
+  ]
+  const sim = new SimulatedAutopilot(ends[1], params)
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  sim.start(1000)
+  const write = (id: string, v: int) => new ParamWrite(gcs, { system: 1, component: 1 }, ParamEncoding.CCast)
+    .run(id, TypedParamValue.Int(v, MavParamType.INT32))
+  await write("PLAIN", 9)
+  await write("MOVED", 8)
+  const shown = (i: int) => sim.params[i].firmwareDefault == null ? "none" : showParam(sim.params[i].firmwareDefault!)
+  expect(`${shown(0)} ${shown(1)}`).toBe("5 3")
+  await write("PLAIN", 5)
+  await write("MOVED", 3)
+  expect(`${shown(0)} ${shown(1)}`).toBe("none none")
+  sim.change("PLAIN", TypedParamValue.Int(6, MavParamType.INT32))
+  expect(shown(0)).toBe("5")
+  sim.stop()
+  gcs.close()
+}
+
+/// After `stop()` nothing it still reads starts a timer: a SET_MESSAGE_INTERVAL read before the stop and handled after it left an
+/// interval running, and the program that stopped it never ended.
+async function startsNoTimerOnceStopped(): Promise<void> throws Error {
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  gcs.run()
+  sim.start(1000)
+  const ask = new CommandLong()
+  ask.targetSystem = 1
+  ask.targetComponent = 1
+  ask.command = MavCmd.SET_MESSAGE_INTERVAL as u16
+  ask._param1 = SysStatus.MSG_ID as f32
+  ask._param2 = 500000.0 as f32
+  gcs.send(ask)
+  sim.stop()
+  await delay(50)
+
+  expect(sim.stopped).toBe(true)
+  expect(sim.intervals.has(SysStatus.MSG_ID)).toBe(false)
+  gcs.close()
+}
+
 describe("the simulated autopilot", () => {
+  it("keeps a parameter's firmware default across writes, and drops it once the value is back at it", keepsTheDefaultsAcrossWrites)
+  it("starts no timer once it is stopped", startsNoTimerOnceStopped)
   it("serves a list of 1200 parameters, downloaded complete in well under 3 s", aThousandParameters)
   it("sends heartbeats and telemetry and answers parameter requests", looksLikeAVehicle)
   it("answers a TIMESYNC request with its time, the request's mirrored, to the one who asked", answersTimeSync)

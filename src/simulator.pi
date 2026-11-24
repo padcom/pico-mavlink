@@ -11,7 +11,7 @@ import { delay } from "std/timers"
 import { MavLinkConnection, Received } from "./connection"
 import { Target } from "./operations"
 import { MavLinkProtocolV2 } from "./protocol"
-import { ParamEncoding, TypedParamValue, decodeParam, encodeParam } from "./params"
+import { ParamEncoding, TypedParamValue, decodeParam, encodeParam, showParam } from "./params"
 import { PackedParam, ParamPackError, encodeParamPack } from "./parampack"
 import { Crc32 } from "./crc32"
 import { FTP_MAX_DATA, FtpError, FtpNack, FtpOpcode, FtpPacket, ftpMessage, ftpPacketOf } from "./ftp"
@@ -90,6 +90,16 @@ export struct SimParam {
   firmwareDefault?: TypedParamValue
 }
 
+/// A parameter written to `value`. Its firmware default stays what it was: the value it started with when it had none of its
+/// own. It is kept only while it differs from the value, as the packed parameter file carries a default only then.
+function written(p: SimParam, value: TypedParamValue): SimParam {
+  const firmware = p.firmwareDefault ?? p.value
+  if (showParam(firmware) == showParam(value)) {
+    return { id: p.id, value: value }
+  }
+  return { id: p.id, value: value, firmwareDefault: firmware }
+}
+
 /// One open FTP session of the simulated vehicle: the file as it was made when it was opened.
 class FtpSession {
   public readonly id: int
@@ -151,6 +161,8 @@ export class SimulatedAutopilot {
   public rateScript: bool = false
   /// How many times SYSTEM_TIME was asked for with MAV_CMD_REQUEST_MESSAGE.
   public systemTimeRequests: int = 0
+  /// Whether it was stopped: what it still reads is ignored, and no timer is started.
+  public stopped: bool = false
   /// How many TIMESYNC requests it has answered.
   public timeSyncs: int = 0
   /// The intervals it was asked for, by message id: milliseconds between messages, -1 for off. A message
@@ -279,6 +291,7 @@ export class SimulatedAutopilot {
 
   /// Starts answering and sending telemetry every `intervalMs`.
   public start(intervalMs: int = 1000): void {
+    stopped = false
     conn.run()
     tickMs = intervalMs
     tick()
@@ -290,12 +303,14 @@ export class SimulatedAutopilot {
   public change(id: string, value: TypedParamValue): void {
     const i = indexOf(id)
     if (i >= 0) {
-      params[i] = { id: id, value: value }
+      params[i] = written(params[i], value)
       send(i)
     }
   }
 
   public stop(): void {
+    // (first: a message read before the stop is still handled after it, and must not start a timer that nothing clears)
+    stopped = true
     logs.stop()
     calibration.stop()
     compass.stop()
@@ -339,6 +354,9 @@ export class SimulatedAutopilot {
 
   /// Gives a message its own interval: `ms` between messages, -1 for off, 0 for the tick again.
   applyInterval(id: int, ms: int): void {
+    if (stopped) {
+      return
+    }
     const old = timers.get(id)
     if (old != null) {
       clearInterval(old!)
@@ -497,6 +515,9 @@ export class SimulatedAutopilot {
   }
 
   handle(r: Received): void {
+    if (stopped) {
+      return
+    }
     if (down) {
       return
     }
@@ -586,7 +607,7 @@ export class SimulatedAutopilot {
       const i = indexOf(m.paramId)
       if (forMe(m.targetSystem as int, m.targetComponent as int) && i >= 0) {
         const v = decodeParam(m.paramValue, m.paramType as int, ParamEncoding.CCast)
-        params[i] = { id: params[i].id, value: rounded(params[i].id, v) }
+        params[i] = written(params[i], rounded(params[i].id, v))
         send(i)
       }
     }
