@@ -1,0 +1,351 @@
+// The recorder: the bytes of a record are the timestamp (8 bytes, big-endian, microseconds) and the frame as it was; batches go to
+// the sink when they are large enough or old enough; a sink that fails stops the recording and says so; and a link to a
+// `SimulatedAutopilot` recorded through a `TlogTap` (in and out) or `attach` reads back as exactly the frames that passed.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { remove } from "std/fs"
+import { tmpDir } from "std/os"
+import { join } from "std/path"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { SimulatedAutopilot } from "./simulator"
+import { Heartbeat, MavAutopilot, MavType } from "./dialects/minimal"
+import { MavLinkProtocolV2 } from "./protocol"
+import { TlogReader, TlogRecord } from "./tlog"
+import { TlogRecorder, TlogSink, TlogTap, createTlog } from "./tlogrecorder"
+import { openTlog } from "./tlogplayer"
+
+/// 2026-11-12 in microseconds since 1970.
+const T0: int = 1794500000000000
+
+/// A sink that keeps what it is given, each write apart; one that fails from the `failAt`-th write on (1 is the first).
+class MemorySink implements TlogSink {
+  public readonly writes: Uint8Array[] = []
+  public closed: int = 0
+  public failAt: int = 0
+  /// A write takes this long (ms), and how many writes were under way at once, at most.
+  public slowMs: int = 0
+  busy: int = 0
+  public mostBusy: int = 0
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    if (failAt > 0 && writes.length + 1 >= failAt) {
+      throw new Error("disk full")
+    }
+    busy += 1
+    if (busy > mostBusy) {
+      mostBusy = busy
+    }
+    if (slowMs > 0) {
+      await delay(slowMs)
+    }
+    writes.push(bytes)
+    busy -= 1
+  }
+
+  public async close(): Promise<void> throws Error {
+    closed += 1
+  }
+
+  public all(): Uint8Array {
+    let n = 0
+    for (const w of writes) {
+      n += w.length
+    }
+    const out = new Uint8Array(n)
+    let at = 0
+    for (const w of writes) {
+      out.setAll(w, at)
+      at += w.length
+    }
+    return out
+  }
+}
+
+function heartbeatFrame(seq: int): Uint8Array throws Error {
+  const h = new Heartbeat()
+  h.type = MavType.GCS as u8
+  h.autopilot = MavAutopilot.INVALID as u8
+  h.mavlinkVersion = 3
+  return new MavLinkProtocolV2(255, 190).serialize(h, seq)
+}
+
+/// Every record of `bytes`, and whether the file ended cut.
+function recordsOf(bytes: Uint8Array): TlogRecord[] {
+  const reader = new TlogReader({ nowUs: T0 })
+  reader.push(bytes)
+  const out: TlogRecord[] = []
+  reader.finish()
+  while (true) {
+    const r = reader.next()
+    if (r == null) {
+      break
+    }
+    out.push(r!)
+  }
+  return out
+}
+
+function temp(name: string): string {
+  join(tmpDir(), `pico-mavlink-${name}-${Date.now()}-${(Math.random() * 1000000.0) as int}.tlog`)
+}
+
+async function recordBytes(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  const rec = new TlogRecorder(sink)
+  const frame = heartbeatFrame(7)
+  rec.write(frame, 0x0102030405060708)
+  rec.write(frame, T0)
+  await rec.close()
+  const bytes = sink.all()
+  expect(bytes.length).toBe(2 * (8 + frame.length))
+  // The timestamp is big-endian, the frame follows unchanged.
+  const stamp: int[] = []
+  for (let i = 0; i < 8; i++) {
+    stamp.push(bytes[i])
+  }
+  expect(stamp.join(",")).toBe("1,2,3,4,5,6,7,8")
+  expect(bytes.slice(8, 8 + frame.length).equals(frame)).toBe(true)
+  const back = recordsOf(bytes)
+  expect(back.length).toBe(2)
+  expect(back[1].timeUs).toBe(T0)
+  expect(back[1].frame.equals(frame)).toBe(true)
+  expect(`${rec.records} ${rec.lost} ${rec.bytesWritten} ${sink.closed}`).toBe(`2 0 ${bytes.length} 1`)
+}
+
+async function clockStamps(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  let now = T0
+  const rec = new TlogRecorder(sink, { clock: () => now })
+  rec.write(heartbeatFrame(0))
+  now += 1234
+  rec.write(heartbeatFrame(1))
+  await rec.close()
+  expect(recordsOf(sink.all()).map((r) => r.timeUs - T0).join(",")).toBe("0,1234")
+}
+
+async function realClockStamps(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  const rec = new TlogRecorder(sink)
+  const before = (Date.now() as int) * 1000
+  rec.write(heartbeatFrame(0))
+  const after = (Date.now() as int) * 1000
+  await rec.close()
+  const t = recordsOf(sink.all())[0].timeUs
+  expect(t >= before && t <= after).toBe(true)
+}
+
+async function flushBySize(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  const frame = heartbeatFrame(0)
+  // Two records make a batch: the third waits for the timer (which is far away).
+  const rec = new TlogRecorder(sink, { flushBytes: 2 * (8 + frame.length), flushMs: 60000 })
+  rec.write(frame, T0)
+  expect(sink.writes.length).toBe(0)
+  rec.write(frame, T0 + 1)
+  rec.write(frame, T0 + 2)
+  await delay(5)
+  expect(sink.writes.length).toBe(1)
+  expect(sink.writes[0].length).toBe(2 * (8 + frame.length))
+  expect(rec.waiting).toBe(8 + frame.length)
+  await rec.close()
+  expect(sink.writes.length).toBe(2)
+  expect(recordsOf(sink.all()).length).toBe(3)
+}
+
+async function flushByTime(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  const rec = new TlogRecorder(sink, { flushMs: 30 })
+  rec.write(heartbeatFrame(0), T0)
+  await delay(5)
+  // Not yet: the batch is young and small.
+  expect(sink.writes.length).toBe(0)
+  rec.write(heartbeatFrame(1), T0 + 1)
+  await delay(80)
+  // The timer of the first frame took both.
+  expect(sink.writes.length).toBe(1)
+  expect(recordsOf(sink.all()).length).toBe(2)
+  expect(rec.waiting).toBe(0)
+  rec.write(heartbeatFrame(2), T0 + 2)
+  await delay(80)
+  expect(sink.writes.length).toBe(2)
+  await rec.close()
+  expect(`${rec.flushes} ${rec.records}`).toBe("2 3")
+}
+
+async function flushInOrder(): Promise<void> throws Error {
+  // Many small batches (one record each), flushed without waiting, to a slow sink: the sink gets one write at a time, in order,
+  // and what came while it was busy goes in the next write.
+  const sink = new MemorySink()
+  sink.slowMs = 2
+  const rec = new TlogRecorder(sink, { flushBytes: 1 })
+  for (let i = 0; i < 50; i++) {
+    rec.write(heartbeatFrame(i), T0 + i)
+  }
+  await rec.flush()
+  await rec.close()
+  const back = recordsOf(sink.all())
+  expect(back.length).toBe(50)
+  let ordered = true
+  for (let i = 0; i < 50; i++) {
+    ordered = ordered && back[i].timeUs == T0 + i && back[i].seq == i
+  }
+  expect(ordered).toBe(true)
+  expect(sink.mostBusy).toBe(1)
+  expect(sink.writes.length < 50).toBe(true)
+}
+
+async function sinkFails(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  sink.failAt = 2
+  const rec = new TlogRecorder(sink, { flushBytes: 1 })
+  rec.write(heartbeatFrame(0), T0)
+  await rec.flush()
+  rec.write(heartbeatFrame(1), T0 + 1)
+  await rec.flush()
+  expect(rec.error != null).toBe(true)
+  rec.write(heartbeatFrame(2), T0 + 2)
+  let message = ""
+  try {
+    await rec.close()
+  } catch (e: Error) {
+    message = e.message
+  }
+  expect(message).toBe("disk full")
+  expect(`${rec.records} ${rec.lost} ${sink.writes.length} ${sink.closed}`).toBe("3 2 1 1")
+}
+
+async function afterClose(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  const rec = new TlogRecorder(sink)
+  rec.write(heartbeatFrame(0), T0)
+  await rec.close()
+  await rec.close()
+  rec.write(heartbeatFrame(1), T0 + 1)
+  expect(`${rec.isClosed} ${rec.records} ${rec.lost} ${sink.closed} ${recordsOf(sink.all()).length}`).toBe("true 2 1 1 1")
+}
+
+/// The frames a ground station saw from a simulated vehicle and sent to it, and the file the tap recorded them to.
+async function recordSimulator(): Promise<void> throws Error {
+  const path = temp("sim")
+  const rec = await createTlog(path, { flushMs: 20 })
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(new TlogTap(ends[0], rec))
+  const received: Uint8Array[] = []
+  const sent: Uint8Array[] = []
+  gcs.on((r: Received) => {
+    received.push(r.packet.buffer)
+  })
+  gcs.run()
+  sim.start(5)
+  for (let i = 0; i < 5; i++) {
+    const h = new Heartbeat()
+    h.type = MavType.GCS as u8
+    h.autopilot = MavAutopilot.INVALID as u8
+    h.mavlinkVersion = 3
+    await gcs.send(h)
+    sent.push(gcs.protocol.serialize(h, i))
+    await delay(20)
+  }
+  sim.stop()
+  await delay(10)
+  gcs.close()
+  await rec.close()
+  const file = await openTlog(path)
+  const fromVehicle: Uint8Array[] = []
+  const fromGcs: Uint8Array[] = []
+  let ordered = true
+  let last = 0
+  for (let i = 0; i < file.count; i++) {
+    const e = await file.entry(i)
+    ordered = ordered && e.timeUs >= last
+    last = e.timeUs
+    if (e.frame[5] == sim.sysid) fromVehicle.push(e.frame) else fromGcs.push(e.frame)
+  }
+  await file.close()
+  await remove(path)
+  expect(received.length >= 10).toBe(true)
+  expect(fromVehicle.length).toBe(received.length)
+  let same = true
+  for (let i = 0; i < received.length; i++) {
+    same = same && fromVehicle[i].equals(received[i])
+  }
+  expect(same).toBe(true)
+  expect(fromGcs.length).toBe(5)
+  let sameSent = true
+  for (let i = 0; i < 5; i++) {
+    sameSent = sameSent && fromGcs[i].equals(sent[i])
+  }
+  expect(sameSent).toBe(true)
+  expect(ordered).toBe(true)
+  expect(file.report.cutEnd).toBe(false)
+  expect(file.report.bytesSkipped).toBe(0)
+}
+
+async function receivedOnly(): Promise<void> throws Error {
+  // `sent: false`, a frame split over many reads, and `attach`: each records what was received, once.
+  const sink = new MemorySink()
+  const rec = new TlogRecorder(sink)
+  const ends = MemoryStream.pair()
+  const tap = new TlogTap(ends[0], rec, { sent: false })
+  const frame = heartbeatFrame(3)
+  for (let i = 0; i < frame.length; i++) {
+    await ends[1].write(frame.slice(i, i + 1))
+  }
+  for (let i = 0; i < frame.length; i++) {
+    await tap.read()
+  }
+  await tap.write(heartbeatFrame(4))
+  await rec.close()
+  const back = recordsOf(sink.all())
+  expect(back.length).toBe(1)
+  expect(back[0].frame.equals(frame)).toBe(true)
+  tap.close()
+}
+
+async function attached(): Promise<void> throws Error {
+  const sink = new MemorySink()
+  const rec = new TlogRecorder(sink)
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(ends[0])
+  let seen = 0
+  gcs.on((_r: Received) => {
+    seen += 1
+  })
+  const detach = rec.attach(gcs)
+  gcs.run()
+  sim.start(5)
+  await delay(40)
+  detach()
+  const atDetach = seen
+  await delay(30)
+  sim.stop()
+  gcs.close()
+  await rec.close()
+  const back = recordsOf(sink.all())
+  expect(atDetach > 0).toBe(true)
+  expect(back.length).toBe(atDetach)
+  expect(seen > atDetach).toBe(true)
+}
+
+describe("TlogRecorder", () => {
+  it("writes an 8-byte big-endian microsecond timestamp and the frame unchanged", recordBytes)
+  it("stamps a frame with its clock", clockStamps)
+  it("stamps with the time since 1970 by default", realClockStamps)
+  it("writes a batch as soon as it is large enough", flushBySize)
+  it("writes a batch at most flushMs after its first frame", flushByTime)
+  it("keeps batches in order when they are flushed back to back", flushInOrder)
+  it("stops at a sink that fails, counts what was lost and throws on close", sinkFails)
+  it("counts a frame written after close as lost; close twice is fine", afterClose)
+})
+
+describe("TlogTap", () => {
+  it("records what a SimulatedAutopilot sends and what the ground station sends, as they were", recordSimulator)
+  it("records only what it receives with sent: false, a split frame once", receivedOnly)
+})
+
+describe("TlogRecorder.attach", () => {
+  it("records what a connection receives until detached", attached)
+})

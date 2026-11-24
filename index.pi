@@ -35,6 +35,18 @@ export {
   TlogWriter,
   signedCopy,
 } from "./src/tlog"
+export {
+  TLOG_FLUSH_BYTES,
+  TLOG_FLUSH_MS,
+  TlogFileSink,
+  TlogRecorder,
+  TlogRecorderOptions,
+  TlogSink,
+  TlogTap,
+  TlogTapOptions,
+  createTlog,
+} from "./src/tlogrecorder"
+export { TlogEntry, TlogFile, TlogPlayer, TlogPlayerOptions, openTlog } from "./src/tlogplayer"
 export { ByteStream, FileStream, MemoryStream, TcpStream, UdpStream } from "./src/stream"
 export { ConnectionOptions, MavLinkConnection, Received, defaultRegistry, packets } from "./src/connection"
 export { Rejection, SigningPolicy, UnsignedPolicy } from "./src/signing"

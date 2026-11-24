@@ -103,6 +103,18 @@ Status: **in development (MV1).**
   against the dialect, resync on garbage, unknown messages skipped and counted, signed frames recognised and never verified,
   segments at a step or a jump in time, 'no date' for timestamps that cannot be real, and a cut end that is not damage; a report
   accounts for every byte. Checked against a recording of ArduPilot SITL and one that MAVProxy wrote.
+- **Done:** recording and playing back a `.tlog` (src/tlogrecorder.pi, src/tlogplayer.pi). `TlogRecorder` writes each frame with an
+  8-byte big-endian timestamp in microseconds since 1970 (`write(frame, timeUs?)`, never waits) to a `TlogSink` (`createTlog(path)` opens
+  a file) in batches: when `flushBytes` (16 KiB) are waiting and at most `flushMs` (1 s) after a batch's first frame, one write at a time and
+  in order, so a crash loses at most that much; a sink that fails stops the recording (`error`, `lost`, and `close` throws it). A `TlogTap`
+  between a connection (or a `MavLinkRouter`) and its stream records every whole, CRC-checked frame that passes, received and (unless
+  `sent: false`) sent; `attach(conn)` records what a running connection receives. `openTlog(path)` indexes a file once (`TlogFile`: `count`,
+  `duration`, `next`, `entry(i)`, `seek(positionUs)`, `report`): a file cut mid-record reads up to its last whole record, a wrong length at
+  the end ends it there, one in the middle costs that record only. Positions are microseconds from the first record on a time line that
+  never goes back (a step back is no time, a new segment follows at once). `TlogPlayer` gives the records when they are due at a `speed`
+  (1x, 2x, 0.5x, changed while playing with `setSpeed`), with `seek` while playing and an abort signal; `playTo(stream)` replays a recording
+  to a connection. Tests: src/tlogrecorder.test.pi and src/tlogplayer.test.pi (against `SimulatedAutopilot`, and MAVProxy's capture
+  round-tripped byte for byte).
 - **Done:** long STATUSTEXT messages: `StatusTextAssembler` joins the chunks (by system, component
   and `id`, in any order, interleaved), and delivers one whose chunks went missing after a timeout,
   marked truncated. `StatusTextReader` does it on a connection.

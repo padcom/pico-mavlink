@@ -1,0 +1,261 @@
+// Recording a link as a `.tlog` while it runs: for every frame an 8-byte big-endian timestamp in microseconds since 1970 (Unix
+// time), then the frame exactly as it was on the wire, the format `TlogReader` reads (and every ground station writes).
+//
+// A `TlogRecorder` takes frames one at a time (`write`, never waits) and hands them to a sink (a file, `createTlog`) in batches:
+// when `flushBytes` are waiting, and at most `flushMs` after the first frame of a batch, so a crash or a power loss costs at most
+// that much of the recording (and a file cut by one reads up to its last whole frame: see `TlogReader`). Writes to the sink are one
+// at a time and in order. A sink that fails stops the recording: the error is kept (`error`), what was not written is counted
+// (`lost`) and `close` throws it.
+//
+// What to record: put a `TlogTap` between a connection (or a router) and the stream it reads, and every whole frame that passes, in
+// and (by default) out, is recorded; or `attach` the recorder to a running connection to record what it receives.
+import { File, open } from "std/fs"
+import { MavLinkConnection, Received } from "./connection"
+import { MavLinkPacketSplitter } from "./splitter"
+import { ByteStream } from "./stream"
+import { TlogWriter } from "./tlog"
+
+/// Where a recording goes: its bytes, in order, and the end.
+export interface TlogSink {
+  /// Takes the next bytes of the recording. What it throws stops the recording.
+  write(bytes: Uint8Array): Promise<void, Error>
+  /// The recording ended: nothing is written after this.
+  close(): Promise<void, Error>
+}
+
+/// A sink that is a file of `std/fs`.
+export class TlogFileSink implements TlogSink {
+  public readonly file: File
+
+  constructor(file: File) {
+    this.file = file
+  }
+
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    await file.write(bytes)
+  }
+
+  public async close(): Promise<void> throws Error {
+    await file.close()
+  }
+}
+
+/// The options of a recorder.
+export struct TlogRecorderOptions {
+  /// The longest a frame waits before it is written to the sink, in milliseconds (default `TLOG_FLUSH_MS`; at least 1).
+  flushMs?: int
+  /// A batch this large (bytes) is written at once, whatever the time (default `TLOG_FLUSH_BYTES`; at least 1).
+  flushBytes?: int
+  /// The time of a frame that is written without one: microseconds since 1970 (default: the clock, `Date.now()`).
+  clock?: () => int
+}
+
+/// How long a frame waits for the sink at most (ms): 1 s.
+export const TLOG_FLUSH_MS: int = 1000
+
+/// The batch that is written at once (bytes): 16 KiB.
+export const TLOG_FLUSH_BYTES: int = 16384
+
+/// Opens (creates, or empties) the file at `path` and records into it; `append` adds to a file that is there instead.
+export async function createTlog(path: string, options: TlogRecorderOptions = {}, append: bool = false): Promise<TlogRecorder> throws Error {
+  const file = await open(path, read: false, write: true, create: true, truncate: !append, append: append)
+  return new TlogRecorder(new TlogFileSink(file), options)
+}
+
+/// A recording being made.
+export class TlogRecorder {
+  public readonly sink: TlogSink
+  public readonly flushMs: int
+  public readonly flushBytes: int
+  readonly clock: () => int
+  /// Frames taken by `write` (written, waiting or lost).
+  public records: int = 0
+  /// Bytes the sink has taken, and in how many writes.
+  public bytesWritten: int = 0
+  public flushes: int = 0
+  /// Frames that never reached the sink: it failed, or they came after `close`.
+  public lost: int = 0
+  /// What the sink threw: the recording stopped there.
+  public error: Error? = null
+  pending: TlogWriter = new TlogWriter()
+  pendingRecords: int = 0
+  timer: int = -1
+  /// The write to the sink under way (`writing` is its number, 0 when none).
+  current: Promise<void>? = null
+  writing: int = 0
+  writes: int = 0
+  closed: bool = false
+
+  constructor(sink: TlogSink, options: TlogRecorderOptions = {}) {
+    this.sink = sink
+    const ms = options.flushMs ?? TLOG_FLUSH_MS
+    this.flushMs = if (ms < 1) 1 else ms
+    const bytes = options.flushBytes ?? TLOG_FLUSH_BYTES
+    this.flushBytes = if (bytes < 1) 1 else bytes
+    this.clock = options.clock ?? (() => (Date.now() as int) * 1000)
+  }
+
+  /// Whether `close` has been called.
+  public get isClosed(): bool {
+    return closed
+  }
+
+  /// Bytes taken and not yet given to the sink.
+  public get waiting(): int {
+    return pending.size
+  }
+
+  /// Records `frame` (a whole MAVLink 1 or 2 frame, as on the wire) at `timeUs` (microseconds since 1970; default now). Never
+  /// waits: the frame is written with its batch.
+  public write(frame: Uint8Array, timeUs: int? = null): void {
+    records += 1
+    if (closed || error != null) {
+      lost += 1
+      return
+    }
+    const c = clock
+    pending.add(timeUs ?? c(), frame)
+    pendingRecords += 1
+    if (pending.size >= flushBytes) {
+      this.flush()
+      return
+    }
+    if (timer < 0) {
+      timer = setTimeout(() => {
+        this.timer = -1
+        this.flush()
+      }, flushMs)
+    }
+  }
+
+  /// Writes what is waiting to the sink, after the writes already under way, and waits for it. Never throws: a sink that fails
+  /// sets `error`.
+  public async flush(): Promise<void> {
+    if (timer >= 0) {
+      clearTimeout(timer)
+      timer = -1
+    }
+    while (true) {
+      const running = current
+      if (running == null || writing == 0) {
+        break
+      }
+      await running!
+    }
+    if (pendingRecords == 0) {
+      return
+    }
+    const bytes = pending.bytes()
+    const count = pendingRecords
+    pending = new TlogWriter()
+    pendingRecords = 0
+    if (error != null) {
+      lost += count
+      return
+    }
+    writes += 1
+    const id = writes
+    writing = id
+    const work = this.put(bytes, count)
+    current = work
+    await work
+    if (writing == id) {
+      writing = 0
+      current = null
+    }
+  }
+
+  async put(bytes: Uint8Array, count: int): Promise<void> {
+    try {
+      await sink.write(bytes)
+      bytesWritten += bytes.length
+      flushes += 1
+    } catch (e: Error) {
+      error = e
+      lost += count
+    }
+  }
+
+  /// Writes what is waiting and closes the sink (twice is fine). Throws what the sink threw, if it failed.
+  public async close(): Promise<void> throws Error {
+    if (!closed) {
+      closed = true
+      await flush()
+      try {
+        await sink.close()
+      } catch (e: Error) {
+        if (error == null) {
+          error = e
+        }
+      }
+    }
+    const failed = error
+    if (failed != null) {
+      throw failed!
+    }
+  }
+
+  /// Records every frame `conn` receives from now on (while its `run()` runs, and only what its signing policy lets through).
+  /// What it sends is not seen here: put a `TlogTap` under the connection for that. Returns the function that stops it.
+  public attach(conn: MavLinkConnection): () => void {
+    const id = conn.on((r: Received) => {
+      this.write(r.packet.buffer)
+    })
+    return () => {
+      conn.off(id)
+    }
+  }
+}
+
+/// The options of a tap.
+export struct TlogTapOptions {
+  /// Record what is written to the stream too (default true).
+  sent?: bool
+  /// CRC-extra by message id: the frames that are recorded (default: every generated dialect). A frame of a message that is not
+  /// here cannot be told from noise, and is not recorded.
+  magicNumbers?: Map<int, int>
+}
+
+/// A byte stream that records the frames that pass through it: put it between a `MavLinkConnection` (or anything else) and the
+/// stream (a link, a `MavLinkRouter`) it would use. Frames are found whole and checked against their CRC in each direction on its
+/// own, so a frame split over several reads is recorded once, when it is whole. The bytes pass unchanged. Closing the tap closes
+/// the stream, not the recorder.
+export class TlogTap implements ByteStream {
+  public readonly stream: ByteStream
+  public readonly recorder: TlogRecorder
+  readonly sent: bool
+  readonly incoming: MavLinkPacketSplitter
+  readonly outgoing: MavLinkPacketSplitter
+
+  constructor(stream: ByteStream, recorder: TlogRecorder, options: TlogTapOptions = {}) {
+    this.stream = stream
+    this.recorder = recorder
+    this.sent = options.sent ?? true
+    this.incoming = new MavLinkPacketSplitter({ magicNumbers: options.magicNumbers })
+    this.outgoing = new MavLinkPacketSplitter({ magicNumbers: options.magicNumbers })
+  }
+
+  public async read(): Promise<Uint8Array?> throws Error {
+    const chunk = await stream.read()
+    if (chunk != null) {
+      for (const raw of incoming.push(chunk!)) {
+        recorder.write(raw.buffer)
+      }
+    }
+    return chunk
+  }
+
+  /// Writes to the stream, and records the frames once they are written (a write that fails records nothing).
+  public async write(bytes: Uint8Array): Promise<void> throws Error {
+    await stream.write(bytes)
+    if (sent) {
+      for (const raw of outgoing.push(bytes)) {
+        recorder.write(raw.buffer)
+      }
+    }
+  }
+
+  public close(): void {
+    stream.close()
+  }
+}

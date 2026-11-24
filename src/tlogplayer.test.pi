@@ -1,0 +1,354 @@
+// Reading a recording back: MAVProxy's capture (src/fixtures/mavproxy.tlog) goes through `TlogFile` and `TlogRecorder` byte for
+// byte; a file cut anywhere in a record reads up to the last whole one, and a length that is wrong ends the file there (at its end)
+// or costs only that record (in the middle); `seek` and `duration` are on the playback time line, which never goes back; and
+// `TlogPlayer` gives the records with their timing at 1x, 2x and 0.5x, follows a change of speed or position while it plays, stops
+// when aborted, and replays a recording of a `SimulatedAutopilot` to a connection.
+import { describe, it, expect } from "std/test"
+import { delay } from "std/timers"
+import { readBytes, remove, writeBytes } from "std/fs"
+import { tmpDir } from "std/os"
+import { join } from "std/path"
+import { MavLinkConnection, Received } from "./connection"
+import { MemoryStream } from "./stream"
+import { SimulatedAutopilot } from "./simulator"
+import { Heartbeat, MavType } from "./dialects/minimal"
+import { Attitude } from "./dialects/common"
+import { TlogWriter } from "./tlog"
+import { TlogTap, createTlog } from "./tlogrecorder"
+import { TlogEntry, TlogFile, TlogPlayer, openTlog } from "./tlogplayer"
+
+const FIXTURE = "src/fixtures/mavproxy.tlog"
+
+/// 2026-11-12 in microseconds since 1970, and a millisecond.
+const T0: int = 1794500000000000
+const MS: int = 1000
+
+function temp(name: string): string {
+  join(tmpDir(), `pico-mavlink-${name}-${Date.now()}-${(Math.random() * 1000000.0) as int}.tlog`)
+}
+
+function heartbeat(): Heartbeat {
+  const h = new Heartbeat()
+  h.type = MavType.QUADROTOR as u8
+  h.mavlinkVersion = 3
+  return h
+}
+
+/// A file of heartbeats at `times` (microseconds after T0), opened; the caller closes and removes it.
+async function fileAt(path: string, times: int[]): Promise<TlogFile> throws Error {
+  const w = new TlogWriter()
+  for (let i = 0; i < times.length; i++) {
+    w.addMessage(T0 + times[i], heartbeat(), i)
+  }
+  await writeBytes(path, w.bytes())
+  return await openTlog(path)
+}
+
+/// Every entry of `file` from where it is.
+async function rest(file: TlogFile): Promise<TlogEntry[]> throws Error {
+  const out: TlogEntry[] = []
+  while (true) {
+    const e = await file.next()
+    if (e == null) {
+      return out
+    }
+    out.push(e!)
+  }
+  return out
+}
+
+async function roundTrip(): Promise<void> throws Error {
+  const original = await readBytes(FIXTURE)
+  const file = await openTlog(FIXTURE)
+  const path = temp("roundtrip")
+  // Small batches, so that more than one write makes the file.
+  const rec = await createTlog(path, { flushBytes: 4096 })
+  let n = 0
+  while (true) {
+    const e = await file.next()
+    if (e == null) {
+      break
+    }
+    rec.write(e!.frame, e!.timeUs)
+    n += 1
+  }
+  await rec.close()
+  await file.close()
+  const copy = await readBytes(path)
+  await remove(path)
+  expect(n).toBe(2480)
+  expect(file.count).toBe(2480)
+  // `write` never waits: what comes while a batch is being written goes in the next one.
+  expect(rec.flushes > 1 && rec.lost == 0).toBe(true)
+  expect(copy.length).toBe(original.length)
+  expect(copy.equals(original)).toBe(true)
+}
+
+async function cutAnywhere(): Promise<void> throws Error {
+  // The fixture cut in the middle of records (in the timestamp, the header, the payload, the checksum) and at a boundary.
+  const original = await readBytes(FIXTURE)
+  const whole = await openTlog(FIXTURE)
+  const ends: int[] = []
+  for (let i = 0; i < whole.count; i++) {
+    ends.push(whole.offsetOf(i) + 8 + (await whole.entry(i)).frame.length)
+  }
+  await whole.close()
+  const path = temp("cut")
+  let good = true
+  const cuts = [3, 20, 1000, 50001, 50007, 77777, 105915, ends[1000]]
+  for (const cut of cuts) {
+    await writeBytes(path, original.slice(0, cut))
+    const file = await openTlog(path)
+    // The records that end at or before the cut.
+    let expected = 0
+    while (expected < ends.length && ends[expected] <= cut) {
+      expected += 1
+    }
+    const got = await rest(file)
+    const atBoundary = expected > 0 && ends[expected - 1] == cut
+    good = good && got.length == expected && file.report.cutEnd == !atBoundary && file.report.bytesSkipped == 0
+    if (expected > 0) {
+      const last = got[got.length - 1]
+      const from = ends[expected - 1] - last.frame.length
+      good = good && last.frame.equals(original.slice(from, ends[expected - 1]))
+    }
+    await file.close()
+  }
+  await remove(path)
+  expect(good).toBe(true)
+}
+
+async function corruptLength(): Promise<void> throws Error {
+  const path = temp("length")
+  const times = [0, 10 * MS, 20 * MS, 30 * MS]
+  const w = new TlogWriter()
+  for (let i = 0; i < times.length; i++) {
+    w.addMessage(T0 + times[i], heartbeat(), i)
+  }
+  const bytes = w.bytes()
+  const record = bytes.length / 4
+  // The last record's length says 255: there is no such frame, the file ends with the third.
+  const tail = bytes.slice(0, bytes.length)
+  tail.set(3 * record + 8 + 1, 255)
+  await writeBytes(path, tail)
+  const a = await openTlog(path)
+  const gotTail = await rest(a)
+  await a.close()
+  expect(`${gotTail.length} ${a.report.cutEnd} ${gotTail[2].timeUs - T0}`).toBe(`3 true ${20 * MS}`)
+  // The second record's length is wrong: its CRC cannot hold, so it is skipped (and counted); the others are read.
+  const middle = bytes.slice(0, bytes.length)
+  middle.set(record + 8 + 1, 3)
+  await writeBytes(path, middle)
+  const b = await openTlog(path)
+  const gotMiddle = await rest(b)
+  await b.close()
+  await remove(path)
+  expect(gotMiddle.map((e) => (e.timeUs - T0) / MS).join(",")).toBe("0,20,30")
+  expect(b.report.bytesSkipped).toBe(record)
+  expect(b.report.cutEnd).toBe(false)
+}
+
+async function seekAndDuration(): Promise<void> throws Error {
+  const path = temp("seek")
+  const file = await fileAt(path, [0, 100 * MS, 200 * MS, 300 * MS, 400 * MS])
+  expect(`${file.count} ${file.duration}`).toBe(`5 ${400 * MS}`)
+  expect(file.seek(250 * MS)).toBe(3)
+  expect((await file.next())!.positionUs).toBe(300 * MS)
+  expect(file.seek(200 * MS)).toBe(2)
+  expect((await file.next())!.index).toBe(2)
+  expect(file.seek(0)).toBe(0)
+  expect((await rest(file)).length).toBe(5)
+  expect(file.seek(401 * MS)).toBe(5)
+  expect((await file.next()) == null).toBe(true)
+  file.seekIndex(4)
+  expect((await file.next())!.timeUs).toBe(T0 + 400 * MS)
+  await file.close()
+  await remove(path)
+}
+
+async function positionsGoOn(): Promise<void> throws Error {
+  // Jitter (a step back of 5 ms) is no time; a step back of a minute and a jump of an hour start segments that follow at once.
+  const path = temp("segments")
+  const file = await fileAt(path, [0, 100 * MS, 95 * MS, 150 * MS, -60000 * MS, -59900 * MS, 3600000 * MS, 3600050 * MS])
+  const all = await rest(file)
+  await file.close()
+  await remove(path)
+  expect(all.map((e) => e.positionUs / MS).join(",")).toBe("0,100,100,150,150,250,250,300")
+  expect(all.map((e) => e.segment).join(",")).toBe("0,0,0,0,1,1,2,2")
+  expect(file.duration).toBe(300 * MS)
+}
+
+/// A clock that only the player's sleeps move: plays a file at `speed` and gives when (ms on that clock) each record came.
+class Virtual {
+  public now: f64 = 0.0
+  public slept: int = 0
+}
+
+async function playVirtual(file: TlogFile, speed: f64): Promise<string> throws Error {
+  const v = new Virtual()
+  const player = new TlogPlayer(file, {
+    speed,
+    clock: () => v.now,
+    sleep: async (ms: int, _s: AbortSignal?): Promise<void> throws Error => {
+      v.now += ms as f64
+      v.slept += 1
+    },
+  })
+  const at: int[] = []
+  await player.play((_e: TlogEntry) => {
+    at.push(v.now as int)
+  })
+  return at.join(",")
+}
+
+async function speeds(): Promise<void> throws Error {
+  const path = temp("speeds")
+  const file = await fileAt(path, [0, 50 * MS, 100 * MS, 100 * MS, 250 * MS])
+  const one = await playVirtual(file, 1.0)
+  file.seek(0)
+  const two = await playVirtual(file, 2.0)
+  file.seek(0)
+  const half = await playVirtual(file, 0.5)
+  // From the middle: the first record goes at once, the others keep their spacing.
+  file.seek(60 * MS)
+  const fromMiddle = await playVirtual(file, 1.0)
+  await file.close()
+  await remove(path)
+  // A record is given at its time or within the millisecond after (sleeps are whole milliseconds).
+  expect(one).toBe("0,51,101,101,251")
+  expect(two).toBe("0,26,51,51,126")
+  expect(half).toBe("0,101,201,201,501")
+  expect(fromMiddle).toBe("0,0,151")
+}
+
+async function changesWhilePlaying(): Promise<void> throws Error {
+  const path = temp("changes")
+  const file = await fileAt(path, [0, 1000 * MS, 2000 * MS, 3000 * MS, 4000 * MS, 5000 * MS])
+  const v = new Virtual()
+  const player = new TlogPlayer(file, {
+    clock: () => v.now,
+    sleep: async (ms: int, _s: AbortSignal?): Promise<void> throws Error => {
+      v.now += ms as f64
+    },
+  })
+  const got: string[] = []
+  await player.play((e: TlogEntry) => {
+    got.push(`${e.index}@${v.now as int}`)
+    if (e.index == 1) {
+      // From here on twice as fast: record 2 is 1000 ms of recording away, 500 ms of clock.
+      player.setSpeed(2.0)
+      return
+    }
+    if (e.index == 2) {
+      // Jump to the last but one: it is due at once, the last a second (at 2x, half a second) later.
+      player.seek(4000 * MS)
+      return
+    }
+  })
+  await file.close()
+  await remove(path)
+  expect(got.join(" ")).toBe("0@0 1@1001 2@1501 4@1501 5@2002")
+  expect(player.setSpeed(0.0)).toBe(false)
+  expect(player.setSpeed(-1.0)).toBe(false)
+  expect(player.speed).toBe(2.0)
+}
+
+async function realTime(): Promise<void> throws Error {
+  // On the real clock: 300 ms of recording at 2x takes at least 150 ms, and each record comes no earlier than it is due.
+  const path = temp("realtime")
+  const file = await fileAt(path, [0, 100 * MS, 200 * MS, 300 * MS])
+  const player = new TlogPlayer(file, { speed: 2.0 })
+  const began = performance.now()
+  const late: f64[] = []
+  await player.play((e: TlogEntry) => {
+    late.push(performance.now() - began - (e.positionUs as f64) / 2000.0)
+  })
+  const took = performance.now() - began
+  await file.close()
+  await remove(path)
+  expect(took >= 149.0 && took < 2000.0).toBe(true)
+  expect(late.length).toBe(4)
+  let early = false
+  for (const l of late) {
+    early = early || l < -1.0
+  }
+  expect(early).toBe(false)
+  expect(player.played).toBe(4)
+}
+
+async function aborts(): Promise<void> throws Error {
+  const path = temp("abort")
+  const file = await fileAt(path, [0, 100 * MS, 10000 * MS, 20000 * MS])
+  const player = new TlogPlayer(file)
+  const ac = new AbortController()
+  setTimeout(() => ac.abort(), 150)
+  const began = performance.now()
+  const n = await player.play((_e: TlogEntry) => {}, ac.signal)
+  const took = performance.now() - began
+  await file.close()
+  await remove(path)
+  expect(n).toBe(2)
+  expect(took < 1000.0).toBe(true)
+}
+
+async function replaySimulator(): Promise<void> throws Error {
+  // Record a SimulatedAutopilot, then replay the file to a connection at 4x: it decodes the same messages, in order.
+  const path = temp("replay")
+  const rec = await createTlog(path)
+  const ends = MemoryStream.pair()
+  const sim = new SimulatedAutopilot(ends[1])
+  const gcs = new MavLinkConnection(new TlogTap(ends[0], rec))
+  const live: string[] = []
+  gcs.on((r: Received) => {
+    live.push(`${r.packet.header.msgid}/${r.packet.header.seq}`)
+  })
+  gcs.run()
+  sim.start(5)
+  await delay(120)
+  sim.stop()
+  await delay(10)
+  gcs.close()
+  await rec.close()
+
+  const file = await openTlog(path)
+  const pipe = MemoryStream.pair()
+  const viewer = new MavLinkConnection(pipe[1])
+  const replayed: string[] = []
+  let attitudes = 0
+  viewer.on((r: Received) => {
+    replayed.push(`${r.packet.header.msgid}/${r.packet.header.seq}`)
+    if (r.message instanceof Attitude) {
+      attitudes += 1
+    }
+  })
+  const running = viewer.run()
+  const began = performance.now()
+  const n = await new TlogPlayer(file, { speed: 4.0 }).playTo(pipe[0])
+  const took = performance.now() - began
+  const span = (file.duration as f64) / 1000.0
+  pipe[0].close()
+  await running
+  await file.close()
+  await remove(path)
+  expect(live.length >= 10).toBe(true)
+  expect(n).toBe(live.length)
+  expect(replayed.join(" ")).toBe(live.join(" "))
+  expect(attitudes > 0).toBe(true)
+  expect(took >= span / 4.0 - 1.0).toBe(true)
+}
+
+describe("TlogFile", () => {
+  it("round-trips MAVProxy's capture byte for byte through TlogRecorder", roundTrip)
+  it("reads a file cut mid-record up to the last whole record", cutAnywhere)
+  it("ends at a wrong length at the end, skips only the record with one in the middle", corruptLength)
+  it("seeks by position and knows its duration", seekAndDuration)
+  it("has a playback time line that never goes back", positionsGoOn)
+})
+
+describe("TlogPlayer", () => {
+  it("gives records with their timing at 1x, 2x and 0.5x, and from the middle", speeds)
+  it("follows a change of speed and a seek while it plays", changesWhilePlaying)
+  it("keeps time on the real clock", realTime)
+  it("stops when aborted, even in a long gap", aborts)
+  it("replays a recording of a SimulatedAutopilot to a connection", replaySimulator)
+})

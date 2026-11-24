@@ -69,6 +69,8 @@ export class TlogRecord {
   public readonly sysid: int
   public readonly compid: int
   public readonly seq: int
+  /// Where the record (its timestamp) begins in what the reader was fed: the byte offset in the file.
+  public offset: int = 0
 
   constructor(timeUs: int, segment: int, frame: Uint8Array, v2: bool, signed: bool, msgid: int) {
     this.timeUs = timeUs
@@ -328,6 +330,8 @@ export class TlogReader {
     const signed = v2 && (buffer[at + 2] & MavLinkProtocolV2.IFLAG_SIGNED) != 0
     note(time)
     const frame = buffer.slice(at, at + need)
+    // buffer[start] is the byte `bytesFed - (end - start)` of what was fed.
+    const offset = report.bytesFed - (end - start)
     report.records += 1
     report.bytesInRecords += TLOG_TIMESTAMP_LENGTH + need
     if (v2) report.v2 += 1 else report.v1 += 1
@@ -336,7 +340,9 @@ export class TlogReader {
     }
     report.byId.set(msgid, (report.byId.get(msgid) ?? 0) + 1)
     start += TLOG_TIMESTAMP_LENGTH + need
-    new TlogRecord(time, segment, frame, v2, signed, msgid)
+    const record = new TlogRecord(time, segment, frame, v2, signed, msgid)
+    record.offset = offset
+    return record
   }
 
   /// Takes the time of a record into the report: the first one, a step back or a jump forward (a new segment), and the last.
@@ -436,6 +442,11 @@ export class TlogWriter {
     reserve(bytes.length)
     buffer.setAll(bytes, length)
     length += bytes.length
+  }
+
+  /// The bytes of the recording so far.
+  public get size(): int {
+    return length
   }
 
   /// The recording so far.
